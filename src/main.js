@@ -2331,8 +2331,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           
           // Show APFS volumes if present
           if (apfsVolumes.length > 0) {
-            html += '<div style="margin-top: 8px; padding-left: 15px; border-left: 2px solid #4fc3f7;">';
-            html += '<strong style="color: #ffb74d; font-size: 0.9em;">📦 APFS Volumes (' + apfsVolumes.length + '):</strong>';
+            html += '<div class="forensic-apfs-volumes">';
+            html += '<strong>📦 APFS Volumes (' + apfsVolumes.length + '):</strong>';
             apfsVolumes.forEach((vol) => {
               const volId = eh(vol.volume_id || '-');
               const volNameApfs = eh(vol.name || '-');
@@ -2340,14 +2340,14 @@ document.addEventListener('DOMContentLoaded', async () => {
               const volUsed = eh(vol.used || '-');
               const volFileVault = eh(vol.filevault || '-');
               
-              html += '<div style="margin: 5px 0; padding: 5px; background: rgba(0,0,0,0.1); border-radius: 4px;">';
-              html += '<span style="color: #81c784;">📁 ' + volId + '</span> - <span style="color: #4fc3f7;">' + volNameApfs + '</span><br>';
-              html += '<span class="forensic-label" style="font-size: 0.85em;">Mount:</span> <span class="forensic-value" style="font-size: 0.85em;">' + volMount + '</span>';
+              html += '<div class="forensic-apfs-volume">';
+              html += '<span class="forensic-apfs-id">📁 ' + volId + '</span> - <span class="forensic-apfs-name">' + volNameApfs + '</span><br>';
+              html += '<span class="forensic-label">Mount:</span> <span class="forensic-value">' + volMount + '</span>';
               if (volUsed !== '-') {
-                html += ' | <span class="forensic-label" style="font-size: 0.85em;">' + t('tools.usedSpace') + ':</span> <span class="forensic-value" style="font-size: 0.85em;">' + volUsed + '</span>';
+                html += ' | <span class="forensic-label">' + t('tools.usedSpace') + ':</span> <span class="forensic-value">' + volUsed + '</span>';
               }
               if (volFileVault !== '-' && volFileVault !== 'No') {
-                html += ' | <span class="forensic-label" style="font-size: 0.85em;">FileVault:</span> <span class="forensic-value" style="font-size: 0.85em; color: #f44336;">' + volFileVault + '</span>';
+                html += ' | <span class="forensic-label">FileVault:</span> <span class="forensic-value forensic-apfs-alert">' + volFileVault + '</span>';
               }
               html += '</div>';
             });
@@ -2372,13 +2372,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             html += '<div class="forensic-usb-device" style="border: 1px solid #444; padding: 10px; margin: 5px 0; border-radius: 6px; background: rgba(0,0,0,0.2);">';
             html += '<strong style="color: #4fc3f7;">📱 ' + t('tools.device') + ' ' + (idx + 1) + ': ' + eh(device.product_name || t('tools.unknown')) + '</strong><br>';
             if (device.manufacturer) html += '<span class="forensic-label">' + t('tools.manufacturer') + ':</span> <span class="forensic-value">' + eh(device.manufacturer) + '</span><br>';
-            if (device.vendor_id) html += '<span class="forensic-label">Vendor ID:</span> <span class="forensic-value" style="font-family: monospace;">' + eh(device.vendor_id) + '</span><br>';
-            if (device.product_id) html += '<span class="forensic-label">Product ID:</span> <span class="forensic-value" style="font-family: monospace;">' + eh(device.product_id) + '</span><br>';
-            if (device.serial_number) html += '<span class="forensic-label">' + t('tools.serialNumber') + ':</span> <span class="forensic-value" style="font-family: monospace; font-size: 11px;">' + eh(device.serial_number) + '</span><br>';
+            if (device.vendor_id) html += '<span class="forensic-label">Vendor ID:</span> <span class="forensic-value mono">' + eh(device.vendor_id) + '</span><br>';
+            if (device.product_id) html += '<span class="forensic-label">Product ID:</span> <span class="forensic-value mono">' + eh(device.product_id) + '</span><br>';
+            if (device.serial_number) html += '<span class="forensic-label">' + t('tools.serialNumber') + ':</span> <span class="forensic-value mono">' + eh(device.serial_number) + '</span><br>';
             if (device.usb_speed) html += '<span class="forensic-label">' + t('tools.usbSpeed') + ':</span> <span class="forensic-value" style="color: #4caf50;">' + eh(device.usb_speed) + '</span><br>';
             if (device.power_allocation) html += '<span class="forensic-label">' + t('tools.powerConsumption') + ':</span> <span class="forensic-value">' + eh(device.power_allocation) + '</span><br>';
             if (device.device_version) html += '<span class="forensic-label">' + t('tools.deviceVersion') + ':</span> <span class="forensic-value">' + eh(device.device_version) + '</span><br>';
-            if (device.location_id) html += '<span class="forensic-label">Location ID:</span> <span class="forensic-value" style="font-family: monospace;">' + eh(device.location_id) + '</span><br>';
+            if (device.location_id) html += '<span class="forensic-label">Location ID:</span> <span class="forensic-value mono">' + eh(device.location_id) + '</span><br>';
             html += '</div>';
           });
         } else {
@@ -2950,7 +2950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         
         // Data source
         if (result.smart_info.source) {
-          html += '<div class="forensic-item" style="margin-top: 10px; font-size: 0.85em; opacity: 0.7;"><span class="forensic-label">' + t('tools.dataSource') + ':</span> <span class="forensic-value">' + eh(result.smart_info.source) + '</span></div>';
+          html += '<div class="forensic-item forensic-source-note"><span class="forensic-label">' + t('tools.dataSource') + ':</span> <span class="forensic-value">' + eh(result.smart_info.source) + '</span></div>';
         }
         
         html += '</div>';
@@ -3109,7 +3109,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   <title>${escapeHtml(t('forensic.reportTitle'))} - ${escapeHtml(deviceName)}</title>
   <style>
     body { background: #f2f4f7; color: #18212f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 24px; }
-    .forensic-report { background: #fff; border-radius: 10px; box-shadow: 0 2px 12px #18212f1a; margin: 0 auto; max-width: 1080px; padding: 22px; }
+    .forensic-report { background: #fff; border-radius: 10px; box-shadow: 0 2px 12px #18212f1a; font-size: 13px; margin: 0 auto; max-width: 1080px; padding: 22px; }
     .forensic-header { border-bottom: 1px solid #d9e0e8; margin-bottom: 16px; padding-bottom: 12px; }
     .forensic-header h4 { color: #1769aa; font-size: 18px; margin: 0 0 4px; } .forensic-timestamp, .forensic-label { color: #5f6b7a; }
     .forensic-overview { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-bottom: 16px; }
@@ -3119,7 +3119,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     .forensic-section { border-bottom: 1px solid #d9e0e8; margin-bottom: 15px; padding-bottom: 12px; } .forensic-section h5, .forensic-disclosure summary { color: #1769aa; font-size: 14px; font-weight: 650; }
     .forensic-disclosure { background: #f7f9fb; border-radius: 6px; padding: 10px; } .forensic-disclosure summary { cursor: pointer; } .forensic-disclosure > :not(summary) { margin-top: 10px; }
     .forensic-grid { display: grid; gap: 7px 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); } .forensic-item { display: flex; gap: 6px; min-width: 0; } .forensic-item.full-width { grid-column: 1 / -1; } .forensic-value { overflow-wrap: anywhere; } .mono, .forensic-hexdump { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .forensic-partitions, .forensic-filesystems, .forensic-filelist { display: flex; flex-direction: column; gap: 6px; } .forensic-hexdump { background: #18212f; border-radius: 6px; color: #b9f6ca; font-size: 10px; overflow-x: auto; padding: 12px; white-space: pre; }
+    .forensic-apfs-volumes { border-left: 2px solid #1769aa; margin-top: 8px; padding-left: 15px; } .forensic-apfs-volumes > strong { color: #b45309; font-size: 13px; } .forensic-apfs-volume { background: #f7f9fb; border-radius: 4px; margin: 5px 0; padding: 6px; } .forensic-apfs-id { color: #2e8b57; } .forensic-apfs-name { color: #1769aa; } .forensic-apfs-alert { color: #c62828; } .forensic-source-note { margin-top: 10px; opacity: .75; }
+    .forensic-partitions, .forensic-filesystems, .forensic-filelist { display: flex; flex-direction: column; gap: 6px; } .forensic-hexdump { background: #18212f; border-radius: 6px; color: #b9f6ca; font-size: 11px; overflow-x: auto; padding: 12px; white-space: pre; }
     .forensic-types, .forensic-toplevel { display: flex; flex-wrap: wrap; gap: 5px; } .smart-attributes-table-container { overflow-x: auto; } .smart-attributes-table { border-collapse: collapse; font-size: 11px; width: 100%; } .smart-attributes-table th, .smart-attributes-table td { border: 1px solid #d9e0e8; padding: 5px; text-align: left; }
     @media print { body { background: #fff; padding: 0; } .forensic-report { box-shadow: none; max-width: none; } details { display: block; } details:not([open]) > :not(summary) { display: block; } }
   </style>

@@ -1571,7 +1571,7 @@ body {
 .forensic-overview-label {
   display: block;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
   margin-bottom: 3px;
 }
 
@@ -1589,7 +1589,7 @@ body {
   background: var(--surface-primary);
   border-radius: 0 6px 6px 0;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 12px;
   margin: 0 0 16px;
   padding: 9px 11px;
 }
@@ -1618,7 +1618,7 @@ body {
 }
 
 .forensic-timestamp {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-secondary);
 }
 
@@ -1697,14 +1697,14 @@ body {
   background: var(--surface-primary);
   padding: 6px 10px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .forensic-partition-raw {
   background: var(--surface-primary);
   padding: 10px 12px;
   border-radius: 4px;
-  font-size: 10px;
+  font-size: 11px;
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
   white-space: pre;
   overflow-x: auto;
@@ -1717,7 +1717,7 @@ body {
   background: #1a1a2e;
   padding: 10px 12px;
   border-radius: 4px;
-  font-size: 9px;
+  font-size: 11px;
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
   white-space: pre;
   overflow-x: auto;
@@ -1736,7 +1736,7 @@ body {
 .forensic-subsection strong {
   display: block;
   margin-bottom: 6px;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-secondary);
 }
 
@@ -1747,7 +1747,7 @@ body {
 }
 
 .forensic-file-item {
-  font-size: 10px;
+  font-size: 12px;
   display: flex;
   gap: 8px;
 }
@@ -1773,13 +1773,13 @@ body {
   background: var(--surface-primary);
   padding: 2px 8px;
   border-radius: 10px;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--accent-purple);
 }
 
 .forensic-value.mono {
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
-  font-size: 9px;
+  font-size: 12px;
   word-break: break-all;
 }
 
@@ -1800,8 +1800,44 @@ body {
   background: var(--surface-primary);
   padding: 2px 8px;
   border-radius: 3px;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-secondary);
+}
+
+.forensic-apfs-volumes {
+  border-left: 2px solid var(--accent-blue);
+  margin-top: 8px;
+  padding-left: 15px;
+}
+
+.forensic-apfs-volumes > strong {
+  color: var(--accent-orange);
+  font-size: 12px;
+}
+
+.forensic-apfs-volume {
+  background: var(--surface-primary);
+  border-radius: 4px;
+  font-size: 12px;
+  margin: 5px 0;
+  padding: 6px;
+}
+
+.forensic-apfs-id {
+  color: var(--accent-green);
+}
+
+.forensic-apfs-name {
+  color: var(--accent-blue);
+}
+
+.forensic-apfs-alert {
+  color: var(--accent-red);
+}
+
+.forensic-source-note {
+  margin-top: 10px;
+  opacity: 0.75;
 }
 
 .forensic-actions {

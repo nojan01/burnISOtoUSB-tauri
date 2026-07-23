@@ -5464,11 +5464,15 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
         "Das Schreiben von Images benötigt Python 3. Installieren Sie es mit: brew install python",
     )?;
     let is_xz = is_xz_compressed(&iso_path)?;
-    let image_size = if is_xz {
-        let xz_path = get_xz_path().ok_or(
+    let xz_path = if is_xz {
+        Some(get_xz_path().ok_or(
             "Für XZ-komprimierte Images wird xz benötigt. Installieren Sie es mit: brew install xz",
-        )?;
-        xz_uncompressed_size(&xz_path, &iso_path)?
+        )?)
+    } else {
+        None
+    };
+    let image_size = if let Some(ref xz_path) = xz_path {
+        xz_uncompressed_size(xz_path, &iso_path)?
     } else {
         compressed_size
     };
@@ -5482,6 +5486,8 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     }
     let iso_path_literal = serde_json::to_string(&iso_path)
         .map_err(|e| format!("Image-Pfad konnte nicht verarbeitet werden: {}", e))?;
+    let xz_path_literal = serde_json::to_string(xz_path.as_deref().unwrap_or(""))
+        .map_err(|e| format!("XZ-Pfad konnte nicht verarbeitet werden: {}", e))?;
     
     let _ = app.emit("burn_phase", "writing");
     emit_progress(&app, 0, "Vorbereitung...", "burn");
@@ -5496,16 +5502,32 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     emit_progress(&app, 0, source_label, "burn");
     
     let python_script = format!(
-        r#"import os, sys, lzma
+        r#"import os, sys, subprocess
 iso_path = {}
+xz_path = {}
 disk_path = "{}"
-buffer_size = 1024 * 1024
+buffer_size = 8 * 1024 * 1024
+progress_interval = 32 * 1024 * 1024
 total_size = {}
 is_xz = {}
 copied = 0
+next_progress = progress_interval
+xz_process = None
 try:
-    opener = lzma.open if is_xz else open
-    with opener(iso_path, 'rb') as src:
+    if is_xz:
+        # Two decoder threads keep decompression ahead of USB write speed
+        # without competing with the writer for all CPU cores and memory.
+        xz_process = subprocess.Popen(
+            [xz_path, '--threads=2', '--decompress', '--stdout', '--', iso_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if xz_process.stdout is None:
+            raise OSError('could not open XZ output stream')
+        src = xz_process.stdout
+    else:
+        src = open(iso_path, 'rb')
+    with src:
         fd = os.open(disk_path, os.O_WRONLY)
         with os.fdopen(fd, 'wb', buffering=0) as dst:
             while True:
@@ -5518,13 +5540,22 @@ try:
                         raise OSError("short write to destination device")
                     view = view[count:]
                 copied += len(chunk)
-                print(f"BYTES:{{copied}}", flush=True)
+                if copied >= next_progress or copied == total_size:
+                    print(f"BYTES:{{copied}}", flush=True)
+                    next_progress = copied + progress_interval
             dst.flush()
             os.fsync(dst.fileno())
-except (OSError, lzma.LZMAError) as exc:
+    if xz_process is not None:
+        xz_error = xz_process.stderr.read().decode('utf-8', errors='replace').strip()
+        if xz_process.wait() != 0:
+            raise OSError(xz_error or 'XZ-Dekomprimierung fehlgeschlagen')
+except OSError as exc:
     print(f"ERROR: {{exc}}", file=sys.stderr)
     sys.exit(1)
-print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
+finally:
+    if xz_process is not None and xz_process.poll() is None:
+        xz_process.kill()
+print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
 
     let mut child = Command::new("sudo").args(["-S", &python3_path, "-c", &python_script])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
@@ -5586,17 +5617,31 @@ print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, rdisk_path, image_size, 
         emit_progress(&app, 0, "VERIFIZIEREN: 0%", "burn");
         
         let verify_script = format!(
-            r#"import os, sys, lzma
+            r#"import os, sys, subprocess
 iso_path = {}
+xz_path = {}
 disk_path = "{}"
-buffer_size = 1024 * 1024
+buffer_size = 8 * 1024 * 1024
+progress_interval = 32 * 1024 * 1024
 total_size = {}
 is_xz = {}
 verified = 0
 errors = 0
+next_progress = progress_interval
+xz_process = None
 try:
-    opener = lzma.open if is_xz else open
-    with opener(iso_path, 'rb') as iso_file:
+    if is_xz:
+        xz_process = subprocess.Popen(
+            [xz_path, '--threads=2', '--decompress', '--stdout', '--', iso_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if xz_process.stdout is None:
+            raise OSError('could not open XZ output stream')
+        iso_file = xz_process.stdout
+    else:
+        iso_file = open(iso_path, 'rb')
+    with iso_file:
         fd = os.open(disk_path, os.O_RDONLY)
         with os.fdopen(fd, 'rb', buffering=0) as disk_file:
             while verified < total_size:
@@ -5607,15 +5652,24 @@ try:
                     errors += 1
                     print(f"MISMATCH:{{verified}}", flush=True)
                 verified += len(iso_chunk)
-                print(f"VERIFY:{{verified}}:{{errors}}", flush=True)
-except (OSError, lzma.LZMAError) as exc:
+                if verified >= next_progress or verified == total_size:
+                    print(f"VERIFY:{{verified}}:{{errors}}", flush=True)
+                    next_progress = verified + progress_interval
+    if xz_process is not None:
+        xz_error = xz_process.stderr.read().decode('utf-8', errors='replace').strip()
+        if xz_process.wait() != 0:
+            raise OSError(xz_error or 'XZ-Dekomprimierung fehlgeschlagen')
+except OSError as exc:
     print(f"ERROR: {{exc}}", file=sys.stderr)
     sys.exit(1)
+finally:
+    if xz_process is not None and xz_process.poll() is None:
+        xz_process.kill()
 if errors == 0:
     print("VERIFY_SUCCESS", flush=True)
 else:
     print(f"VERIFY_FAILED:{{errors}}", flush=True)
-    sys.exit(1)"#, iso_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
+    sys.exit(1)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
 
         let mut verify_child = Command::new("sudo").args(["-S", &python3_path, "-c", &verify_script])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
