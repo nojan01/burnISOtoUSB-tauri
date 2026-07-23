@@ -3631,6 +3631,12 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if let Some(fs_info) = detect_filesystem_signatures(&disk_id, &password) {
         result["filesystem_signatures"] = fs_info;
     }
+
+    // Linux filesystems are usually not mounted by macOS. Read their public
+    // superblock metadata directly instead of relying on a third-party driver.
+    if let Some(linux_info) = analyze_linux_filesystems(&disk_id, &password) {
+        result["linux_filesystem_details"] = linux_info;
+    }
     
     // 6. Get file count and directory structure (if mounted)
     if let Some(mount_point) = result.get("disk_info")
@@ -4154,13 +4160,14 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if result.get("usb_info").is_some() { sources.push("system_profiler".to_string()); }
     if result.get("smart_info").is_some() { sources.push("SMART / smartctl".to_string()); }
     if result.get("filesystem_details").is_some() { sources.push("mounted filesystem metadata".to_string()); }
+    if result.get("linux_filesystem_details").is_some() { sources.push("Linux filesystem superblock (read-only)".to_string()); }
 
     let mut limitations = Vec::new();
     if result.get("smart_info").is_none() {
         limitations.push("SMART-Daten wurden vom Gerät oder USB-Adapter nicht bereitgestellt.".to_string());
     }
     if result.get("filesystem_details").is_none() {
-        limitations.push("Datei-Metadaten sind nur für ein von macOS lesbar eingehängtes Dateisystem verfügbar.".to_string());
+        limitations.push("Datei-Metadaten sind nur für ein von macOS lesbar eingehängtes Dateisystem verfügbar; Linux-Superblock-Metadaten werden bei Erkennung separat gelesen.".to_string());
     }
 
     result["analysis_quality"] = serde_json::json!({
@@ -4900,6 +4907,156 @@ except Exception as e:
     }
     
     None
+}
+
+/// Read non-sensitive Linux filesystem metadata directly from on-disk
+/// superblocks. This is deliberately read-only and works even when macOS
+/// cannot mount ext, Btrfs, XFS or a LUKS container.
+fn analyze_linux_filesystems(disk_id: &str, password: &str) -> Option<serde_json::Value> {
+    let list_cmd = format!("diskutil list {} 2>/dev/null", disk_id);
+    let mut partitions = vec![disk_id.to_string()];
+
+    if let Ok(output) = Command::new("sh").args(["-c", &list_cmd]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(part_id) = line.split_whitespace().last() {
+                if part_id.starts_with("disk") && part_id.contains('s') && !partitions.iter().any(|id| id == part_id) {
+                    partitions.push(part_id.to_string());
+                }
+            }
+        }
+    }
+
+    let python3 = get_python3_path().unwrap_or_else(|| "python3".to_string());
+    let mut filesystems = Vec::new();
+
+    for part_id in partitions {
+        let device_json = serde_json::to_string(&format!("/dev/r{}", part_id)).ok()?;
+        let partition_json = serde_json::to_string(&part_id).ok()?;
+        let python_script = r#"
+import datetime
+import json
+
+device = {DEVICE}
+partition = {PARTITION}
+
+def u16le(data, offset): return int.from_bytes(data[offset:offset + 2], 'little')
+def u32le(data, offset): return int.from_bytes(data[offset:offset + 4], 'little')
+def u64le(data, offset): return int.from_bytes(data[offset:offset + 8], 'little')
+def u16be(data, offset): return int.from_bytes(data[offset:offset + 2], 'big')
+def u32be(data, offset): return int.from_bytes(data[offset:offset + 4], 'big')
+def u64be(data, offset): return int.from_bytes(data[offset:offset + 8], 'big')
+def text(data): return data.split(b'\0', 1)[0].decode('utf-8', 'replace').strip() or None
+def uuid_text(data):
+    value = data.hex()
+    return '-'.join((value[0:8], value[8:12], value[12:16], value[16:20], value[20:32])) if len(data) == 16 else None
+def timestamp(value):
+    try: return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).isoformat().replace('+00:00', 'Z') if value else None
+    except (OverflowError, OSError, ValueError): return None
+def compact(info): return {key: value for key, value in info.items() if value not in (None, '', [], {})}
+
+details = []
+try:
+    with open(device, 'rb', buffering=0) as stream:
+        data = stream.read(131072)
+
+    # LUKS header — metadata only; encrypted contents are never read.
+    if len(data) >= 208 and data[:6] == b'LUKS\xba\xbe':
+        details.append(compact({
+            'filesystem': 'LUKS encrypted container', 'partition': partition,
+            'luks_version': u16be(data, 6), 'cipher': text(data[8:40]),
+            'cipher_mode': text(data[40:72]), 'hash': text(data[72:104]),
+            'payload_offset_sectors': u32be(data, 104), 'uuid': text(data[168:208]),
+        }))
+
+    # ext2/ext3/ext4 superblock starts at byte 1024.
+    if len(data) >= 2048 and data[1080:1082] == b'\x53\xef':
+        sb = data[1024:2048]
+        compat, incompat, ro_compat = u32le(sb, 0x5c), u32le(sb, 0x60), u32le(sb, 0x64)
+        ext4_flags = 0x40 | 0x80 | 0x100 | 0x200 | 0x8000 | 0x10000 | 0x20000
+        ext4_ro_flags = 0x08 | 0x10 | 0x20 | 0x40 | 0x200 | 0x400 | 0x4000
+        fs_name = 'ext4' if (incompat & ext4_flags) or (ro_compat & ext4_ro_flags) else ('ext3' if compat & 0x04 else 'ext2')
+        block_size = 1024 << u32le(sb, 0x18)
+        total_blocks, free_blocks = u32le(sb, 0x04), u32le(sb, 0x0c)
+        if incompat & 0x80 and len(sb) >= 0x15c:
+            total_blocks |= u32le(sb, 0x150) << 32
+            free_blocks |= u32le(sb, 0x158) << 32
+        total_bytes, free_bytes = total_blocks * block_size, free_blocks * block_size
+        used_bytes = max(0, total_bytes - free_bytes)
+        feature_names = [name for enabled, name in [
+            (compat & 0x04, 'journal'), (compat & 0x20, 'directory-index'),
+            (incompat & 0x40, 'extents'), (incompat & 0x80, '64-bit'),
+            (incompat & 0x200, 'flexible-block-groups'), (incompat & 0x10000, 'encryption'),
+            (incompat & 0x20000, 'casefold'), (ro_compat & 0x200, 'bigalloc'),
+            (ro_compat & 0x400, 'metadata-checksums')
+        ] if enabled]
+        state = u16le(sb, 0x3a)
+        details.append(compact({
+            'filesystem': fs_name, 'partition': partition, 'uuid': uuid_text(sb[0x68:0x78]),
+            'label': text(sb[0x78:0x88]), 'last_mounted_at': timestamp(u32le(sb, 0x2c)),
+            'last_written_at': timestamp(u32le(sb, 0x30)), 'last_checked_at': timestamp(u32le(sb, 0x40)),
+            'block_size_bytes': block_size, 'inode_size_bytes': u16le(sb, 0x58) or 128,
+            'total_bytes': total_bytes, 'free_bytes': free_bytes, 'used_bytes': used_bytes,
+            'used_percent': round((used_bytes * 100.0 / total_bytes), 1) if total_bytes else None,
+            'inode_count': u32le(sb, 0x00), 'free_inodes': u32le(sb, 0x10),
+            'mount_count': u16le(sb, 0x34), 'max_mount_count': int.from_bytes(sb[0x36:0x38], 'little', signed=True),
+            'state': 'clean' if state & 0x01 else 'not cleanly unmounted',
+            'has_errors': bool(state & 0x02), 'needs_recovery': bool(incompat & 0x04),
+            'has_journal': bool(compat & 0x04), 'features': feature_names,
+        }))
+
+    # XFS superblock is at offset zero and uses big-endian values.
+    if len(data) >= 264 and data[:4] == b'XFSB':
+        details.append(compact({
+            'filesystem': 'XFS', 'partition': partition, 'uuid': uuid_text(data[32:48]),
+            'label': text(data[108:120]), 'block_size_bytes': u32be(data, 4),
+            'inode_size_bytes': u16be(data, 104), 'total_bytes': u64be(data, 8) * u32be(data, 4),
+            'allocation_groups': u32be(data, 88), 'version': u16be(data, 100) & 0x0f,
+        }))
+
+    # Btrfs primary superblock is at 64 KiB.
+    if len(data) >= 69632 and data[65600:65608] == b'_BHRfS_M':
+        sb = data[65536:65536 + 4096]
+        total_bytes, used_bytes = u64le(sb, 0x70), u64le(sb, 0x78)
+        details.append(compact({
+            'filesystem': 'Btrfs', 'partition': partition, 'uuid': uuid_text(sb[0x20:0x30]),
+            'label': text(sb[0x12b:0x22b]), 'sectorsize_bytes': u32le(sb, 0x90),
+            'nodesize_bytes': u32le(sb, 0x94), 'total_bytes': total_bytes, 'used_bytes': used_bytes,
+            'free_bytes': max(0, total_bytes - used_bytes),
+            'used_percent': round((used_bytes * 100.0 / total_bytes), 1) if total_bytes else None,
+            'device_count': u64le(sb, 0x88), 'generation': u64le(sb, 0x48),
+        }))
+except Exception:
+    pass
+
+print(json.dumps(details, ensure_ascii=False))
+"#.replace("{DEVICE}", &device_json).replace("{PARTITION}", &partition_json);
+
+        let tmp_script = std::env::temp_dir().join(format!("burniso_linuxfs_{}_{}.py", std::process::id(), part_id));
+        if std::fs::write(&tmp_script, python_script).is_err() {
+            continue;
+        }
+        let cmd = format!("{} {} ; rm -f {}", python3, tmp_script.display(), tmp_script.display());
+        if let Ok(output) = sudo_sh(password, &cmd) {
+            if let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                for entry in entries {
+                    let is_duplicate = filesystems.iter().any(|existing: &serde_json::Value| {
+                        existing.get("partition") == entry.get("partition")
+                            && existing.get("filesystem") == entry.get("filesystem")
+                    });
+                    if !is_duplicate {
+                        filesystems.push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    if filesystems.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "filesystems": filesystems }))
+    }
 }
 
 /// Analyze mounted content (files, folders, OS detection)

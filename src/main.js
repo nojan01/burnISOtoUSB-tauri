@@ -678,6 +678,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       '</div>';
   }
 
+  function normalizeForensicTypography(report) {
+    const size = '12px';
+    const family = '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    report.style.setProperty('font-size', size, 'important');
+    report.style.setProperty('font-family', family, 'important');
+    report.style.setProperty('font-weight', '400', 'important');
+    report.style.setProperty('line-height', '1.4', 'important');
+    report.querySelectorAll('h4, h5, summary, strong, span, p, li, pre, th, td').forEach((element) => {
+      element.style.setProperty('font-size', size, 'important');
+      element.style.setProperty('font-family', family, 'important');
+      element.style.setProperty('font-weight', '400', 'important');
+      element.style.setProperty('line-height', '1.4', 'important');
+    });
+  }
+
   // Reset burn state to initial (silent = no disk reload log)
   function resetBurnState(silent) {
     isBurning = false;
@@ -2520,6 +2535,47 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         html += '</div></div>';
       }
+
+      // Linux filesystem metadata is read from the raw superblock. It remains
+      // available even when macOS cannot mount the volume.
+      const linuxFilesystems = result.linux_filesystem_details?.filesystems;
+      if (Array.isArray(linuxFilesystems) && linuxFilesystems.length > 0) {
+        html += '<div class="forensic-section">';
+        html += '<h5>🐧 Linux-Dateisystem-Details</h5>';
+        linuxFilesystems.forEach((filesystem) => {
+          const filesystemName = eh(filesystem.filesystem || 'Linux-Dateisystem');
+          const partition = eh(filesystem.partition || '-');
+          const bytes = (value) => Number.isFinite(Number(value)) ? formatBytes(Number(value)) : '-';
+          const item = (label, value, fullWidth = false) => {
+            if (value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0)) return '';
+            const renderedValue = Array.isArray(value) ? value.join(', ') : String(value);
+            return '<div class="forensic-item' + (fullWidth ? ' full-width' : '') + '"><span class="forensic-label">' + eh(label) + ':</span><span class="forensic-value">' + eh(renderedValue) + '</span></div>';
+          };
+
+          html += '<div class="forensic-partition">';
+          html += '<strong>🐧 ' + filesystemName + ' (' + partition + ')</strong>';
+          html += '<div class="forensic-grid" style="margin-top: 8px;">';
+          html += item('UUID', filesystem.uuid);
+          html += item('Label', filesystem.label);
+          html += item('Größe', filesystem.total_bytes !== undefined ? bytes(filesystem.total_bytes) : undefined);
+          html += item('Belegt', filesystem.used_bytes !== undefined ? bytes(filesystem.used_bytes) + (filesystem.used_percent !== undefined ? ' (' + filesystem.used_percent + '%)' : '') : undefined);
+          html += item('Frei', filesystem.free_bytes !== undefined ? bytes(filesystem.free_bytes) : undefined);
+          html += item('Blockgröße', filesystem.block_size_bytes !== undefined ? bytes(filesystem.block_size_bytes) : undefined);
+          html += item('Inode-Größe', filesystem.inode_size_bytes !== undefined ? bytes(filesystem.inode_size_bytes) : undefined);
+          html += item('Inodes', filesystem.inode_count !== undefined ? String(filesystem.inode_count) + (filesystem.free_inodes !== undefined ? ' (' + filesystem.free_inodes + ' frei)' : '') : undefined);
+          html += item('Status', filesystem.state);
+          html += item('Journal', filesystem.has_journal === undefined ? undefined : (filesystem.has_journal ? 'vorhanden' : 'nicht vorhanden'));
+          html += item('Wiederherstellung', filesystem.needs_recovery === undefined ? undefined : (filesystem.needs_recovery ? 'erforderlich' : 'nicht erforderlich'));
+          html += item('Letztes Einhängen', filesystem.last_mounted_at);
+          html += item('Letzter Schreibzugriff', filesystem.last_written_at);
+          html += item('Letzte Prüfung', filesystem.last_checked_at);
+          html += item('Verschlüsselung', filesystem.cipher ? filesystem.cipher + (filesystem.cipher_mode ? ' · ' + filesystem.cipher_mode : '') : undefined);
+          html += item('LUKS-Version', filesystem.luks_version);
+          html += item('Features', filesystem.features, true);
+          html += '</div></div>';
+        });
+        html += '</div>';
+      }
       
       // Content Analysis Section
       if (result.content_analysis) {
@@ -2609,7 +2665,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<div class="forensic-grid">';
         html += '<div class="forensic-item"><span class="forensic-label">MBR-Signatur:</span> <span class="forensic-value">' + eh(result.mbr_analysis.mbr_signature) + '</span></div>';
         html += '<div class="forensic-item"><span class="forensic-label">Gültig:</span> <span class="forensic-value">' + (result.mbr_analysis.valid_mbr ? '✓ Ja' : '✗ Nein') + '</span></div>';
-        html += '</details>';
+        html += '</div></details>';
         if (result.mbr_analysis.partition_entries && result.mbr_analysis.partition_entries.length > 0) {
           html += '<div class="forensic-partitions" style="margin-top:8px;">';
           result.mbr_analysis.partition_entries.forEach(p => {
@@ -2621,7 +2677,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           });
           html += '</div>';
         }
-        html += '</div>';
       }
       
       // GPT Analysis Section
@@ -2981,6 +3036,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       html += '</div>';
       
       forensicResult.innerHTML = html;
+      const renderedForensicReport = forensicResult.querySelector('.forensic-report');
+      normalizeForensicTypography(renderedForensicReport);
       forensicResult.classList.remove('hidden');
       forensicExportSection.classList.remove('hidden');
       
@@ -3120,8 +3177,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     .forensic-disclosure { background: #f7f9fb; border-radius: 6px; padding: 10px; } .forensic-disclosure summary { cursor: pointer; } .forensic-disclosure > :not(summary) { margin-top: 10px; }
     .forensic-grid { display: grid; gap: 7px 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); } .forensic-item { display: flex; gap: 6px; min-width: 0; } .forensic-item.full-width { grid-column: 1 / -1; } .forensic-value { overflow-wrap: anywhere; } .mono, .forensic-hexdump { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .forensic-apfs-volumes { border-left: 2px solid #1769aa; margin-top: 8px; padding-left: 15px; } .forensic-apfs-volumes > strong { color: #b45309; font-size: 13px; } .forensic-apfs-volume { background: #f7f9fb; border-radius: 4px; margin: 5px 0; padding: 6px; } .forensic-apfs-id { color: #2e8b57; } .forensic-apfs-name { color: #1769aa; } .forensic-apfs-alert { color: #c62828; } .forensic-source-note { margin-top: 10px; opacity: .75; }
-    .forensic-partitions, .forensic-filesystems, .forensic-filelist { display: flex; flex-direction: column; gap: 6px; } .forensic-hexdump { background: #18212f; border-radius: 6px; color: #b9f6ca; font-size: 11px; overflow-x: auto; padding: 12px; white-space: pre; }
-    .forensic-types, .forensic-toplevel { display: flex; flex-wrap: wrap; gap: 5px; } .smart-attributes-table-container { overflow-x: auto; } .smart-attributes-table { border-collapse: collapse; font-size: 11px; width: 100%; } .smart-attributes-table th, .smart-attributes-table td { border: 1px solid #d9e0e8; padding: 5px; text-align: left; }
+    .forensic-partitions, .forensic-filesystems, .forensic-filelist { display: flex; flex-direction: column; gap: 6px; } .forensic-hexdump { background: #18212f; border-radius: 6px; color: #b9f6ca; font-size: inherit; overflow-x: auto; padding: 12px; white-space: pre; }
+    .forensic-types, .forensic-toplevel { display: flex; flex-wrap: wrap; gap: 5px; } .smart-attributes-table-container { overflow-x: auto; } .smart-attributes-table { border-collapse: collapse; font-size: inherit; width: 100%; } .smart-attributes-table th, .smart-attributes-table td { border: 1px solid #d9e0e8; padding: 5px; text-align: left; }
     @media print { body { background: #fff; padding: 0; } .forensic-report { box-shadow: none; max-width: none; } details { display: block; } details:not([open]) > :not(summary) { display: block; } }
   </style>
 </head>

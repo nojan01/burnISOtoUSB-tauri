@@ -1534,7 +1534,24 @@ body {
   background: var(--surface-secondary);
   border-radius: 8px;
   padding: 16px;
-  font-size: 12px;
+  --forensic-data-font-size: 12px;
+  font-size: var(--forensic-data-font-size);
+}
+
+/* Keep every textual element in the report at one readable base size.
+ * Visual hierarchy is expressed through color, spacing, and weight only. */
+.forensic-report h4,
+.forensic-report h5,
+.forensic-report summary,
+.forensic-report strong,
+.forensic-report span,
+.forensic-report p,
+.forensic-report li,
+.forensic-report pre,
+.forensic-report th,
+.forensic-report td {
+  font-size: var(--forensic-data-font-size) !important;
+  line-height: 1.4;
 }
 
 .forensic-header {
@@ -1665,6 +1682,25 @@ body {
   gap: 6px 16px;
 }
 
+.forensic-report .forensic-grid,
+.forensic-report .forensic-item,
+.forensic-report .forensic-item > .forensic-label,
+.forensic-report .forensic-item > .forensic-value,
+.forensic-report .forensic-partition,
+.forensic-report .forensic-fs-item,
+.forensic-report .forensic-file-item,
+.forensic-report .forensic-type-badge,
+.forensic-report .toplevel-item,
+.forensic-report .forensic-partition-raw,
+.forensic-report .forensic-hexdump,
+.forensic-report .forensic-apfs-volume,
+.forensic-report .smart-attributes-table,
+.forensic-report .smart-attributes-table th,
+.forensic-report .smart-attributes-table td {
+  font-size: var(--forensic-data-font-size) !important;
+  line-height: 1.4;
+}
+
 .forensic-item {
   display: flex;
   gap: 6px;
@@ -1682,6 +1718,7 @@ body {
 
 .forensic-value {
   color: var(--text-primary);
+  font-weight: 400;
   word-break: break-word;
 }
 
@@ -1704,7 +1741,6 @@ body {
   background: var(--surface-primary);
   padding: 10px 12px;
   border-radius: 4px;
-  font-size: 11px;
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
   white-space: pre;
   overflow-x: auto;
@@ -1717,7 +1753,6 @@ body {
   background: #1a1a2e;
   padding: 10px 12px;
   border-radius: 4px;
-  font-size: 11px;
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
   white-space: pre;
   overflow-x: auto;
@@ -1736,7 +1771,7 @@ body {
 .forensic-subsection strong {
   display: block;
   margin-bottom: 6px;
-  font-size: 12px;
+  font-size: var(--forensic-data-font-size);
   color: var(--text-secondary);
 }
 
@@ -1747,7 +1782,6 @@ body {
 }
 
 .forensic-file-item {
-  font-size: 12px;
   display: flex;
   gap: 8px;
 }
@@ -1773,13 +1807,11 @@ body {
   background: var(--surface-primary);
   padding: 2px 8px;
   border-radius: 10px;
-  font-size: 11px;
   color: var(--accent-purple);
 }
 
 .forensic-value.mono {
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
-  font-size: 12px;
   word-break: break-all;
 }
 
@@ -1800,7 +1832,6 @@ body {
   background: var(--surface-primary);
   padding: 2px 8px;
   border-radius: 3px;
-  font-size: 11px;
   color: var(--text-secondary);
 }
 
@@ -1812,13 +1843,12 @@ body {
 
 .forensic-apfs-volumes > strong {
   color: var(--accent-orange);
-  font-size: 12px;
+  font-size: var(--forensic-data-font-size);
 }
 
 .forensic-apfs-volume {
   background: var(--surface-primary);
   border-radius: 4px;
-  font-size: 12px;
   margin: 5px 0;
   padding: 6px;
 }
