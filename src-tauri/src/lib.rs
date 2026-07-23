@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri::menu::{Menu, MenuItem, Submenu, PredefinedMenuItem, AboutMetadata};
 
@@ -53,6 +54,116 @@ fn sudo_sh(password: &str, script: &str) -> std::io::Result<std::process::Output
         let _ = stdin.write_all(b"\n");
     }
     child.wait_with_output()
+}
+
+/// Liefert einen expliziten Python-3-Pfad, damit `sudo` nicht von einer
+/// abweichenden PATH-Konfiguration abhängig ist. Python 3 ist auf macOS
+/// nicht mehr standardmäßig garantiert verfügbar.
+fn get_python3_path() -> Option<String> {
+    for candidate in [
+        "/usr/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ] {
+        if std::path::Path::new(candidate).is_file()
+            && Command::new(candidate).arg("--version").output().is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+
+    let output = Command::new("which").arg("python3").output().ok()?;
+    let candidate = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !candidate.is_empty()
+        && std::path::Path::new(&candidate).is_file()
+        && Command::new(&candidate).arg("--version").output().is_ok()
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn get_xz_path() -> Option<String> {
+    for candidate in ["/usr/bin/xz", "/opt/homebrew/bin/xz", "/usr/local/bin/xz"] {
+        if std::path::Path::new(candidate).is_file()
+            && Command::new(candidate).arg("--version").output().is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+
+    let output = Command::new("which").arg("xz").output().ok()?;
+    let candidate = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !candidate.is_empty()
+        && std::path::Path::new(&candidate).is_file()
+        && Command::new(&candidate).arg("--version").output().is_ok()
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn is_xz_compressed(path: &str) -> Result<bool, String> {
+    const XZ_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
+    let mut file = File::open(path).map_err(|e| format!("Image nicht lesbar: {}", e))?;
+    let mut header = [0u8; XZ_MAGIC.len()];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(header == XZ_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(format!("Image konnte nicht geprüft werden: {}", e)),
+    }
+}
+
+fn xz_uncompressed_size(xz_path: &str, image_path: &str) -> Result<u64, String> {
+    let output = Command::new(xz_path)
+        .args(["--robot", "--list", image_path])
+        .output()
+        .map_err(|e| format!("XZ-Prüfung konnte nicht gestartet werden: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "XZ-Image ist ungültig: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            (fields.first() == Some(&"totals"))
+                .then(|| fields.get(4).and_then(|size| size.parse::<u64>().ok()))
+                .flatten()
+        })
+        .filter(|size| *size > 0)
+        .ok_or_else(|| "Entpackte Größe des XZ-Images konnte nicht bestimmt werden".to_string())
+}
+
+fn is_valid_disk_id(disk_id: &str) -> bool {
+    disk_id
+        .strip_prefix("disk")
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Beendet den gesamten Prozessbaum des privilegierten Schreibvorgangs.
+/// `sudo` kann den eigentlichen Writer als Kindprozess starten; nur den
+/// direkten `sudo`-Prozess zu töten würde den destruktiven Schreibvorgang
+/// sonst weiterlaufen lassen.
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: Der Kindprozess wird vor dem Start in eine eigene Prozessgruppe
+    // gesetzt. Eine negative PID adressiert genau diese Gruppe via kill(2).
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut Child) {
+    let _ = child.kill();
 }
 
 /// W4: Externes Kommando mit Watchdog-Timeout ausfuehren. Fuer kurze Hilfskommandos
@@ -718,6 +829,7 @@ fn check_dependencies() -> serde_json::Value {
     let paragon = check_paragon_drivers();
     let smartctl = get_smartctl_path().is_some();
     let e2fsprogs = get_e2fsprogs_path().is_some();
+    let python3 = get_python3_path().is_some();
     
     // Check if Homebrew is installed
     let homebrew_installed = std::path::Path::new("/opt/homebrew/bin/brew").exists()
@@ -727,6 +839,7 @@ fn check_dependencies() -> serde_json::Value {
     let mut missing_brew_packages = Vec::new();
     if !smartctl { missing_brew_packages.push("smartmontools"); }
     if !e2fsprogs { missing_brew_packages.push("e2fsprogs"); }
+    if !python3 { missing_brew_packages.push("python"); }
     
     // Build install command
     let install_command: Option<String> = if !missing_brew_packages.is_empty() {
@@ -738,6 +851,7 @@ fn check_dependencies() -> serde_json::Value {
     serde_json::json!({
         "smartmontools": smartctl,
         "e2fsprogs": e2fsprogs,
+        "python3": python3,
         "paragon_ntfs": paragon.get("ntfs").and_then(|v| v.as_bool()).unwrap_or(false),
         "paragon_extfs": paragon.get("extfs").and_then(|v| v.as_bool()).unwrap_or(false),
         "homebrew": homebrew_installed,
@@ -2586,80 +2700,249 @@ fn write_pass(
     total_passes: u32,
     pass_desc: &str,
     password: &str,
+    python3_path: &str,
 ) -> Result<(), String> {
     // Calculate base progress for this pass
-    let pass_start = ((pass_num - 1) as f64 / total_passes as f64 * 90.0) as u32 + 5;
-    let pass_range = (90.0 / total_passes as f64) as u32;
+    let pass_start_f = (pass_num - 1) as f64 / total_passes as f64 * 90.0 + 5.0;
+    let pass_range_f = 90.0 / total_passes as f64;
+    let pass_start = pass_start_f as u32;
+    let pass_end = (pass_start_f + pass_range_f) as u32;
     
     emit_progress(app, pass_start, &format!("Pass {}/{}: {}...", pass_num, total_passes, pass_desc), "tools");
     
-    // Use dd with 1MB blocks
-    let block_size = 1024 * 1024u64; // 1MB
-    let total_blocks = disk_size / block_size;
-    
-    // Build dd command
-    let dd_cmd = format!(
-        "dd if={} of={} bs=1m count={} 2>&1",
-        source, disk_path, total_blocks
+    // Use a single sudo Python invocation that streams REAL progress per MiB.
+    // This avoids the per-chunk fork/exec overhead of repeatedly starting
+    // sudo+dd, and gives the UI accurate, monotonic progress instead of an
+    // estimate based on an assumed write speed (which used to cap at 94 % and
+    // make the UI look frozen on slow USB sticks).
+    //
+    // Block size: 16 MiB. macOS raw USB devices are usually fastest at
+    // 8–32 MiB writes — anything smaller is dominated by per-syscall and
+    // device-controller overhead. Progress is emitted every 64 MiB so the
+    // pipe stays responsive without flooding the UI.
+    //
+    // For random data we pre-fill a 16 MiB buffer once from /dev/urandom and
+    // refresh ~1 MiB of it before each chunk. This avoids forcing the kernel
+    // CSPRNG to produce the entire disk's worth of bytes (which can become
+    // the bottleneck before the USB) while still giving every block a unique
+    // pattern that is indistinguishable from random data for forensic
+    // purposes.
+    let is_random = source.contains("urandom") || source.contains("random");
+    let py = format!(
+        r#"import os, sys, time
+src_path = "{src}"
+dst_path = "{dst}"
+total = {total}
+is_random = {rand}
+buf_size = 16 * 1024 * 1024
+report_every = 64 * 1024 * 1024
+refresh_size = 1024 * 1024  # 1 MiB freshly randomized per chunk
+
+try:
+    dfd = os.open(dst_path, os.O_WRONLY)
+    dst = os.fdopen(dfd, 'wb', buffering=0)
+except OSError as exc:
+    print(f"ERROR: {{exc}}", file=sys.stderr)
+    sys.exit(1)
+
+if is_random:
+    # Seed buffer once with high-quality randomness, then keep a small slice
+    # fresh for each write so consecutive chunks differ.
+    buf = bytearray(os.urandom(buf_size))
+    src = None
+else:
+    src = open(src_path, 'rb', buffering=0)
+    buf = None
+
+written = 0
+last_report = 0
+start_t = time.time()
+last_t = start_t
+last_bytes = 0
+try:
+    while written < total:
+        remaining = total - written
+        cur = min(buf_size, remaining)
+        if is_random:
+            # Refresh a small random slice for this chunk
+            off = (written // buf_size) % (buf_size - refresh_size + 1)
+            buf[off:off + refresh_size] = os.urandom(refresh_size)
+            data = bytes(buf[:cur]) if cur != buf_size else bytes(buf)
+        else:
+            data = src.read(cur)
+            if not data:
+                break
+        # A single FileIO.write() may write only part of the buffer. Continue
+        # until the complete chunk reached the raw device before advancing
+        # written/progress; otherwise a partial overwrite could be reported
+        # as a successful pass.
+        view = memoryview(data)
+        while view:
+            count = dst.write(view)
+            if count is None or count <= 0:
+                raise OSError("short write to destination device")
+            view = view[count:]
+        written += len(data)
+        if written - last_report >= report_every or written == total:
+            now = time.time()
+            dt_recent = now - last_t
+            speed = (written - last_bytes) / dt_recent / (1024 * 1024) if dt_recent > 0 else 0.0
+            elapsed = now - start_t
+            avg = written / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
+            # ETA based on overall average speed (smoothed, not the bursty
+            # short-term rate which jumps wildly with NAND cache flushes).
+            eta = (total - written) / (avg * 1024 * 1024) if avg > 0.5 else 0
+            print(f"BYTES:{{written}}:{{speed:.1f}}:{{avg:.1f}}:{{int(eta)}}", flush=True)
+            last_report = written
+            last_t = now
+            last_bytes = written
+    dst.flush()
+    os.fsync(dst.fileno())
+except OSError as exc:
+    print(f"ERROR: {{exc}}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    try: dst.close()
+    except Exception: pass
+    if src is not None:
+        try: src.close()
+        except Exception: pass
+print("DONE", flush=True)
+"#,
+        src = source,
+        dst = disk_path,
+        total = disk_size,
+        rand = if is_random { "True" } else { "False" }
     );
     
-    let mut child = Command::new("sudo")
-        .args(["-S", "sh", "-c", &dd_cmd])
+    let mut command = Command::new("sudo");
+    command
+        .args(["-S", python3_path, "-c", &py])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpgid is async-signal-safe and is the only operation in
+        // the child between fork and exec. It isolates sudo and its writer so
+        // cancellation can terminate both.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
         .spawn()
-        .map_err(|e| format!("dd start error: {}", e))?;
+        .map_err(|e| format!("write start error: {}", e))?;
     
-    // Send password
     if let Some(ref mut stdin) = child.stdin {
         writeln!(stdin, "{}", password).ok();
     }
     drop(child.stdin.take());
     
-    // Poll with progress estimation based on typical write speed (~50MB/s for USB)
-    let estimated_seconds = (disk_size as f64 / (50.0 * 1024.0 * 1024.0)) as u64;
-    let start_time = std::time::Instant::now();
-    
-    loop {
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+    let (line_tx, line_rx) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // Drain stderr concurrently. Otherwise a verbose sudo/Python error could
+    // fill its pipe and deadlock the writer before the parent can read it.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut error_msg = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut error_msg);
+        error_msg
+    });
+    let total_mib = disk_size as f64 / (1024.0 * 1024.0);
+    let mut done = false;
+    let mut exit_status: Option<ExitStatus> = None;
+
+    while exit_status.is_none() {
         if CANCEL_TOOLS.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err("Cancelled".to_string());
         }
-        
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    emit_progress(app, pass_start + pass_range, &format!("Pass {}/{}: Complete", pass_num, total_passes), "tools");
-                    return Ok(());
-                } else {
-                    if let Some(mut stderr) = child.stderr.take() {
-                        let mut error_msg = String::new();
-                        let _ = stderr.read_to_string(&mut error_msg);
-                        // dd outputs stats to stderr, check for actual errors
-                        if error_msg.contains("Permission denied") || error_msg.contains("No such file") {
-                            return Err(format!("dd error: {}", error_msg));
-                        }
+        let stdout_closed = match line_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(line)) => {
+                if let Some(stripped) = line.strip_prefix("BYTES:") {
+            let mut parts = stripped.splitn(4, ':');
+            let bytes_str = parts.next().unwrap_or("0");
+            let speed_str = parts.next().unwrap_or("0");
+            let avg_str = parts.next().unwrap_or("0");
+            let eta_str = parts.next().unwrap_or("0");
+            if let Ok(bytes) = bytes_str.parse::<u64>() {
+                let frac = (bytes as f64 / disk_size as f64).min(1.0);
+                let progress = pass_start + (frac * pass_range_f).min(pass_range_f) as u32;
+                let written_mib = bytes as f64 / (1024.0 * 1024.0);
+                let eta_secs: u64 = eta_str.parse().unwrap_or(0);
+                let eta_str = if eta_secs > 0 {
+                    let h = eta_secs / 3600;
+                    let m = (eta_secs % 3600) / 60;
+                    let s = eta_secs % 60;
+                    if h > 0 {
+                        format!(", ETA {}:{:02}:{:02}", h, m, s)
+                    } else {
+                        format!(", ETA {}:{:02}", m, s)
                     }
-                    return Ok(()); // dd often exits 0 but reports to stderr
-                }
-            }
-            Ok(None) => {
-                // Estimate progress based on elapsed time
-                let elapsed = start_time.elapsed().as_secs();
-                let estimated_progress = if estimated_seconds > 0 {
-                    ((elapsed as f64 / estimated_seconds as f64) * pass_range as f64).min(pass_range as f64 - 1.0) as u32
                 } else {
-                    0
+                    String::new()
                 };
-                let current = pass_start + estimated_progress;
-                emit_progress(app, current, &format!("Pass {}/{}: {}...", pass_num, total_passes, pass_desc), "tools");
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                emit_progress(
+                    app,
+                    progress,
+                    &format!(
+                        "Pass {}/{}: {}... {:.0} / {:.0} MiB ({} MB/s, Ø {} MB/s{})",
+                        pass_num, total_passes, pass_desc, written_mib, total_mib, speed_str, avg_str, eta_str
+                    ),
+                    "tools",
+                );
             }
-            Err(e) => return Err(format!("Wait error: {}", e)),
+                } else if line == "DONE" {
+                    done = true;
+                }
+                false
+            }
+            Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => true,
+        };
+
+        exit_status = child
+            .try_wait()
+            .map_err(|e| format!("wait error: {}", e))?;
+        if exit_status.is_none() && stdout_closed {
+            // Avoid a busy loop after stdout closes while the child is still
+            // flushing the raw device.
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
+
+    let status = exit_status.expect("exit status is set by loop condition");
+    let _ = stdout_reader.join();
+    let err_msg = stderr_reader.join().unwrap_or_default();
+
+    if !status.success() || !done {
+        if !err_msg.is_empty() {
+            return Err(format!("write error: {}", err_msg.trim()));
+        }
+        return Err("write failed".to_string());
+    }
+    emit_progress(app, pass_end, &format!("Pass {}/{}: Complete", pass_num, total_passes), "tools");
+    Ok(())
 }
 
 /// Get disk size in bytes
@@ -2697,8 +2980,17 @@ async fn secure_erase(
     CANCEL_TOOLS.store(false, Ordering::SeqCst);
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
-    
+
+    // Commands can be invoked independently of the UI. Restrict the device
+    // identifier before embedding the derived path in the privileged script.
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
+
     let disk_path = format!("/dev/r{}", disk_id); // Use raw device for faster writes
+    let python3_path = get_python3_path().ok_or(
+        "Secure erase requires Python 3. Install it with Homebrew: brew install python",
+    )?;
     
     // Level descriptions
     let level_desc = match level {
@@ -2725,11 +3017,11 @@ async fn secure_erase(
     match level {
         0 => {
             // Single pass zeros
-            write_pass(&app, &disk_path, disk_size, "/dev/zero", 1, 1, "Zeros", &password)?;
+            write_pass(&app, &disk_path, disk_size, "/dev/zero", 1, 1, "Zeros", &password, &python3_path)?;
         }
         1 => {
             // Single pass random
-            write_pass(&app, &disk_path, disk_size, "/dev/urandom", 1, 1, "Random", &password)?;
+            write_pass(&app, &disk_path, disk_size, "/dev/urandom", 1, 1, "Random", &password, &python3_path)?;
         }
         2 => {
             // DoD 7-Pass: 0x00, 0xFF, Random, 0x00, 0xFF, Random, Random
@@ -2740,7 +3032,7 @@ async fn secure_erase(
                 }
                 let source = if i % 2 == 1 { "/dev/zero" } else { "/dev/urandom" };
                 let desc = if i % 2 == 1 { "Zeros" } else { "Random" };
-                write_pass(&app, &disk_path, disk_size, source, i, 7, desc, &password)?;
+                write_pass(&app, &disk_path, disk_size, source, i, 7, desc, &password, &python3_path)?;
             }
         }
         3 => {
@@ -2757,17 +3049,17 @@ async fn secure_erase(
                 } else {
                     ("/dev/urandom", "Random")
                 };
-                write_pass(&app, &disk_path, disk_size, source, i, 35, desc, &password)?;
+                write_pass(&app, &disk_path, disk_size, source, i, 35, desc, &password, &python3_path)?;
             }
         }
         4 => {
             // DoE 3-Pass: Random, Zeros, Random
-            write_pass(&app, &disk_path, disk_size, "/dev/urandom", 1, 3, "Random", &password)?;
+            write_pass(&app, &disk_path, disk_size, "/dev/urandom", 1, 3, "Random", &password, &python3_path)?;
             if !CANCEL_TOOLS.load(Ordering::SeqCst) {
-                write_pass(&app, &disk_path, disk_size, "/dev/zero", 2, 3, "Zeros", &password)?;
+                write_pass(&app, &disk_path, disk_size, "/dev/zero", 2, 3, "Zeros", &password, &python3_path)?;
             }
             if !CANCEL_TOOLS.load(Ordering::SeqCst) {
-                write_pass(&app, &disk_path, disk_size, "/dev/urandom", 3, 3, "Random", &password)?;
+                write_pass(&app, &disk_path, disk_size, "/dev/urandom", 3, 3, "Random", &password, &python3_path)?;
             }
         }
         _ => {
@@ -2786,18 +3078,16 @@ async fn secure_erase(
 /// Forensic analysis - gather all available information about a USB device
 #[tauri::command]
 async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_json::Value, String> {
-    // 0. Validate password first with a simple sudo command
-    if let Ok(output) = sudo_sh(&password, "true") {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let combined = format!("{}{}", stdout, stderr);
-        
-        if combined.contains("Sorry, try again") || 
-           combined.contains("incorrect password") ||
-           combined.contains("no password was provided") ||
-           combined.contains("Authentication failed") {
-            return Err("Falsches Passwort. Bitte geben Sie Ihr Admin-Passwort korrekt ein.".to_string());
-        }
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
+
+    // Validate the password before collecting evidence. Do not continue with
+    // a partial, silently unprivileged acquisition if sudo rejects it.
+    let password_check = sudo_sh(&password, "true")
+        .map_err(|e| format!("Administrator-Prüfung fehlgeschlagen: {}", e))?;
+    if !password_check.status.success() {
+        return Err("Falsches Passwort. Bitte geben Sie Ihr Admin-Passwort korrekt ein.".to_string());
     }
     
     let mut result = serde_json::json!({
@@ -3860,6 +4150,26 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         }
     }
     
+    let mut sources = vec!["diskutil".to_string(), "raw disk header".to_string()];
+    if result.get("usb_info").is_some() { sources.push("system_profiler".to_string()); }
+    if result.get("smart_info").is_some() { sources.push("SMART / smartctl".to_string()); }
+    if result.get("filesystem_details").is_some() { sources.push("mounted filesystem metadata".to_string()); }
+
+    let mut limitations = Vec::new();
+    if result.get("smart_info").is_none() {
+        limitations.push("SMART-Daten wurden vom Gerät oder USB-Adapter nicht bereitgestellt.".to_string());
+    }
+    if result.get("filesystem_details").is_none() {
+        limitations.push("Datei-Metadaten sind nur für ein von macOS lesbar eingehängtes Dateisystem verfügbar.".to_string());
+    }
+
+    result["analysis_quality"] = serde_json::json!({
+        "mode": "read_only",
+        "sources": sources,
+        "limitations": limitations,
+        "sections_collected": result.as_object().map(|sections| sections.len()).unwrap_or(0),
+    });
+
     Ok(result)
 }
 
@@ -5144,7 +5454,34 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     CANCEL_BURN.store(false, Ordering::SeqCst);
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
-    let iso_size = std::fs::metadata(&iso_path).map_err(|e| format!("ISO nicht gefunden: {}", e))?.len();
+    let compressed_size = std::fs::metadata(&iso_path)
+        .map_err(|e| format!("Image nicht gefunden: {}", e))?
+        .len();
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
+    let python3_path = get_python3_path().ok_or(
+        "Das Schreiben von Images benötigt Python 3. Installieren Sie es mit: brew install python",
+    )?;
+    let is_xz = is_xz_compressed(&iso_path)?;
+    let image_size = if is_xz {
+        let xz_path = get_xz_path().ok_or(
+            "Für XZ-komprimierte Images wird xz benötigt. Installieren Sie es mit: brew install xz",
+        )?;
+        xz_uncompressed_size(&xz_path, &iso_path)?
+    } else {
+        compressed_size
+    };
+    let disk_size = get_disk_size(&disk_id)?;
+    if image_size > disk_size {
+        return Err(format!(
+            "Image ist zu groß: {} benötigt, Datenträger bietet nur {}",
+            format_bytes(image_size),
+            format_bytes(disk_size)
+        ));
+    }
+    let iso_path_literal = serde_json::to_string(&iso_path)
+        .map_err(|e| format!("Image-Pfad konnte nicht verarbeitet werden: {}", e))?;
     
     let _ = app.emit("burn_phase", "writing");
     emit_progress(&app, 0, "Vorbereitung...", "burn");
@@ -5155,33 +5492,41 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     emit_progress(&app, 0, "Unmount Disk...", "burn");
     ensure_disk_unmounted(&app, &disk_id)?;
     
-    emit_progress(&app, 0, "Schreibe ISO auf USB...", "burn");
+    let source_label = if is_xz { "Entpacke und schreibe XZ-Image auf USB..." } else { "Schreibe Image auf USB..." };
+    emit_progress(&app, 0, source_label, "burn");
     
     let python_script = format!(
-        r#"import os, sys
-iso_path = "{}"
+        r#"import os, sys, lzma
+iso_path = {}
 disk_path = "{}"
 buffer_size = 1024 * 1024
 total_size = {}
+is_xz = {}
 copied = 0
 try:
-    with open(iso_path, 'rb') as src:
+    opener = lzma.open if is_xz else open
+    with opener(iso_path, 'rb') as src:
         fd = os.open(disk_path, os.O_WRONLY)
         with os.fdopen(fd, 'wb', buffering=0) as dst:
             while True:
                 chunk = src.read(buffer_size)
                 if not chunk: break
-                dst.write(chunk)
+                view = memoryview(chunk)
+                while view:
+                    count = dst.write(view)
+                    if count is None or count <= 0:
+                        raise OSError("short write to destination device")
+                    view = view[count:]
                 copied += len(chunk)
                 print(f"BYTES:{{copied}}", flush=True)
             dst.flush()
             os.fsync(dst.fileno())
-except OSError as exc:
+except (OSError, lzma.LZMAError) as exc:
     print(f"ERROR: {{exc}}", file=sys.stderr)
     sys.exit(1)
-print("WRITE_SUCCESS", flush=True)"#, iso_path.replace('"', r#"\""#), rdisk_path, iso_size);
+print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
 
-    let mut child = Command::new("sudo").args(["-S", "python3", "-c", &python_script])
+    let mut child = Command::new("sudo").args(["-S", &python3_path, "-c", &python_script])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("Fehler beim Starten: {}", e))?;
     
@@ -5200,7 +5545,7 @@ print("WRITE_SUCCESS", flush=True)"#, iso_path.replace('"', r#"\""#), rdisk_path
         }
         if let Some(stripped) = line.strip_prefix("BYTES:") {
             if let Ok(bytes) = stripped.parse::<u64>() {
-                let percent = ((bytes as f64 / iso_size as f64) * 100.0) as u32;
+                let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
                 emit_progress(&app, percent.min(100), &format!("SCHREIBEN: {}%", percent.min(100)), "burn");
             }
         } else if line.contains("WRITE_SUCCESS") {
@@ -5212,7 +5557,15 @@ print("WRITE_SUCCESS", flush=True)"#, iso_path.replace('"', r#"\""#), rdisk_path
     
     if !status.success() || !write_success {
         let _ = app.emit("burn_phase", "error");
-        return Err("Brennvorgang fehlgeschlagen".to_string());
+        let mut error_msg = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut error_msg);
+        }
+        return if error_msg.trim().is_empty() {
+            Err("Brennvorgang fehlgeschlagen".to_string())
+        } else {
+            Err(format!("Brennvorgang fehlgeschlagen: {}", error_msg.trim()))
+        };
     }
     
     if verify {
@@ -5233,15 +5586,17 @@ print("WRITE_SUCCESS", flush=True)"#, iso_path.replace('"', r#"\""#), rdisk_path
         emit_progress(&app, 0, "VERIFIZIEREN: 0%", "burn");
         
         let verify_script = format!(
-            r#"import os, sys
-iso_path = "{}"
+            r#"import os, sys, lzma
+iso_path = {}
 disk_path = "{}"
 buffer_size = 1024 * 1024
 total_size = {}
+is_xz = {}
 verified = 0
 errors = 0
 try:
-    with open(iso_path, 'rb') as iso_file:
+    opener = lzma.open if is_xz else open
+    with opener(iso_path, 'rb') as iso_file:
         fd = os.open(disk_path, os.O_RDONLY)
         with os.fdopen(fd, 'rb', buffering=0) as disk_file:
             while verified < total_size:
@@ -5253,16 +5608,16 @@ try:
                     print(f"MISMATCH:{{verified}}", flush=True)
                 verified += len(iso_chunk)
                 print(f"VERIFY:{{verified}}:{{errors}}", flush=True)
-except OSError as exc:
+except (OSError, lzma.LZMAError) as exc:
     print(f"ERROR: {{exc}}", file=sys.stderr)
     sys.exit(1)
 if errors == 0:
     print("VERIFY_SUCCESS", flush=True)
 else:
     print(f"VERIFY_FAILED:{{errors}}", flush=True)
-    sys.exit(1)"#, iso_path.replace('"', r#"\""#), rdisk_path, iso_size);
+    sys.exit(1)"#, iso_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
 
-        let mut verify_child = Command::new("sudo").args(["-S", "python3", "-c", &verify_script])
+        let mut verify_child = Command::new("sudo").args(["-S", &python3_path, "-c", &verify_script])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             .map_err(|e| format!("Verifizierung Fehler: {}", e))?;
         
@@ -5284,7 +5639,7 @@ else:
                 let parts: Vec<&str> = stripped.split(':').collect();
                 if let (Some(bytes_str), Some(err_str)) = (parts.first(), parts.get(1)) {
                     if let (Ok(bytes), Ok(errs)) = (bytes_str.parse::<u64>(), err_str.parse::<u32>()) {
-                        let percent = ((bytes as f64 / iso_size as f64) * 100.0) as u32;
+                        let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
                         let status_msg = if errs > 0 {
                             format!("VERIFIZIEREN: {}% ({} Fehler)", percent.min(100), errs)
                         } else {

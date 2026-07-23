@@ -65,7 +65,9 @@
     "flags": "Flags",
     "status": "Status",
     "prefail": "Pre-fail",
-    "ok": "OK"
+    "ok": "OK",
+    "readOnlyMode": "Nur lesende Analyse",
+    "sectionsCollected": "Datenbereiche erfasst"
   },
   "burn": {
     "selectIso": "ISO-Datei auswählen",
@@ -254,8 +256,14 @@
     "formatButton": "Formatieren",
     "secureEraseTitle": "Sicheres Löschen",
     "eraseQuick": "Schnell (1x Nullen)",
+    "eraseQuickTime": "ca. 15 Min – 1 Std",
     "eraseRandom": "Zufallsdaten",
+    "eraseRandomTime": "ca. 15 Min – 1 Std",
     "eraseDoe": "DoE 3-Pass",
+    "eraseDoeTime": "ca. 45 Min – 3 Std",
+    "eraseEstimatePrefix": "ca.",
+    "eraseEstimateMinutes": "Min",
+    "eraseEstimateHours": "Std",
     "eraseGutmann": "Gutmann 35x",
     "eraseGutmannWarn": "⚠️ Nicht für Flash!",
     "secureEraseButton": "Sicher löschen",
@@ -481,7 +489,7 @@
     "copied": "Kopiert!"
   },
   "errors": {
-    "invalidIsoExtension": "Ungültige Dateiendung. Erlaubt sind .iso oder .img.",
+    "invalidIsoExtension": "Ungültige Dateiendung. Erlaubt sind .iso, .img oder .xz.",
     "invalidIsoPath": "Ungültiger ISO-Pfad.",
     "invalidBackupPath": "Ungültiger Backup-Pfad.",
     "invalidBackupExtension": "Ungültige Dateiendung für Backup. Erlaubt sind .img, .iso oder .dmg."

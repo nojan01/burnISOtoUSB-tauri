@@ -65,7 +65,9 @@
     "flags": "Flags",
     "status": "Status",
     "prefail": "Pre-fail",
-    "ok": "OK"
+    "ok": "OK",
+    "readOnlyMode": "Read-only analysis",
+    "sectionsCollected": "data sections collected"
   },
   "burn": {
     "selectIso": "Select ISO File",
@@ -254,8 +256,14 @@
     "formatButton": "Format",
     "secureEraseTitle": "Secure Erase",
     "eraseQuick": "Quick (1x Zeros)",
+    "eraseQuickTime": "~15 min – 1 h",
     "eraseRandom": "Random Data",
+    "eraseRandomTime": "~15 min – 1 h",
     "eraseDoe": "DoE 3-Pass",
+    "eraseDoeTime": "~45 min – 3 h",
+    "eraseEstimatePrefix": "~",
+    "eraseEstimateMinutes": "min",
+    "eraseEstimateHours": "h",
     "eraseGutmann": "Gutmann 35x",
     "eraseGutmannWarn": "⚠️ Not for Flash!",
     "secureEraseButton": "Secure Erase",
@@ -481,7 +489,7 @@
     "copied": "Copied!"
   },
   "errors": {
-    "invalidIsoExtension": "Invalid file extension. Allowed: .iso or .img.",
+    "invalidIsoExtension": "Invalid file extension. Allowed: .iso, .img, or .xz.",
     "invalidIsoPath": "Invalid ISO path.",
     "invalidBackupPath": "Invalid backup path.",
     "invalidBackupExtension": "Invalid backup file extension. Allowed: .img, .iso or .dmg."

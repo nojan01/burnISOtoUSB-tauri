@@ -423,6 +423,61 @@ document.addEventListener('DOMContentLoaded', async () => {
   const eraseLevelInputs = document.querySelectorAll('input[name="erase-level"]');
   const secureEraseBtn = document.getElementById('secure-erase-btn');
   const cancelEraseBtn = document.getElementById('cancel-erase-btn');
+
+  // Update the small "~xx min" labels under each erase option based on the
+  // currently selected disk size. Estimates use a typical USB write speed
+  // range of 10–30 MB/s — slow USB-2 sticks at the low end, decent USB-3
+  // sticks at the high end.
+  function updateEraseTimeEstimates(sizeStr) {
+    // Parse "63 GB" / "32 GB" / "1.5 TB" → bytes
+    let gb = NaN;
+    if (sizeStr) {
+      const m = String(sizeStr).match(/([\d.,]+)\s*(KB|MB|GB|TB)/i);
+      if (m) {
+        const v = parseFloat(m[1].replace(',', '.'));
+        const unit = m[2].toUpperCase();
+        const factor = unit === 'TB' ? 1024 : unit === 'GB' ? 1 : unit === 'MB' ? 1/1024 : 1/(1024*1024);
+        gb = v * factor;
+      }
+    }
+
+    function fmt(min) {
+      if (!isFinite(min) || min <= 0) return '';
+      const number = new Intl.NumberFormat(window.i18n.currentLang === 'de' ? 'de-DE' : 'en-US', {
+        maximumFractionDigits: 0
+      });
+      if (min < 60) return number.format(Math.round(min)) + ' ' + t('tools.eraseEstimateMinutes');
+      const h = Math.floor(min / 60);
+      const r = Math.round(min - h * 60);
+      const hours = number.format(h) + ' ' + t('tools.eraseEstimateHours');
+      return r === 0 ? hours : hours + ' ' + number.format(r) + ' ' + t('tools.eraseEstimateMinutes');
+    }
+
+    function rangeFor(passes) {
+      if (!isFinite(gb) || gb <= 0) return null;
+      // 30 MB/s fast end, 10 MB/s slow end
+      const fastMin = (gb * 1024) / 30 / 60 * passes;
+      const slowMin = (gb * 1024) / 10 / 60 * passes;
+      return t('tools.eraseEstimatePrefix') + ' ' + fmt(fastMin) + ' – ' + fmt(slowMin);
+    }
+
+    const map = { '0': 1, '1': 1, '4': 3, '3': 35 };
+    eraseLevelInputs.forEach(input => {
+      const small = input.parentElement.querySelector('small');
+      if (!small) return;
+      // Don't overwrite the Gutmann warning text
+      if (input.value === '3') return;
+      const range = rangeFor(map[input.value]);
+      if (range) {
+        small.textContent = range;
+      } else {
+        // Restore default i18n label
+        const key = small.getAttribute('data-i18n');
+        if (key && window.i18n) small.textContent = window.i18n.t(key);
+      }
+    });
+  }
+
   const bootcheckBtn = document.getElementById('bootcheck-btn');
   const bootcheckResult = document.getElementById('bootcheck-result');
   const toolsProgressFill = document.getElementById('tools-progress-fill');
@@ -538,7 +593,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Helper to set ISO file from path
   function setIsoFile(path) {
-    if (path && (path.toLowerCase().endsWith('.iso') || path.toLowerCase().endsWith('.img'))) {
+    if (path && (path.toLowerCase().endsWith('.iso') || path.toLowerCase().endsWith('.img') || path.toLowerCase().endsWith('.xz'))) {
       selectedIsoPath = path;
       isoPathInput.value = path;
       logBurn(t('logs.isoSelected') + path.split('/').pop(), 'info');
@@ -607,6 +662,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   function logDiagnose(message, type) { appendLog(diagnoseLog, message, type); }
   function logTools(message, type) { appendLog(toolsLog, message, type); }
   function logForensic(message, type) { appendLog(forensicLog, message, type); }
+
+  function forensicValue(value, fallback = '—') {
+    if (value === null || value === undefined || value === '' || value === 'Not applicable') return fallback;
+    if (typeof value === 'boolean') return value ? t('forensic.yes') : t('forensic.no');
+    return String(value);
+  }
+
+  function forensicItem(label, value, options = {}) {
+    const className = options.className ? ' ' + options.className : '';
+    const fullWidth = options.fullWidth ? ' full-width' : '';
+    return '<div class="forensic-item' + fullWidth + '">' +
+      '<span class="forensic-label">' + escapeHtml(label) + ':</span>' +
+      '<span class="forensic-value' + className + '">' + escapeHtml(forensicValue(value)) + '</span>' +
+      '</div>';
+  }
 
   // Reset burn state to initial (silent = no disk reload log)
   function resetBurnState(silent) {
@@ -809,7 +879,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   selectIsoBtn.addEventListener('click', async function() {
     try {
       const selected = await open({
-        filters: [{ name: 'ISO/IMG Files', extensions: ['iso', 'img', 'dmg'] }],
+        filters: [{ name: 'ISO/IMG/XZ Files', extensions: ['iso', 'img', 'dmg', 'xz'] }],
         multiple: false
       });
       
@@ -880,8 +950,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     
     // W3: Frontend-Validierung des ISO-Pfads
     const isoLower = String(selectedIsoPath).toLowerCase();
-    if (!isoLower.endsWith('.iso') && !isoLower.endsWith('.img')) {
-      logBurn(t('errors.invalidIsoExtension') || 'Invalid file: only .iso/.img are supported', 'error');
+    if (!isoLower.endsWith('.iso') && !isoLower.endsWith('.img') && !isoLower.endsWith('.xz')) {
+      logBurn(t('errors.invalidIsoExtension') || 'Invalid file: only .iso/.img/.xz are supported', 'error');
       return;
     }
     if (selectedIsoPath.length < 5) {
@@ -1784,6 +1854,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       repairBtn.disabled = false;
       secureEraseBtn.disabled = false;
       bootcheckBtn.disabled = false;
+      updateEraseTimeEstimates(selectedToolsDisk.size);
     } else {
       selectedToolsDisk = null;
       toolsDiskInfo.classList.remove('visible');
@@ -1791,6 +1862,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       repairBtn.disabled = true;
       secureEraseBtn.disabled = true;
       bootcheckBtn.disabled = true;
+      updateEraseTimeEstimates(null);
     }
   });
 
@@ -2146,6 +2218,38 @@ document.addEventListener('DOMContentLoaded', async () => {
       html += '<h4>🔬 ' + (t('tools.forensicTitle') || 'Forensik-Analyse') + '</h4>';
       html += '<div class="forensic-timestamp">' + (t('tools.forensicTimestamp') || 'Zeitstempel') + ': ' + eh(result.timestamp) + '</div>';
       html += '</div>';
+
+      // A compact overview makes the key evidence visible before the detailed
+      // acquisition data. The remaining sections retain the complete result.
+      const overviewDisk = result.disk_info || {};
+      const overviewSmart = result.smart_info || {};
+      const overviewPartitions = Array.isArray(result.partitions) ? result.partitions.length : 0;
+      const overviewHealth = overviewSmart.health_status || overviewDisk.smart_status || t('tools.unknown');
+      const overviewBootable = overviewDisk.bootable === true || result.boot_info?.is_iso9660 ||
+        (result.boot_info?.has_gpt && (result.boot_info?.has_efi || result.mbr_analysis?.partition_entries?.some(p => p.type_hex === 'EF')));
+      const overviewFilesystem = overviewDisk.filesystem || overviewDisk.content_type || t('tools.unknown');
+      const overviewDevice = overviewDisk.media_name || overviewDisk.device_id || result.disk_id || t('tools.unknown');
+
+      html += '<section class="forensic-overview" aria-label="Forensik-Überblick">';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.device')) + '</span><strong>' + eh(forensicValue(overviewDevice)) + '</strong></div>';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.size')) + '</span><strong>' + eh(forensicValue(overviewDisk.disk_size)) + '</strong></div>';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.filesystem')) + '</span><strong>' + eh(forensicValue(overviewFilesystem)) + '</strong></div>';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.forensicPartitions')) + '</span><strong>' + overviewPartitions + '</strong></div>';
+      html += '<div class="forensic-overview-card ' + (String(overviewHealth).toLowerCase().includes('fail') ? 'critical' : '') + '"><span class="forensic-overview-label">SMART</span><strong>' + eh(forensicValue(overviewHealth)) + '</strong></div>';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.forensicBootable')) + '</span><strong>' + (overviewBootable ? '✓ ' + eh(t('forensic.yes')) : '— ' + eh(t('forensic.no'))) + '</strong></div>';
+      html += '</section>';
+
+      if (result.analysis_quality) {
+        const sources = Array.isArray(result.analysis_quality.sources) ? result.analysis_quality.sources : [];
+        const limitations = Array.isArray(result.analysis_quality.limitations) ? result.analysis_quality.limitations : [];
+        html += '<section class="forensic-acquisition">';
+        html += '<div><strong>✓ ' + eh(t('forensic.readOnlyMode')) + '</strong>';
+        if (result.analysis_quality.sections_collected) html += ' <span class="forensic-acquisition-count">' + eh(result.analysis_quality.sections_collected) + ' ' + eh(t('forensic.sectionsCollected')) + '</span>';
+        html += '</div>';
+        if (sources.length) html += '<div class="forensic-source-list">' + sources.map(source => '<span>' + eh(source) + '</span>').join('') + '</div>';
+        if (limitations.length) html += '<ul class="forensic-limitations">' + limitations.map(note => '<li>' + eh(note) + '</li>').join('') + '</ul>';
+        html += '</section>';
+      }
       
       // Paragon Drivers Section (if available)
       if (result.paragon_drivers) {
@@ -2165,16 +2269,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Check if this is an SD Card (has SD Card info from card reader)
       const isSDCard = result.usb_info && result.usb_info.hardware_type === 'SD Card';
       
-      for (let key in result.disk_info) {
-        // Skip smart_status from diskutil for SD Cards (we show card reader health status instead)
-        if (isSDCard && key === 'smart_status') continue;
-        
-        const value = result.disk_info[key];
-        // Skip "Not applicable" values from diskutil output
-        if (value && !String(value).includes('Not applicable')) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(key) + ':</span> <span class="forensic-value">' + eh(value) + '</span></div>';
+      const diskLabels = {
+        media_name: t('tools.forensicMediaName'), device_id: 'Identifier', device_node: 'Gerätepfad',
+        protocol: t('tools.forensicProtocol'), disk_size: t('tools.forensicTotalSize'),
+        block_size: 'Blockgröße', filesystem: t('tools.forensicFileSystem'), content_type: 'Inhaltstyp',
+        volume_name: 'Volume', mount_point: t('tools.mountPoint'), total_space: t('tools.forensicTotalSize'),
+        used_space: t('tools.forensicUsedSpace'), free_space: t('tools.forensicFreeSpace'),
+        removable: t('tools.forensicRemovable'), read_only: 'Schreibgeschützt', is_ssd: 'Solid State',
+        uuid: 'UUID', volume_uuid: 'Volume-UUID', smart_status: 'SMART'
+      };
+      const primaryDiskFields = ['media_name', 'device_id', 'device_node', 'protocol', 'disk_size', 'block_size',
+        'filesystem', 'content_type', 'volume_name', 'mount_point', 'total_space', 'used_space', 'free_space',
+        'removable', 'read_only', 'is_ssd', 'uuid', 'volume_uuid', 'smart_status'];
+      primaryDiskFields.forEach(key => {
+        if (isSDCard && key === 'smart_status') return;
+        const value = result.disk_info?.[key];
+        if (value !== undefined && value !== null && value !== '' && !String(value).includes('Not applicable')) {
+          html += forensicItem(diskLabels[key] || key, value, { className: key.includes('uuid') ? 'mono' : '' });
         }
-      }
+      });
       html += '</div></div>';
       
       // Partitions Section - show all partitions with their filesystems
@@ -2301,7 +2414,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       
       // Partition Layout Section
-      if (result.partition_layout) {
+      if (result.partition_layout && !(result.partitions && Array.isArray(result.partitions) && result.partitions.length > 0)) {
         html += '<div class="forensic-section">';
         html += '<h5>💾 ' + t('tools.forensicPartitions') + '</h5>';
         html += '<div class="forensic-partitions">';
@@ -2442,30 +2555,30 @@ document.addEventListener('DOMContentLoaded', async () => {
       
       // Hardware Info Section
       if (result.hardware_info) {
-        html += '<div class="forensic-section">';
-        html += '<h5>🔧 ' + (t('tools.forensicHardwareInfo') || 'Hardware-Details') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>🔧 ' + (t('tools.forensicHardwareInfo') || 'Hardware-Details') + '</summary>';
         html += '<div class="forensic-grid">';
         for (let key in result.hardware_info) {
           html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(result.hardware_info[key]) + '</span></div>';
         }
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // Controller Info Section
       if (result.controller_info) {
-        html += '<div class="forensic-section">';
-        html += '<h5>🎛️ ' + (t('tools.forensicController') || 'USB-Controller') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>🎛️ ' + (t('tools.forensicController') || 'USB-Controller') + '</summary>';
         html += '<div class="forensic-grid">';
         for (let key in result.controller_info) {
           html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(result.controller_info[key]) + '</span></div>';
         }
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // Storage Info Section
       if (result.storage_info) {
-        html += '<div class="forensic-section">';
-        html += '<h5>💿 ' + (t('tools.forensicStorageInfo') || 'Speicher-Details') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>💿 ' + (t('tools.forensicStorageInfo') || 'Speicher-Details') + '</summary>';
         html += '<div class="forensic-grid">';
         for (let key in result.storage_info) {
           let value = result.storage_info[key];
@@ -2475,28 +2588,28 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
           html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(value) + '</span></div>';
         }
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // Disk Activity Section
       if (result.disk_activity) {
-        html += '<div class="forensic-section">';
-        html += '<h5>📊 ' + (t('tools.forensicActivity') || 'Disk-Aktivität') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>📊 ' + (t('tools.forensicActivity') || 'Disk-Aktivität') + '</summary>';
         html += '<div class="forensic-grid">';
         html += '<div class="forensic-item"><span class="forensic-label">KB/Transfer:</span> <span class="forensic-value">' + eh(result.disk_activity.kb_per_transfer) + '</span></div>';
         html += '<div class="forensic-item"><span class="forensic-label">Transfers/s:</span> <span class="forensic-value">' + eh(result.disk_activity.transfers_per_sec) + '</span></div>';
         html += '<div class="forensic-item"><span class="forensic-label">MB/s:</span> <span class="forensic-value">' + eh(result.disk_activity.mb_per_sec) + '</span></div>';
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // MBR Analysis Section
       if (result.mbr_analysis) {
-        html += '<div class="forensic-section">';
-        html += '<h5>📀 ' + (t('tools.forensicMbrAnalysis') || 'MBR-Analyse') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>📀 ' + (t('tools.forensicMbrAnalysis') || 'MBR-Analyse') + '</summary>';
         html += '<div class="forensic-grid">';
         html += '<div class="forensic-item"><span class="forensic-label">MBR-Signatur:</span> <span class="forensic-value">' + eh(result.mbr_analysis.mbr_signature) + '</span></div>';
         html += '<div class="forensic-item"><span class="forensic-label">Gültig:</span> <span class="forensic-value">' + (result.mbr_analysis.valid_mbr ? '✓ Ja' : '✗ Nein') + '</span></div>';
-        html += '</div>';
+        html += '</details>';
         if (result.mbr_analysis.partition_entries && result.mbr_analysis.partition_entries.length > 0) {
           html += '<div class="forensic-partitions" style="margin-top:8px;">';
           result.mbr_analysis.partition_entries.forEach(p => {
@@ -2513,15 +2626,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       
       // GPT Analysis Section
       if (result.gpt_analysis) {
-        html += '<div class="forensic-section">';
-        html += '<h5>📦 ' + (t('tools.forensicGptAnalysis') || 'GPT-Analyse') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>📦 ' + (t('tools.forensicGptAnalysis') || 'GPT-Analyse') + '</summary>';
         html += '<div class="forensic-grid">';
         html += '<div class="forensic-item"><span class="forensic-label">GPT-Signatur:</span> <span class="forensic-value">' + eh(result.gpt_analysis.gpt_signature) + '</span></div>';
         html += '<div class="forensic-item"><span class="forensic-label">Gültig:</span> <span class="forensic-value">' + (result.gpt_analysis.valid_gpt ? '✓ Ja' : '✗ Nein') + '</span></div>';
         if (result.gpt_analysis.gpt_revision) {
           html += '<div class="forensic-item"><span class="forensic-label">Revision:</span> <span class="forensic-value">' + eh(result.gpt_analysis.gpt_revision) + '</span></div>';
         }
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // Filesystem Details Section
@@ -2845,8 +2958,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       
       // Sector Checksums Section
       if (result.sector_checksums) {
-        html += '<div class="forensic-section">';
-        html += '<h5>🔐 ' + t('tools.forensicChecksums') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>🔐 ' + t('tools.forensicChecksums') + '</summary>';
         html += '<div class="forensic-grid">';
         if (result.sector_checksums.mbr_md5) {
           html += '<div class="forensic-item full-width"><span class="forensic-label">MD5:</span> <span class="forensic-value mono">' + eh(result.sector_checksums.mbr_md5) + '</span></div>';
@@ -2854,15 +2967,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (result.sector_checksums.mbr_sha256) {
           html += '<div class="forensic-item full-width"><span class="forensic-label">SHA256:</span> <span class="forensic-value mono">' + eh(result.sector_checksums.mbr_sha256) + '</span></div>';
         }
-        html += '</div></div>';
+        html += '</div></details>';
       }
       
       // Raw Header Hex Dump Section
       if (result.raw_header_hex) {
-        html += '<div class="forensic-section">';
-        html += '<h5>🔢 ' + (t('tools.forensicRawHeader') || 'Raw Header (Hex)') + '</h5>';
+        html += '<details class="forensic-section forensic-disclosure">';
+        html += '<summary>🔢 ' + (t('tools.forensicRawHeader') || 'Raw Header (Hex)') + '</summary>';
         html += '<pre class="forensic-hexdump">' + eh(result.raw_header_hex) + '</pre>';
-        html += '</div>';
+        html += '</details>';
       }
       
       html += '</div>';
@@ -2901,6 +3014,40 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   
   // Save forensic JSON button
+  function buildForensicJsonExport(result) {
+    const disk = result.disk_info || {};
+    const boot = result.boot_info || {};
+    const smart = result.smart_info || {};
+    const partitions = Array.isArray(result.partitions) ? result.partitions : [];
+    const detectedFilesystems = result.filesystem_signatures?.detected_filesystems || [];
+
+    return {
+      schema_version: '1.0',
+      report: {
+        type: 'forensic-usb-analysis',
+        created_at: result.timestamp,
+        language: window.i18n.currentLang,
+        read_only: result.analysis_quality?.mode === 'read_only'
+      },
+      summary: {
+        device: disk.media_name || disk.device_id || result.disk_id || null,
+        disk_identifier: result.disk_id || disk.device_id || null,
+        capacity: disk.disk_size || null,
+        filesystem: disk.filesystem || disk.content_type || null,
+        partition_count: partitions.length,
+        bootable: Boolean(disk.bootable || boot.is_iso9660 || (boot.has_gpt && boot.has_efi)),
+        smart_health: smart.health_status || disk.smart_status || null,
+        detected_filesystems: detectedFilesystems
+      },
+      acquisition: result.analysis_quality || {
+        mode: 'read_only',
+        sources: [],
+        limitations: []
+      },
+      evidence: result
+    };
+  }
+
   copyForensicBtn.addEventListener('click', async function() {
     if (!lastForensicResult) return;
     
@@ -2912,7 +3059,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
       
       if (filePath) {
-        const jsonContent = JSON.stringify(lastForensicResult, null, 2);
+        const jsonContent = JSON.stringify(buildForensicJsonExport(lastForensicResult), null, 2);
         await invoke('write_text_file', { path: filePath, content: jsonContent });
         copyForensicBtn.textContent = '✓ ' + t('messages.success');
         logForensic(t('forensic.reportSaved').replace('{path}', filePath), 'success');
@@ -2950,6 +3097,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   function generateForensicHtmlReport(result) {
     const deviceName = result.disk_info?.Device || result.disk_info?.['Device Identifier'] || 'USB';
     const currentLang = window.i18n.currentLang;
+    const renderedReport = forensicResult.querySelector('.forensic-report');
+    if (renderedReport) {
+      // Reuse the structured in-app report so HTML and UI cannot drift apart.
+      // The report contains only escaped data from the backend.
+      return `<!DOCTYPE html>
+<html lang="${escapeHtml(currentLang)}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(t('forensic.reportTitle'))} - ${escapeHtml(deviceName)}</title>
+  <style>
+    body { background: #f2f4f7; color: #18212f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 24px; }
+    .forensic-report { background: #fff; border-radius: 10px; box-shadow: 0 2px 12px #18212f1a; margin: 0 auto; max-width: 1080px; padding: 22px; }
+    .forensic-header { border-bottom: 1px solid #d9e0e8; margin-bottom: 16px; padding-bottom: 12px; }
+    .forensic-header h4 { color: #1769aa; font-size: 18px; margin: 0 0 4px; } .forensic-timestamp, .forensic-label { color: #5f6b7a; }
+    .forensic-overview { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-bottom: 16px; }
+    .forensic-overview-card, .forensic-acquisition, .forensic-partition, .forensic-fs-item { background: #f7f9fb; border: 1px solid #d9e0e8; border-radius: 6px; padding: 9px 10px; }
+    .forensic-overview-label { color: #5f6b7a; display: block; font-size: 11px; margin-bottom: 3px; } .forensic-overview-card strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
+    .forensic-acquisition { border-left: 3px solid #2e8b57; font-size: 12px; margin-bottom: 16px; } .forensic-source-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; } .forensic-source-list span, .forensic-type-badge, .toplevel-item { background: #e8eef5; border-radius: 12px; padding: 2px 7px; } .forensic-limitations { margin: 7px 0 0; padding-left: 18px; }
+    .forensic-section { border-bottom: 1px solid #d9e0e8; margin-bottom: 15px; padding-bottom: 12px; } .forensic-section h5, .forensic-disclosure summary { color: #1769aa; font-size: 14px; font-weight: 650; }
+    .forensic-disclosure { background: #f7f9fb; border-radius: 6px; padding: 10px; } .forensic-disclosure summary { cursor: pointer; } .forensic-disclosure > :not(summary) { margin-top: 10px; }
+    .forensic-grid { display: grid; gap: 7px 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); } .forensic-item { display: flex; gap: 6px; min-width: 0; } .forensic-item.full-width { grid-column: 1 / -1; } .forensic-value { overflow-wrap: anywhere; } .mono, .forensic-hexdump { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .forensic-partitions, .forensic-filesystems, .forensic-filelist { display: flex; flex-direction: column; gap: 6px; } .forensic-hexdump { background: #18212f; border-radius: 6px; color: #b9f6ca; font-size: 10px; overflow-x: auto; padding: 12px; white-space: pre; }
+    .forensic-types, .forensic-toplevel { display: flex; flex-wrap: wrap; gap: 5px; } .smart-attributes-table-container { overflow-x: auto; } .smart-attributes-table { border-collapse: collapse; font-size: 11px; width: 100%; } .smart-attributes-table th, .smart-attributes-table td { border: 1px solid #d9e0e8; padding: 5px; text-align: left; }
+    @media print { body { background: #fff; padding: 0; } .forensic-report { box-shadow: none; max-width: none; } details { display: block; } details:not([open]) > :not(summary) { display: block; } }
+  </style>
+</head>
+<body>${renderedReport.outerHTML}</body>
+</html>`;
+    }
     let html = `<!DOCTYPE html>
 <html lang="${currentLang}">
 <head>
@@ -3620,10 +3797,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!cancelDiagnoseBtn.disabled) cancelDiagnoseBtn.click();
         break;
       case 'lang_de':
-        window.i18n.setLanguage('de');
+        window.i18n.setLanguage('de').then(() => updateEraseTimeEstimates(selectedToolsDisk?.size));
         break;
       case 'lang_en':
-        window.i18n.setLanguage('en');
+        window.i18n.setLanguage('en').then(() => updateEraseTimeEstimates(selectedToolsDisk?.size));
         break;
       case 'theme_dark':
         window.i18n.setTheme('dark');

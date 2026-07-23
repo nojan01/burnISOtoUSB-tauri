@@ -79,6 +79,8 @@
 ### Voraussetzungen
 - macOS 10.15 (Catalina) oder neuer
 - Administrator-Rechte (für USB-Zugriff)
+- Python 3 zum Brennen und sicheren Löschen (bei Bedarf: `brew install python`)
+- Für XZ-komprimierte Images: `xz` (bei Bedarf: `brew install xz`)
 
 ### Download
 1. Lade die neueste Version von der [Releases-Seite](https://github.com/nojan01/burniso-tauri/releases) herunter
@@ -196,6 +198,7 @@ cargo tauri build
 - Windows ISO-Images
 - macOS Installer Images
 - Hybrid ISO/IMG Images
+- XZ-komprimierte ISO/IMG Images (automatisch beim Schreiben entpackt)
 
 ### Dateisysteme (Backup)
 - **APFS** - Apple File System

@@ -1549,6 +1549,74 @@ body {
   color: var(--text-primary);
 }
 
+.forensic-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.forensic-overview-card {
+  background: var(--surface-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 9px 10px;
+  min-width: 0;
+}
+
+.forensic-overview-card.critical {
+  border-color: var(--accent-red);
+}
+
+.forensic-overview-label {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 10px;
+  margin-bottom: 3px;
+}
+
+.forensic-overview-card strong {
+  display: block;
+  color: var(--text-primary);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forensic-acquisition {
+  border-left: 3px solid var(--accent-green);
+  background: var(--surface-primary);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin: 0 0 16px;
+  padding: 9px 11px;
+}
+
+.forensic-acquisition-count {
+  margin-left: 5px;
+}
+
+.forensic-source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.forensic-source-list span {
+  background: var(--surface-secondary);
+  border-radius: 10px;
+  color: var(--text-primary);
+  padding: 2px 7px;
+}
+
+.forensic-limitations {
+  margin: 7px 0 0;
+  padding-left: 17px;
+}
+
 .forensic-timestamp {
   font-size: 11px;
   color: var(--text-secondary);
@@ -1569,6 +1637,26 @@ body {
   font-size: 12px;
   color: var(--accent-blue);
   font-weight: 600;
+}
+
+.forensic-disclosure {
+  background: var(--surface-primary);
+  border-radius: 6px;
+  padding: 0;
+}
+
+.forensic-disclosure summary {
+  cursor: pointer;
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 10px;
+}
+
+.forensic-disclosure > :not(summary) {
+  margin-left: 10px;
+  margin-right: 10px;
+  margin-bottom: 10px;
 }
 
 .forensic-grid {
@@ -1779,5 +1867,3 @@ body {
   align-items: center;
   gap: 10px;
 }
-
-
