@@ -28,12 +28,31 @@ Der Build erzeugt unter `src-tauri/target/release/bundle/macos/` mindestens:
 - `BurnISO to USB.app.tar.gz` und `BurnISO to USB.app.tar.gz.sig` für den Updater
 - eine DMG für die manuelle Installation
 
-Notarisiere und staple die DMG wie bisher mit dem Keychain-Profil
-`burniso-notary`. Anschließend das Update-Manifest erzeugen:
+Notarisiere und staple sowohl die App als auch die DMG mit dem Keychain-Profil
+`burniso-notary`. Wird die gestapelte App anschließend neu archiviert, darf das
+Archiv **keinen** separaten obersten `.app`-Verzeichniseintrag enthalten:
+
+```zsh
+COPYFILE_DISABLE=1 tar --no-xattrs -C "src-tauri/target/release/bundle/macos" \
+  -czf "src-tauri/target/release/bundle/macos/BurnISO.to.USB.app.tar.gz" \
+  "BurnISO to USB.app/Contents"
+
+TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.tauri/burniso-usb-updater.key" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+  npm run tauri -- signer sign \
+  "src-tauri/target/release/bundle/macos/BurnISO.to.USB.app.tar.gz"
+```
+
+Tauri entfernt beim Installieren bereits die oberste App-Ebene. Ein leeres
+`.app`-Verzeichnis als eigener Tar-Eintrag würde deshalb das Entpacken des
+Updates abbrechen. Die Optionen `COPYFILE_DISABLE=1` und `--no-xattrs` sind
+ebenfalls zwingend: Ohne sie können macOS-Metadatendateien (`._*`) im
+installierten Bundle entstehen und dessen Code-Signatur ungültig machen.
+Anschließend das Update-Manifest erzeugen:
 
 ```zsh
 npm run make-updater-manifest -- 1.4.3 darwin-aarch64 \
-  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz" \
+  "src-tauri/target/release/bundle/macos/BurnISO.to.USB.app.tar.gz" \
   "src-tauri/target/release/bundle/macos/latest.json"
 ```
 
@@ -45,8 +64,8 @@ muss im neuesten veröffentlichten Release liegen; die App ruft es über
 ```zsh
 gh release upload v1.4.3 \
   "src-tauri/target/release/bundle/dmg/BurnISO to USB_1.4.3_aarch64.dmg" \
-  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz" \
-  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz.sig" \
+  "src-tauri/target/release/bundle/macos/BurnISO.to.USB.app.tar.gz" \
+  "src-tauri/target/release/bundle/macos/BurnISO.to.USB.app.tar.gz.sig" \
   "src-tauri/target/release/bundle/macos/latest.json"
 ```
 
