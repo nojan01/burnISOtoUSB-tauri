@@ -1,0 +1,56 @@
+# macOS-Release mit Auto-Update
+
+Die automatische Aktualisierung verwendet das von Tauri signierte
+`*.app.tar.gz`-Archiv, **nicht** die DMG. Die DMG bleibt für die manuelle
+Installation erhalten.
+
+## Voraussetzungen
+
+- Der private Updater-Schlüssel liegt ausschließlich lokal unter
+  `~/.tauri/burniso-usb-updater.key` und darf niemals ins Repository oder in
+  einen GitHub-Release gelangen.
+- Das Developer-ID-Zertifikat und das Notarisierungsprofil
+  `burniso-notary` sind im Schlüsselbund vorhanden.
+
+## Release erstellen
+
+Ersetze `1.4.3` durch die neue, bereits in `package.json`, `Cargo.toml` und
+`tauri.conf.json` eingetragene Version.
+
+```zsh
+export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/burniso-usb-updater.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+npm run tauri -- build
+```
+
+Der Build erzeugt unter `src-tauri/target/release/bundle/macos/` mindestens:
+
+- `BurnISO to USB.app.tar.gz` und `BurnISO to USB.app.tar.gz.sig` für den Updater
+- eine DMG für die manuelle Installation
+
+Notarisiere und staple die DMG wie bisher mit dem Keychain-Profil
+`burniso-notary`. Anschließend das Update-Manifest erzeugen:
+
+```zsh
+npm run make-updater-manifest -- 1.4.3 darwin-aarch64 \
+  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz" \
+  "src-tauri/target/release/bundle/macos/latest.json"
+```
+
+Lade bei **jedem** Release die DMG, das `.app.tar.gz`, dessen `.sig` und
+`latest.json` als Assets des GitHub-Releases hoch. Das Asset `latest.json`
+muss im neuesten veröffentlichten Release liegen; die App ruft es über
+`releases/latest/download/latest.json` ab.
+
+```zsh
+gh release upload v1.4.3 \
+  "src-tauri/target/release/bundle/dmg/BurnISO to USB_1.4.3_aarch64.dmg" \
+  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz" \
+  "src-tauri/target/release/bundle/macos/BurnISO to USB.app.tar.gz.sig" \
+  "src-tauri/target/release/bundle/macos/latest.json"
+```
+
+Eine App ohne den Updater (bis einschließlich 1.4.2) kann sich nicht selbst
+auf diese erste Version aktualisieren. Sie muss einmalig manuell installiert
+werden. Danach stehen „Nach Updates suchen…“ und die Prüfung beim Start zur
+Verfügung.

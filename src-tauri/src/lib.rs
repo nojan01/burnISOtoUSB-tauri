@@ -6049,7 +6049,7 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     
     let about_metadata = AboutMetadata {
         name: Some("BurnISO to USB".to_string()),
-        version: Some("1.4.0".to_string()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
         copyright: Some("© 2026 Norbert Jander".to_string()),
         comments: Some(about_comments.to_string()),
         ..Default::default()
@@ -6124,6 +6124,8 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     let help_label = if lang == "en" { "Help" } else { "Hilfe" };
     let github = MenuItem::with_id(app_handle, "github", "GitHub Repository", true, None::<&str>)?;
     let help_item = MenuItem::with_id(app_handle, "help", help_label, true, Some("CmdOrCtrl+?"))?;
+    let check_updates_label = if lang == "en" { "Check for Updates…" } else { "Nach Updates suchen…" };
+    let check_updates = MenuItem::with_id(app_handle, "check_updates", check_updates_label, true, None::<&str>)?;
     let lang_german = MenuItem::with_id(app_handle, "lang_de", "🇩🇪 Deutsch", true, None::<&str>)?;
     let lang_english = MenuItem::with_id(app_handle, "lang_en", "🇬🇧 English", true, None::<&str>)?;
     
@@ -6131,7 +6133,7 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
         app_handle,
         help_menu_label,
         true,
-        &[&help_item, &PredefinedMenuItem::separator(app_handle)?, &github, &PredefinedMenuItem::separator(app_handle)?, &lang_german, &lang_english],
+        &[&help_item, &check_updates, &PredefinedMenuItem::separator(app_handle)?, &github, &PredefinedMenuItem::separator(app_handle)?, &lang_german, &lang_english],
     )?;
     
     let menu = Menu::with_items(
@@ -6149,9 +6151,18 @@ fn set_menu_language(app_handle: AppHandle, lang: String) -> Result<(), String> 
     build_menu(&app_handle, &lang).map_err(|e| e.to_string())
 }
 
+/// Startet die App nach einer erfolgreich verifizierten Aktualisierung neu.
+/// Der Updater ersetzt auf macOS das App-Bundle, die neue Version wird erst
+/// nach dem Neustart ausgeführt.
+#[tauri::command]
+fn restart_application(app_handle: AppHandle) {
+    app_handle.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -6181,7 +6192,8 @@ pub fn run() {
             forensic_analysis,
             get_window_state,
             save_window_state,
-            set_menu_language
+            set_menu_language,
+            restart_application
         ])
         .setup(|app| {
             let app_handle = app.handle();
@@ -6235,6 +6247,9 @@ pub fn run() {
                         }
                         "help" => {
                             let _ = window.emit("menu-action", "help");
+                        }
+                        "check_updates" => {
+                            let _ = window.emit("menu-action", "check_updates");
                         }
                         "github" => {
                             let _ = Command::new("open")

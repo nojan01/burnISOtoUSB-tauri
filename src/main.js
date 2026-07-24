@@ -7,7 +7,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Wait a bit for Tauri to initialize
   await new Promise(resolve => setTimeout(resolve, 100));
   
-  const { invoke } = window.__TAURI__.core;
+  const { invoke, Channel } = window.__TAURI__.core;
   const { listen } = window.__TAURI__.event;
   const { open, save } = window.__TAURI__.dialog;
   const { getCurrentWindow, ProgressBarStatus } = window.__TAURI__.window;
@@ -37,6 +37,106 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {
       console.log('Clipboard error:', e);
       return false;
+    }
+  }
+
+  async function showUpdateMessage(message, title) {
+    try {
+      if (window.__TAURI__?.dialog?.message) {
+        await window.__TAURI__.dialog.message(message, { title, kind: 'info' });
+        return;
+      }
+    } catch (error) {
+      console.warn('Native update dialog unavailable:', error);
+    }
+    window.alert(message);
+  }
+
+  async function askToInstallUpdate(message, title) {
+    try {
+      if (window.__TAURI__?.dialog?.ask) {
+        return await window.__TAURI__.dialog.ask(message, {
+          title,
+          kind: 'info',
+          okLabel: window.i18n.currentLang === 'de' ? 'Installieren' : 'Install',
+          cancelLabel: window.i18n.currentLang === 'de' ? 'Später' : 'Later'
+        });
+      }
+    } catch (error) {
+      console.warn('Native update confirmation unavailable:', error);
+    }
+    return window.confirm(message);
+  }
+
+  let updateCheckInProgress = false;
+
+  async function checkForUpdates({ interactive = false } = {}) {
+    if (updateCheckInProgress) return;
+    updateCheckInProgress = true;
+
+    const isGerman = window.i18n.currentLang === 'de';
+    const title = isGerman ? 'BurnISO to USB – Updates' : 'BurnISO to USB – Updates';
+
+    try {
+      const update = await invoke('plugin:updater|check');
+      if (!update) {
+        if (interactive) {
+          await showUpdateMessage(
+            isGerman ? 'Diese Version ist aktuell.' : 'This version is up to date.',
+            title
+          );
+        }
+        return;
+      }
+
+      const notes = update.body ? `\n\n${update.body}` : '';
+      const installNow = await askToInstallUpdate(
+        isGerman
+          ? `Version ${update.version} ist verfügbar (installiert: ${update.currentVersion}).${notes}\n\nJetzt herunterladen und installieren?`
+          : `Version ${update.version} is available (installed: ${update.currentVersion}).${notes}\n\nDownload and install now?`,
+        title
+      );
+      if (!installNow) return;
+
+      let downloaded = 0;
+      let contentLength = 0;
+      const progressChannel = new Channel((event) => {
+        if (event.event === 'Started') {
+          contentLength = event.data.contentLength || 0;
+        } else if (event.event === 'Progress') {
+          downloaded += event.data.chunkLength;
+          if (contentLength > 0) {
+            document.title = `BurnISO to USB – ${Math.round((downloaded / contentLength) * 100)}%`;
+          }
+        }
+      });
+
+      await invoke('plugin:updater|download_and_install', {
+        rid: update.rid,
+        onEvent: progressChannel
+      });
+      document.title = 'BurnISO to USB';
+
+      await showUpdateMessage(
+        isGerman
+          ? 'Das Update wurde installiert. Die App wird jetzt neu gestartet.'
+          : 'The update was installed. The app will now restart.',
+        title
+      );
+      await invoke('restart_application');
+    } catch (error) {
+      document.title = 'BurnISO to USB';
+      console.error('Update check failed:', error);
+      if (interactive) {
+        await showUpdateMessage(
+          isGerman
+            ? `Die Update-Prüfung ist fehlgeschlagen: ${String(error)}`
+            : `The update check failed: ${String(error)}`,
+          title
+        );
+      }
+    } finally {
+      updateCheckInProgress = false;
     }
   }
 
@@ -91,6 +191,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   
   // Check dependencies on startup
   checkAndShowDependencies();
+
+  // Prüft im Hintergrund. Bei einer verfügbaren Version wird ausdrücklich
+  // nachgefragt; bei Netzwerkfehlern bleibt der Start der App unbeeinträchtigt.
+  setTimeout(() => checkForUpdates(), 1500);
 
   // Dock progress helper (macOS dock icon progress bar)
   const appWindow = getCurrentWindow();
@@ -3889,6 +3993,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             console.error('Failed to open help:', err);
           }
         })();
+        break;
+      case 'check_updates':
+        checkForUpdates({ interactive: true });
         break;
     }
   });

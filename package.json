@@ -1,15 +1,17 @@
 {
   "name": "tauri-app",
   "private": true,
-  "version": "1.4.2",
+  "version": "1.4.3",
   "type": "module",
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "make-updater-manifest": "node scripts/create-updater-manifest.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
   },
   "dependencies": {
-    "@tauri-apps/plugin-dialog": "~2.6.0"
+    "@tauri-apps/plugin-dialog": "~2.6.0",
+    "@tauri-apps/plugin-updater": "^2.10.1"
   }
 }
