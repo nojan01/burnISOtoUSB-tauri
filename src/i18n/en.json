@@ -224,7 +224,9 @@
     "english": "English"
   },
   "common": {
-    "remaining": "remaining"
+    "remaining": "remaining",
+    "yes": "Yes",
+    "no": "No"
   },
   "notifications": {
     "burnComplete": "Burn Complete",
@@ -479,7 +481,10 @@
     "smartStartStop": "Start/Stop Count",
     "smartSeekError": "Seek Error Rate",
     "smartHeadHours": "Head Flying Hours",
-    "smartLoadCycles": "Load Cycle Count"
+    "smartLoadCycles": "Load Cycle Count",
+    "smartAttributes": "SMART Attributes",
+    "forensicWrongPassword": "Wrong password",
+    "forensicPasswordHint": "Please enter your administrator password correctly and try again."
   },
   "dependencies": {
     "missingTitle": "Optional tools missing",

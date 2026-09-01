@@ -279,7 +279,23 @@ cargo tauri build
 
 ## Lizenz
 
-MIT License - Siehe [LICENSE](LICENSE) für Details.
+**MIT License** — Copyright (c) 2026 Norbert Jander. Siehe [LICENSE](LICENSE) für den vollständigen Text.
+
+Die Software wird „wie besehen“ und **ohne jede Gewährleistung** bereitgestellt.
+Da dieses Werkzeug Datenträger direkt beschreibt und sicher löscht, kann eine
+Fehlbedienung zu **unwiederbringlichem Datenverlust** führen. Die Nutzung erfolgt
+auf eigene Verantwortung.
+
+### Komponenten Dritter
+
+Eine vollständige Aufstellung aller verwendeten Fremdkomponenten und ihrer
+Lizenzen findet sich in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Kurzfassung: Alle Abhängigkeiten stehen unter permissiven Lizenzen (überwiegend
+MIT bzw. Apache-2.0). Fünf Pakete aus dem WebView-Unterbau stehen unter der
+MPL-2.0 und werden unverändert eingebunden. Externe Systemwerkzeuge wie
+`smartctl` (GPL) werden **nicht mitgeliefert**, sondern nur aufgerufen, sofern
+sie auf dem System vorhanden sind.
 
 ---
 

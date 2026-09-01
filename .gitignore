@@ -26,7 +26,9 @@ dist-ssr
 # Rust/Tauri
 src-tauri/target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock wird bewusst versioniert: Dies ist eine Anwendung, kein
+# Bibliotheks-Crate. Nur so sind Builds für Mitwirkende reproduzierbar.
+# (Empfehlung des Cargo-Handbuchs, Abschnitt "Cargo.lock and Cargo.toml")
 
 # Sensitive files (S4)
 .env

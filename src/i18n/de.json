@@ -224,7 +224,9 @@
     "english": "English"
   },
   "common": {
-    "remaining": "verbleibend"
+    "remaining": "verbleibend",
+    "yes": "Ja",
+    "no": "Nein"
   },
   "notifications": {
     "burnComplete": "Brennvorgang abgeschlossen",
@@ -479,7 +481,10 @@
     "smartStartStop": "Start/Stop Count",
     "smartSeekError": "Seek Error Rate",
     "smartHeadHours": "Head Flying Hours",
-    "smartLoadCycles": "Load Cycle Count"
+    "smartLoadCycles": "Load Cycle Count",
+    "smartAttributes": "SMART-Attribute",
+    "forensicWrongPassword": "Falsches Passwort",
+    "forensicPasswordHint": "Bitte geben Sie Ihr Administrator-Passwort korrekt ein und versuchen Sie es erneut."
   },
   "dependencies": {
     "missingTitle": "Optionale Tools fehlen",

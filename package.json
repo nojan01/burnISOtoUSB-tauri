@@ -1,7 +1,18 @@
 {
-  "name": "tauri-app",
+  "name": "burniso-to-usb",
   "private": true,
   "version": "1.4.5",
+  "description": "ISO to USB writer, USB backup, disk diagnostics and forensic analysis tool for macOS",
+  "license": "MIT",
+  "author": "Norbert Jander",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nojan01/burniso-tauri.git"
+  },
+  "homepage": "https://github.com/nojan01/burniso-tauri#readme",
+  "bugs": {
+    "url": "https://github.com/nojan01/burniso-tauri/issues"
+  },
   "type": "module",
   "scripts": {
     "tauri": "tauri",

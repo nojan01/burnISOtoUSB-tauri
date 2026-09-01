@@ -245,7 +245,7 @@
       <p><strong>Verschlüsselung:</strong> Für APFS und HFS+ kann die Verschlüsselung aktiviert werden. Das Passwort wird beim Einbinden des Volumes benötigt.</p>
       <p>Partitionsschema: GUID (GPT) oder MBR wählbar.</p>
       
-      <h3>� First Aid (Reparieren)</h3>
+      <h3>🩹 First Aid (Reparieren)</h3>
       <p>Repariert Dateisystem-Fehler auf dem USB-Stick:</p>
       <ul>
         <li>Fehlerhafte Verzeichnisstruktur</li>
@@ -311,6 +311,39 @@
       
       <h3>Verifizierung fehlgeschlagen</h3>
       <p>Der USB-Stick könnte defekt sein. Versuche einen anderen Port oder Stick.</p>
+    </div>
+
+    <h2>⚖️ Lizenz</h2>
+    <div class="section">
+      <p>
+        <strong>BurnISO to USB</strong> ist freie Open-Source-Software und steht unter der
+        <strong>MIT-Lizenz</strong>.
+      </p>
+      <p>© 2026 Norbert Jander</p>
+      <p>
+        Hiermit wird unentgeltlich jeder Person, die eine Kopie dieser Software und der
+        zugehörigen Dokumentationsdateien erhält, die Erlaubnis erteilt, sie uneingeschränkt
+        zu nutzen, zu kopieren, zu verändern, zusammenzuführen, zu veröffentlichen, zu
+        verbreiten, zu unterlizenzieren und/oder zu verkaufen — unter der Bedingung, dass der
+        obige Urheberrechtsvermerk und dieser Erlaubnisvermerk in allen Kopien enthalten sind.
+      </p>
+      <div class="warning">
+        <strong>⚠️ Keine Gewährleistung:</strong> Die Software wird „wie besehen“ bereitgestellt,
+        ohne Gewährleistung jeglicher Art. Die Autoren haften nicht für Schäden oder Datenverlust,
+        die aus der Nutzung entstehen. Das gilt insbesondere für das Beschreiben und sichere
+        Löschen von Datenträgern — <strong>prüfe das Zielgerät vor jedem Schreibvorgang sorgfältig</strong>.
+      </div>
+      <p>
+        Quellcode und vollständiger Lizenztext:<br>
+        <code>https://github.com/nojan01/burniso-tauri</code>
+      </p>
+      <p>
+        Diese App verwendet Komponenten Dritter (unter anderem Tauri, Rust-Bibliotheken und
+        die macOS-Systemwerkzeuge <code>diskutil</code>, <code>dd</code> und <code>smartctl</code>).
+        Deren Lizenzen sind in der Datei <code>THIRD_PARTY_NOTICES.md</code> im Quellcode-Repository
+        aufgeführt. <code>smartctl</code> (smartmontools, GPL) wird nicht mitgeliefert, sondern
+        nur aufgerufen, sofern es auf dem System installiert ist.
+      </p>
     </div>
   </div>
 
@@ -413,7 +446,7 @@
       <p><strong>Encryption:</strong> For APFS and HFS+, encryption can be enabled. The password is required when mounting the volume.</p>
       <p>Partition scheme: GUID (GPT) or MBR selectable.</p>
       
-      <h3>� First Aid (Repair)</h3>
+      <h3>🩹 First Aid (Repair)</h3>
       <p>Repairs file system errors on the USB drive:</p>
       <ul>
         <li>Corrupted directory structure</li>
@@ -480,6 +513,39 @@
       
       <h3>Verification failed</h3>
       <p>The USB drive might be defective. Try a different port or drive.</p>
+    </div>
+
+    <h2>⚖️ License</h2>
+    <div class="section">
+      <p>
+        <strong>BurnISO to USB</strong> is free and open source software, licensed under the
+        <strong>MIT License</strong>.
+      </p>
+      <p>© 2026 Norbert Jander</p>
+      <p>
+        Permission is hereby granted, free of charge, to any person obtaining a copy of this
+        software and associated documentation files, to deal in the Software without
+        restriction — including without limitation the rights to use, copy, modify, merge,
+        publish, distribute, sublicense and/or sell copies — subject to the condition that the
+        above copyright notice and this permission notice are included in all copies.
+      </p>
+      <div class="warning">
+        <strong>⚠️ No warranty:</strong> The software is provided “as is”, without warranty of
+        any kind. The authors are not liable for any damage or data loss arising from its use.
+        This applies in particular to writing to and securely erasing storage devices —
+        <strong>verify the target device carefully before every write operation</strong>.
+      </div>
+      <p>
+        Source code and full license text:<br>
+        <code>https://github.com/nojan01/burniso-tauri</code>
+      </p>
+      <p>
+        This app uses third-party components (including Tauri, Rust libraries and the macOS
+        system tools <code>diskutil</code>, <code>dd</code> and <code>smartctl</code>). Their
+        licenses are listed in <code>THIRD_PARTY_NOTICES.md</code> in the source repository.
+        <code>smartctl</code> (smartmontools, GPL) is not bundled — it is only invoked if it is
+        installed on the system.
+      </p>
     </div>
   </div>
 

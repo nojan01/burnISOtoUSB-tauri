@@ -1441,6 +1441,11 @@ async fn diagnose_surface_scan(app: AppHandle, disk_id: String, password: String
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
     
+    // Nur-lesende Operation: Kennung pruefen, damit keine Metazeichen in die
+    // privilegierten dd-Kommandos gelangen (diese laufen als root).
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
     let device_path = format!("/dev/r{}", disk_id);
     
     // First unmount all partitions and verify (K5)
@@ -1550,6 +1555,8 @@ async fn diagnose_full_test(app: AppHandle, disk_id: String, password: String) -
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
     
+    // Schreibende Operation: Kennung und Zieleignung pruefen.
+    ensure_writable_target(&disk_id)?;
     // Use rdisk for raw device access (like speed test)
     let device_path = format!("/dev/r{}", disk_id);
     
@@ -1735,6 +1742,8 @@ async fn diagnose_speed_test(app: AppHandle, disk_id: String, password: String) 
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
     
+    // Schreibende Operation: Kennung und Zieleignung pruefen.
+    ensure_writable_target(&disk_id)?;
     let device_path = format!("/dev/r{}", disk_id);
     
     // Show progress immediately
@@ -2136,6 +2145,105 @@ fn is_removable_media(disk_id: &str) -> bool {
     false
 }
 
+/// Bestaetigt, dass das Ziel ein vom Nutzer angeschlossenes Geraet ist: entweder
+/// extern (`Internal == false`) oder ein Wechselmedium (`RemovableMedia == true`).
+/// Das entspricht exakt der Menge, die `list_disks` in der Oberflaeche anbietet
+/// (externe physische Datentraeger plus interne Kartenleser) — externe SSDs, die
+/// `RemovableMedia == false` melden, bleiben also weiterhin waehlbar.
+///
+/// Faellt bewusst auf `false` zurueck, wenn `diskutil` nicht ausgewertet werden
+/// kann: Im Zweifel wird nicht geschrieben.
+fn is_user_attachable(disk_id: &str) -> bool {
+    let Ok(out) = Command::new("diskutil").args(["info", "-plist", disk_id]).output() else {
+        return false;
+    };
+    let plist = String::from_utf8_lossy(&out.stdout);
+    if extract_plist_bool(&plist, "Internal") == Some(false) {
+        return true;
+    }
+    extract_plist_bool(&plist, "RemovableMedia") == Some(true)
+}
+
+/// Pflichtpruefung vor jeder Operation, die auf einen Datentraeger schreibt.
+///
+/// Prueft zweierlei: das Format der Kennung (verhindert, dass Metazeichen in
+/// privilegierte Kommandos gelangen) und die Eignung des Ziels (verhindert, dass
+/// die interne Systemplatte ueberschrieben wird). Commands sind ueber IPC auch
+/// unabhaengig von der Oberflaeche aufrufbar — die Pruefung darf daher nicht
+/// allein im Frontend stattfinden.
+fn ensure_writable_target(disk_id: &str) -> Result<(), String> {
+    if !is_valid_disk_id(disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
+    if !is_user_attachable(disk_id) {
+        return Err(format!(
+            "Refusing to operate on '{}': only external or removable devices are permitted",
+            disk_id
+        ));
+    }
+    Ok(())
+}
+
+/// Ermittelt das APFS-Volume eines soeben angelegten APFS-Datentraegers.
+///
+/// `diskutil eraseDisk APFS` legt den Container auf einer *synthetisierten*
+/// Platte an: aus `disk4` wird beispielsweise Container `disk5` mit Volume
+/// `disk5s1`. Die Volume-Kennung laesst sich daher nicht aus der Zielkennung
+/// ableiten, sondern nur ueber den Rueckverweis der Partition.
+fn find_apfs_volume(disk_id: &str) -> Result<String, String> {
+    let partition = format!("{}s1", disk_id);
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", &partition])
+        .output()
+        .map_err(|e| format!("diskutil info Fehler: {}", e))?;
+    if !output.status.success() {
+        return Err("APFS-Partition nicht gefunden".to_string());
+    }
+    let plist = String::from_utf8_lossy(&output.stdout);
+    let container = extract_plist_string(&plist, "APFSContainerReference")
+        .ok_or("APFS-Container konnte nicht ermittelt werden")?;
+    Ok(format!("{}s1", container))
+}
+
+/// Verschluesselt ein APFS-Volume ("FileVault" aktivieren).
+///
+/// Die Passphrase wird ueber die Standardeingabe uebergeben. Sie erscheint
+/// dadurch weder in der Prozessliste noch in einem Shell-String und kann keine
+/// Sonderzeichen-Wirkung entfalten (Befund W-1).
+fn encrypt_apfs_volume(volume: &str, passphrase: &str) -> Result<(), String> {
+    let mut child = Command::new("diskutil")
+        .args([
+            "apfs",
+            "encryptVolume",
+            volume,
+            "-user",
+            "disk",
+            "-stdinpassphrase",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Verschlüsselung konnte nicht gestartet werden: {}", e))?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        writeln!(stdin, "{}", passphrase)
+            .map_err(|e| format!("Passphrase konnte nicht übergeben werden: {}", e))?;
+    }
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Verschlüsselung fehlgeschlagen: {}", e))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let detail = if err.trim().is_empty() { out } else { err };
+        return Err(format!("Verschlüsselung fehlgeschlagen: {}", detail.trim()));
+    }
+    Ok(())
+}
+
 fn get_disk_details(disk_id: &str) -> Result<DiskInfo, String> {
     // V5: Komplett auf -plist umgestellt; vermeidet brittle Regex/Substring-Parsing
     // der textuellen `diskutil info`-Ausgabe.
@@ -2388,6 +2496,8 @@ async fn repair_disk(
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
     
+    // Veraendernde Operation: Kennung und Zieleignung pruefen.
+    ensure_writable_target(&disk_id)?;
     let disk_path = format!("/dev/{}", disk_id);
     
     emit_progress(&app, 5, "Starting disk repair...", "tools");
@@ -2454,9 +2564,9 @@ async fn repair_disk(
         
         // Use repairVolume for partitions, repairDisk for whole disk
         let repair_cmd = if partition.contains('s') {
-            format!("diskutil repairVolume {}", partition_path)
+            format!("diskutil repairVolume {}", shell_quote(&partition_path))
         } else {
-            format!("diskutil repairDisk {}", partition_path)
+            format!("diskutil repairDisk {}", shell_quote(&partition_path))
         };
         
         let mut child = Command::new("sudo")
@@ -2525,6 +2635,8 @@ async fn format_disk(
     encrypted: Option<bool>,
     encryption_password: Option<String>,
 ) -> Result<String, String> {
+    // Loeschende Operation: Kennung und Zieleignung pruefen.
+    ensure_writable_target(&disk_id)?;
     CANCEL_TOOLS.store(false, Ordering::SeqCst);
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
@@ -2543,11 +2655,28 @@ async fn format_disk(
         ("ext3", _) => "UFSD_EXTFS", // Paragon extFS driver
         ("ext4", _) => "UFSD_EXTFS", // Paragon extFS driver
         ("APFS", false) => "APFS",
-        ("APFS", true) => "APFS (Encrypted)",
+        // Seit dem Wegfall von CoreStorage kennt diskutil keine verschluesselten
+        // Personalitaeten mehr (siehe `diskutil listFilesystems`). Verschluesselte
+        // Datentraeger entstehen daher zweistufig: erst APFS anlegen, danach
+        // `diskutil apfs encryptVolume`.
+        ("APFS", true) => "APFS",
         ("HFS+", false) => "JHFS+",
-        ("HFS+", true) => "JHFS+ (Encrypted)",
+        ("HFS+", true) => {
+            return Err("Verschlüsseltes HFS+ wird von macOS nicht mehr unterstützt. \
+                        Bitte APFS als Dateisystem wählen.".to_string())
+        }
         _ => return Err(format!("Nicht unterstütztes Dateisystem: {}", filesystem)),
     };
+
+    // Verschluesselung ist ausschliesslich fuer APFS umsetzbar. Ohne diese
+    // Pruefung wuerde der Wunsch bei FAT32/ExFAT/NTFS stillschweigend
+    // uebergangen und ein unverschluesselter Datentraeger entstehen.
+    if is_encrypted && filesystem != "APFS" {
+        return Err(format!(
+            "Verschlüsselung ist für {} nicht möglich. Bitte APFS wählen.",
+            filesystem
+        ));
+    }
     
     // Validate scheme
     let scheme_type = match scheme.as_str() {
@@ -2598,14 +2727,16 @@ async fn format_disk(
             volume_name, scheme_type, disk_path, volume_name, disk_path, partition_suffix
         )
     } else if is_encrypted {
-        let enc_pass = encryption_password.unwrap_or_default();
+        let enc_pass = encryption_password.clone().unwrap_or_default();
         if enc_pass.is_empty() {
             return Err("Verschlüsselungspasswort erforderlich".to_string());
         }
-        // For encrypted APFS/HFS+, use diskutil with passphrase
+        // W-1: Die Passphrase gehoert nicht in die Kommandozeile. Hier entsteht
+        // zunaechst nur ein unverschluesseltes APFS-Volume; die Passphrase wird
+        // anschliessend ueber die Standardeingabe uebergeben.
         format!(
-            r#"diskutil eraseDisk "{}" "{}" {} {} -passphrase "{}""#,
-            fs_type, volume_name, scheme_type, disk_path, enc_pass
+            r#"diskutil eraseDisk "{}" "{}" {} {}"#,
+            fs_type, volume_name, scheme_type, disk_path
         )
     } else {
         format!(
@@ -2650,6 +2781,21 @@ async fn format_disk(
                     let _ = Command::new("diskutil")
                         .args(["mountDisk", &disk_path])
                         .output();
+
+                    // Zweite Stufe der Verschluesselung. Erst jetzt existiert das
+                    // APFS-Volume, das verschluesselt werden kann.
+                    if is_encrypted {
+                        emit_progress(&app, 97, "Verschlüsselung wird gestartet...", "tools");
+                        let enc_pass = encryption_password.clone().unwrap_or_default();
+                        let volume = find_apfs_volume(&disk_id)?;
+                        encrypt_apfs_volume(&volume, &enc_pass)?;
+                        emit_progress(&app, 100, "Format complete!", "tools");
+                        return Ok(format!(
+                            "USB verschlüsselt als APFS formatiert ({}). \
+                             Die Verschlüsselung läuft im Hintergrund weiter.",
+                            volume_name
+                        ));
+                    }
                     
                     // Additional wait and retry mount for FAT32/exFAT/NTFS/ext which sometimes need it
                     if filesystem == "FAT32" || filesystem == "ExFAT" || filesystem == "NTFS" 
@@ -2982,10 +3128,9 @@ async fn secure_erase(
     let _ = app.emit("operation_start", _op_id);
 
     // Commands can be invoked independently of the UI. Restrict the device
-    // identifier before embedding the derived path in the privileged script.
-    if !is_valid_disk_id(&disk_id) {
-        return Err("Invalid disk identifier".to_string());
-    }
+    // identifier before embedding the derived path in the privileged script,
+    // and refuse targets that are not user-attached media (W-2).
+    ensure_writable_target(&disk_id)?;
 
     let disk_path = format!("/dev/r{}", disk_id); // Use raw device for faster writes
     let python3_path = get_python3_path().ok_or(
@@ -3116,7 +3261,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     });
     
     // 1. Get basic disk info from diskutil
-    let diskutil_cmd = format!("diskutil info {} 2>/dev/null", disk_id);
+    let diskutil_cmd = format!("diskutil info {} 2>/dev/null", shell_quote(&disk_id));
     
     if let Ok(output) = sudo_sh(&password, &diskutil_cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3305,7 +3450,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                 // If this is an APFS Physical Store, get container and volume info
                 if let Some(container) = part_info.get("apfs_container").and_then(|c| c.as_str()) {
                     // Get APFS container info
-                    let apfs_cmd = format!("diskutil apfs list {} 2>/dev/null", container);
+                    let apfs_cmd = format!("diskutil apfs list {} 2>/dev/null", shell_quote(container));
                     if let Ok(apfs_output) = Command::new("sh").args(["-c", &apfs_cmd]).output() {
                         let apfs_stdout = String::from_utf8_lossy(&apfs_output.stdout);
                         
@@ -3534,7 +3679,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     }
     
     // 2. Get partition layout
-    let partitions_cmd = format!("diskutil list {} 2>/dev/null", disk_id);
+    let partitions_cmd = format!("diskutil list {} 2>/dev/null", shell_quote(&disk_id));
     
     if let Ok(output) = sudo_sh(&password, &partitions_cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3694,8 +3839,8 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     
     // 9. Get USB controller path info
     let usb_path_cmd = format!(
-        "system_profiler SPUSBDataType 2>/dev/null | grep -B30 '{}' | head -35",
-        disk_id
+        "system_profiler SPUSBDataType 2>/dev/null | grep -B30 {} | head -35",
+        shell_quote(&disk_id)
     );
     if let Ok(output) = Command::new("sh").args(["-c", &usb_path_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3885,10 +4030,13 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         .and_then(|m| m.as_str()) 
     {
         if !mount_point.is_empty() {
+            // K-1: Der Einhaengepunkt stammt aus dem Datentraegernamen und ist
+            // damit fremdbestimmt. Vor jeder Shell-Verwendung maskieren.
+            let mp = shell_quote(mount_point);
             let mut fs_details = serde_json::Map::new();
             
             // Get filesystem stats via df
-            let df_cmd = format!("df -i '{}' 2>/dev/null | tail -1", mount_point);
+            let df_cmd = format!("df -i {} 2>/dev/null | tail -1", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &df_cmd]).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let parts: Vec<&str> = stdout.split_whitespace().collect();
@@ -3905,14 +4053,14 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
             
             // Count hidden files
-            let hidden_cmd = format!("find '{}' -name '.*' -maxdepth 2 2>/dev/null | wc -l", mount_point);
+            let hidden_cmd = format!("find {} -name '.*' -maxdepth 2 2>/dev/null | wc -l", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &hidden_cmd]).output() {
                 let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 fs_details.insert("hidden_files_count".to_string(), serde_json::json!(count));
             }
             
             // Get top 5 largest files
-            let large_cmd = format!("find '{}' -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -5", mount_point);
+            let large_cmd = format!("find {} -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -5", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &large_cmd]).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let files: Vec<serde_json::Value> = stdout.lines()
@@ -3935,8 +4083,8 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             
             // Get file type distribution
             let types_cmd = format!(
-                "find '{}' -type f -maxdepth 3 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -10",
-                mount_point
+                "find {} -type f -maxdepth 3 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -10",
+                mp
             );
             if let Ok(output) = Command::new("sh").args(["-c", &types_cmd]).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3961,8 +4109,8 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             
             // Get recent files (last modified)
             let recent_cmd = format!(
-                "find '{}' -type f -maxdepth 3 -mtime -7 2>/dev/null | head -10",
-                mount_point
+                "find {} -type f -maxdepth 3 -mtime -7 2>/dev/null | head -10",
+                mp
             );
             if let Ok(output) = Command::new("sh").args(["-c", &recent_cmd]).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3975,21 +4123,21 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
             
             // Get directory count
-            let dir_cmd = format!("find '{}' -type d 2>/dev/null | wc -l", mount_point);
+            let dir_cmd = format!("find {} -type d 2>/dev/null | wc -l", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &dir_cmd]).output() {
                 let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 fs_details.insert("directory_count".to_string(), serde_json::json!(count));
             }
             
             // Get total file count
-            let file_cmd = format!("find '{}' -type f 2>/dev/null | wc -l", mount_point);
+            let file_cmd = format!("find {} -type f 2>/dev/null | wc -l", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &file_cmd]).output() {
                 let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 fs_details.insert("total_file_count".to_string(), serde_json::json!(count));
             }
             
             // Get symlink count
-            let link_cmd = format!("find '{}' -type l 2>/dev/null | wc -l", mount_point);
+            let link_cmd = format!("find {} -type l 2>/dev/null | wc -l", mp);
             if let Ok(output) = Command::new("sh").args(["-c", &link_cmd]).output() {
                 let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 fs_details.insert("symlink_count".to_string(), serde_json::json!(count));
@@ -4662,7 +4810,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
     }
     
     // Get list of partitions for this disk
-    let list_cmd = format!("diskutil list {} 2>/dev/null", disk_id);
+    let list_cmd = format!("diskutil list {} 2>/dev/null", shell_quote(disk_id));
     let mut partitions = vec![disk_id.to_string()];
     
     if let Ok(output) = Command::new("sh").args(["-c", &list_cmd]).output() {
@@ -4683,7 +4831,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             continue; // Skip whole disk, only check partitions
         }
         
-        let info_cmd = format!("diskutil info {} 2>/dev/null", part_id);
+        let info_cmd = format!("diskutil info {} 2>/dev/null", shell_quote(part_id));
         if let Ok(output) = Command::new("sh").args(["-c", &info_cmd]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut personality = String::new();
@@ -4876,7 +5024,7 @@ except Exception as e:
                         let mut final_fs_name = fs_name.to_string();
                         if part_id != disk_id {
                             // Check partition type
-                            let info_cmd = format!("diskutil info {} 2>/dev/null | grep 'Partition Type'", part_id);
+                            let info_cmd = format!("diskutil info {} 2>/dev/null | grep 'Partition Type'", shell_quote(part_id));
                             if let Ok(info_out) = Command::new("sh").args(["-c", &info_cmd]).output() {
                                 let info_str = String::from_utf8_lossy(&info_out.stdout);
                                 if info_str.contains("0xEF") || info_str.to_lowercase().contains("efi") {
@@ -4913,7 +5061,7 @@ except Exception as e:
 /// superblocks. This is deliberately read-only and works even when macOS
 /// cannot mount ext, Btrfs, XFS or a LUKS container.
 fn analyze_linux_filesystems(disk_id: &str, password: &str) -> Option<serde_json::Value> {
-    let list_cmd = format!("diskutil list {} 2>/dev/null", disk_id);
+    let list_cmd = format!("diskutil list {} 2>/dev/null", shell_quote(disk_id));
     let mut partitions = vec![disk_id.to_string()];
 
     if let Ok(output) = Command::new("sh").args(["-c", &list_cmd]).output() {
@@ -5059,14 +5207,36 @@ print(json.dumps(details, ensure_ascii=False))
     }
 }
 
+/// Maskiert einen Wert fuer die sichere Verwendung in einem POSIX-Shell-Befehl.
+///
+/// Hintergrund (Befund K-1): Einhaengepunkte stammen aus dem Datentraeger selbst
+/// — der Datentraegername bestimmt den Pfad unter `/Volumes`. Ein Name wie
+/// `x';id;'` erzeugte bisher einen ausbrechenden Befehl, sodass beliebiger Code
+/// allein durch das Einstecken eines praeparierten Datentraegers lief.
+///
+/// Der Wert wird in einfache Anfuehrungszeichen gesetzt. Innerhalb dieser sind
+/// **alle** Zeichen buchstaeblich — mit Ausnahme des Anfuehrungszeichens selbst.
+/// Dieses wird als `'\''` geschrieben: schliessen, maskiertes Zeichen, wieder
+/// oeffnen. Damit kann kein Zeichen die Zeichenkette verlassen.
+///
+/// Das Ergebnis enthaelt die Anfuehrungszeichen bereits; im Formatstring steht
+/// daher `{}` und nicht `'{}'`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Analyze mounted content (files, folders, OS detection)
 fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
+    // K-1: Einmal maskieren, danach ausschliesslich den maskierten Wert in
+    // Shell-Befehle einsetzen. `mount_point` bleibt fuer Pfadaufbau und
+    // Textersetzung unveraendert nutzbar.
+    let mp = shell_quote(mount_point);
     let mut content = serde_json::Map::new();
     
     // Count files and folders
     let count_cmd = format!(
-        "find '{}' -maxdepth 5 2>/dev/null | head -10000 | wc -l",
-        mount_point
+        "find {} -maxdepth 5 2>/dev/null | head -10000 | wc -l",
+        mp
     );
     
     if let Ok(output) = Command::new("sh").args(["-c", &count_cmd]).output() {
@@ -5076,7 +5246,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     }
     
     // Get disk usage
-    let du_cmd = format!("du -sh '{}' 2>/dev/null", mount_point);
+    let du_cmd = format!("du -sh {} 2>/dev/null", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &du_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(size) = stdout.split_whitespace().next() {
@@ -5085,14 +5255,14 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     }
     
     // Get file count
-    let file_count_cmd = format!("find '{}' -type f 2>/dev/null | wc -l", mount_point);
+    let file_count_cmd = format!("find {} -type f 2>/dev/null | wc -l", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &file_count_cmd]).output() {
         let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
         content.insert("file_count".to_string(), serde_json::json!(count));
     }
     
     // Get directory count
-    let dir_count_cmd = format!("find '{}' -type d 2>/dev/null | wc -l", mount_point);
+    let dir_count_cmd = format!("find {} -type d 2>/dev/null | wc -l", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &dir_count_cmd]).output() {
         let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
         content.insert("directory_count".to_string(), serde_json::json!(count));
@@ -5143,7 +5313,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     ];
     for path in &macos_paths {
         let full_path = format!("{}/{}", mount_point, path);
-        let check_cmd = format!("ls -d '{}' 2>/dev/null | head -1", full_path);
+        let check_cmd = format!("ls -d {} 2>/dev/null | head -1", shell_quote(&full_path));
         if let Ok(output) = Command::new("sh").args(["-c", &check_cmd]).output() {
             if !output.stdout.is_empty() {
                 if !detected_os.contains(&"macOS".to_string()) {
@@ -5178,7 +5348,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         // Get home users for Linux
         let home_path = format!("{}/home", mount_point);
         if std::path::Path::new(&home_path).exists() {
-            let home_cmd = format!("ls -1 '{}' 2>/dev/null", home_path);
+            let home_cmd = format!("ls -1 {} 2>/dev/null", shell_quote(&home_path));
             if let Ok(output) = Command::new("sh").args(["-c", &home_cmd]).output() {
                 let users: Vec<String> = String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -5194,7 +5364,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         // Check for installed package count
         let dpkg_path = format!("{}/var/lib/dpkg/status", mount_point);
         if std::path::Path::new(&dpkg_path).exists() {
-            let pkg_cmd = format!("grep -c '^Package:' '{}' 2>/dev/null", dpkg_path);
+            let pkg_cmd = format!("grep -c '^Package:' {} 2>/dev/null", shell_quote(&dpkg_path));
             if let Ok(output) = Command::new("sh").args(["-c", &pkg_cmd]).output() {
                 let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 content.insert("installed_packages_dpkg".to_string(), serde_json::json!(count));
@@ -5204,7 +5374,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         // Check for kernel versions
         let boot_path = format!("{}/boot", mount_point);
         if std::path::Path::new(&boot_path).exists() {
-            let kernel_cmd = format!("ls '{}' 2>/dev/null | grep -E 'vmlinuz|initrd' | head -5", boot_path);
+            let kernel_cmd = format!("ls {} 2>/dev/null | grep -E 'vmlinuz|initrd' | head -5", shell_quote(&boot_path));
             if let Ok(output) = Command::new("sh").args(["-c", &kernel_cmd]).output() {
                 let kernels: Vec<String> = String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -5233,7 +5403,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         // Get Windows user profiles
         let users_path = format!("{}/Users", mount_point);
         if std::path::Path::new(&users_path).exists() {
-            let users_cmd = format!("ls -1 '{}' 2>/dev/null | grep -v -E '^(Public|Default|All Users|Default User|desktop.ini)$'", users_path);
+            let users_cmd = format!("ls -1 {} 2>/dev/null | grep -v -E '^(Public|Default|All Users|Default User|desktop.ini)$'", shell_quote(&users_path));
             if let Ok(output) = Command::new("sh").args(["-c", &users_cmd]).output() {
                 let users: Vec<String> = String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -5249,7 +5419,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         // Get installed programs
         let prog_path = format!("{}/Program Files", mount_point);
         if std::path::Path::new(&prog_path).exists() {
-            let prog_cmd = format!("ls -1 '{}' 2>/dev/null | head -20", prog_path);
+            let prog_cmd = format!("ls -1 {} 2>/dev/null | head -20", shell_quote(&prog_path));
             if let Ok(output) = Command::new("sh").args(["-c", &prog_cmd]).output() {
                 let progs: Vec<String> = String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -5270,14 +5440,14 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     }
     
     // List top-level directories with details
-    let ls_cmd = format!("ls -la '{}' 2>/dev/null | head -35", mount_point);
+    let ls_cmd = format!("ls -la {} 2>/dev/null | head -35", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &ls_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         content.insert("root_listing".to_string(), serde_json::json!(stdout.trim()));
     }
     
     // Also get simple list for backwards compatibility
-    let ls_simple_cmd = format!("ls -1 '{}' 2>/dev/null | head -30", mount_point);
+    let ls_simple_cmd = format!("ls -1 {} 2>/dev/null | head -30", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &ls_simple_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let dirs: Vec<&str> = stdout.lines().collect();
@@ -5288,8 +5458,8 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     
     // Get largest files with human-readable sizes
     let large_cmd = format!(
-        "find '{}' -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -10",
-        mount_point
+        "find {} -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -10",
+        mp
     );
     if let Ok(output) = Command::new("sh").args(["-c", &large_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5323,7 +5493,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     }
     
     // Get hidden files
-    let hidden_cmd = format!("find '{}' -maxdepth 2 -name '.*' -type f 2>/dev/null | head -20", mount_point);
+    let hidden_cmd = format!("find {} -maxdepth 2 -name '.*' -type f 2>/dev/null | head -20", mp);
     if let Ok(output) = Command::new("sh").args(["-c", &hidden_cmd]).output() {
         let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -5337,8 +5507,8 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     
     // Get file type distribution
     let types_cmd = format!(
-        "find '{}' -type f -name '*.*' 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -15",
-        mount_point
+        "find {} -type f -name '*.*' 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -15",
+        mp
     );
     if let Ok(output) = Command::new("sh").args(["-c", &types_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5363,8 +5533,8 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     
     // Get recently modified files (last 7 days)
     let recent_cmd = format!(
-        "find '{}' -type f -mtime -7 2>/dev/null | head -15",
-        mount_point
+        "find {} -type f -mtime -7 2>/dev/null | head -15",
+        mp
     );
     if let Ok(output) = Command::new("sh").args(["-c", &recent_cmd]).output() {
         let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -5420,6 +5590,11 @@ fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json
 /// Check if a USB disk is bootable (EFI/MBR/Hybrid)
 #[tauri::command]
 async fn check_bootable(disk_id: String, password: String) -> Result<serde_json::Value, String> {
+    // Nur-lesend, aber die Kennung landet in einem Python-Stringliteral, das als
+    // root ausgefuehrt wird — ein Anfuehrungszeichen wuerde daraus ausbrechen.
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
     let disk_path = format!("/dev/r{}", disk_id);
     
     // Use Python with sudo to read raw disk bytes
@@ -5614,9 +5789,8 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     let compressed_size = std::fs::metadata(&iso_path)
         .map_err(|e| format!("Image nicht gefunden: {}", e))?
         .len();
-    if !is_valid_disk_id(&disk_id) {
-        return Err("Invalid disk identifier".to_string());
-    }
+    // Schreibende Operation: Kennung und Zieleignung pruefen (K-2/W-2).
+    ensure_writable_target(&disk_id)?;
     let python3_path = get_python3_path().ok_or(
         "Das Schreiben von Images benötigt Python 3. Installieren Sie es mit: brew install python",
     )?;
@@ -5899,6 +6073,11 @@ async fn backup_usb_raw(app: AppHandle, disk_id: String, destination: String, di
     CANCEL_BACKUP.store(false, Ordering::SeqCst);
     let _op_id = start_operation();
     let _ = app.emit("operation_start", _op_id);
+    // Liest den Datentraeger roh aus; die Kennung landet in einem als root
+    // ausgefuehrten Python-Stringliteral und muss daher geprueft sein.
+    if !is_valid_disk_id(&disk_id) {
+        return Err("Invalid disk identifier".to_string());
+    }
     let disk_path = format!("/dev/{}", disk_id);
     let rdisk_path = format!("/dev/r{}", disk_id);
     emit_progress(&app, 0, "Unmount Disk...", "backup");
@@ -6026,6 +6205,24 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     } else {
         ("Über BurnISO to USB", "ISO auf USB brennen & USB sichern", "BurnISO to USB ausblenden", "Andere ausblenden", "Alle einblenden", "BurnISO to USB beenden")
     };
+
+    // Der native macOS-Über-Dialog stellt ausschließlich name, version,
+    // copyright und credits dar — das AboutMetadata-Feld `license` wird auf
+    // dieser Plattform nicht gerendert. Der Lizenzhinweis steht deshalb in
+    // `credits`, damit er tatsächlich sichtbar ist.
+    let about_credits = if lang == "en" {
+        "Free and open source software, licensed under the MIT License.\n\
+         Provided \"as is\", without warranty of any kind.\n\n\
+         Source code and full license text:\n\
+         https://github.com/nojan01/burniso-tauri\n\n\
+         Third-party components are listed in THIRD_PARTY_NOTICES.md."
+    } else {
+        "Freie Open-Source-Software unter der MIT-Lizenz.\n\
+         Bereitstellung ohne jede Gewährleistung.\n\n\
+         Quellcode und vollständiger Lizenztext:\n\
+         https://github.com/nojan01/burniso-tauri\n\n\
+         Komponenten Dritter sind in THIRD_PARTY_NOTICES.md aufgeführt."
+    };
     
     let (file_menu_label, select_iso_label, select_destination_label, refresh_label, close_label) = if lang == "en" {
         ("File", "Open ISO File...", "Choose Destination...", "Refresh USB Devices", "Close Window")
@@ -6052,6 +6249,9 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         copyright: Some("© 2026 Norbert Jander".to_string()),
         comments: Some(about_comments.to_string()),
+        license: Some("MIT".to_string()),
+        website: Some("https://github.com/nojan01/burniso-tauri".to_string()),
+        credits: Some(about_credits.to_string()),
         ..Default::default()
     };
     
@@ -6265,4 +6465,57 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Fuehrt einen Shell-Befehl aus und liefert die Standardausgabe.
+    fn run(cmd: &str) -> String {
+        let out = Command::new("sh").args(["-c", cmd]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// K-1: Der Einhaengepunkt stammt aus dem Datentraegernamen. Ein praeparierter
+    /// Name wie `x';id;'` durfte frueher aus dem einfachen Anfuehrungszeichen
+    /// ausbrechen und beliebige Befehle ausfuehren.
+    #[test]
+    fn shell_quote_verhindert_befehlseinschleusung() {
+        let boesartig = "/Volumes/x';id;'";
+
+        // Gegenprobe: die alte, ungesicherte Bauweise fuehrt `id` tatsaechlich aus.
+        // Schlaegt dieser Teil fehl, prueft der Test nichts Sinnvolles mehr.
+        let alt = format!("find '{}' -type f 2>/dev/null | wc -l", boesartig);
+        assert!(
+            run(&alt).contains("uid="),
+            "Gegenprobe wirkungslos: die alte Bauweise fuehrt `id` nicht mehr aus"
+        );
+
+        // Die abgesicherte Bauweise darf `id` nicht ausfuehren.
+        let neu = format!("find {} -type f 2>/dev/null | wc -l", shell_quote(boesartig));
+        assert!(
+            !run(&neu).contains("uid="),
+            "Einschleusung weiterhin moeglich: {}",
+            neu
+        );
+    }
+
+    /// Der maskierte Wert muss von der Shell als genau ein Argument mit
+    /// unveraendertem Inhalt gelesen werden.
+    #[test]
+    fn shell_quote_erhaelt_den_inhalt() {
+        for wert in [
+            "/Volumes/Mein Stick",
+            "/Volumes/x';id;'",
+            "/Volumes/a$(whoami)b",
+            "/Volumes/back\\slash",
+            "/Volumes/`hostname`",
+            "/Volumes/semi;kolon",
+        ] {
+            let ausgabe = run(&format!("printf '%s' {}", shell_quote(wert)));
+            assert_eq!(ausgabe, wert, "Maskierung veraendert den Wert");
+        }
+    }
 }
