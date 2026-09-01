@@ -3887,34 +3887,47 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     }
     
     // 8. Get detailed hardware info via ioreg
+    // K-1: Muster maskieren. Zudem muss der BSD-Name exakt passen -- 'disk10' ist
+    // Praefix von 'disk10s1', sonst liefert der Treffer die Groesse einer Partition
+    // (z. B. 209715200 Byte der EFI) statt die des Datentraegers.
+    let bsd_name = disk_id.trim_start_matches("/dev/");
+    let ioreg_pattern = shell_quote(&format!("\"BSD Name\" = \"{}\"", bsd_name));
     let ioreg_cmd = format!(
-        "ioreg -r -c IOMedia -l 2>/dev/null | grep -A50 'BSD Name.*{}' | head -60",
-        disk_id
+        "ioreg -r -c IOMedia -l 2>/dev/null | grep -A50 {} | head -60",
+        ioreg_pattern
     );
     if let Ok(output) = Command::new("sh").args(["-c", &ioreg_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut hw_info = serde_json::Map::new();
         
+        // Jede Eigenschaft steht im ioreg-Objekt genau einmal; -A50 kann aber in das
+        // naechste Objekt hineinreichen. Daher nur den ersten Treffer uebernehmen.
         for line in stdout.lines() {
             let line = line.trim();
             if line.contains("\"Size\"") {
                 if let Some(size) = line.split('=').nth(1) {
-                    hw_info.insert("exact_size_bytes".to_string(), serde_json::json!(size.trim()));
+                    hw_info.entry("exact_size_bytes".to_string())
+                        .or_insert_with(|| serde_json::json!(size.trim()));
                 }
             } else if line.contains("\"Preferred Block Size\"") {
                 if let Some(bs) = line.split('=').nth(1) {
-                    hw_info.insert("preferred_block_size".to_string(), serde_json::json!(bs.trim()));
+                    hw_info.entry("preferred_block_size".to_string())
+                        .or_insert_with(|| serde_json::json!(bs.trim()));
                 }
             } else if line.contains("\"Physical Block Size\"") {
                 if let Some(pbs) = line.split('=').nth(1) {
-                    hw_info.insert("physical_block_size".to_string(), serde_json::json!(pbs.trim()));
+                    hw_info.entry("physical_block_size".to_string())
+                        .or_insert_with(|| serde_json::json!(pbs.trim()));
                 }
             } else if line.contains("\"Removable\"") {
-                hw_info.insert("hardware_removable".to_string(), serde_json::json!(line.contains("Yes")));
+                hw_info.entry("hardware_removable".to_string())
+                    .or_insert_with(|| serde_json::json!(line.contains("Yes")));
             } else if line.contains("\"Ejectable\"") {
-                hw_info.insert("ejectable".to_string(), serde_json::json!(line.contains("Yes")));
+                hw_info.entry("ejectable".to_string())
+                    .or_insert_with(|| serde_json::json!(line.contains("Yes")));
             } else if line.contains("\"Whole\"") {
-                hw_info.insert("is_whole_disk".to_string(), serde_json::json!(line.contains("Yes")));
+                hw_info.entry("is_whole_disk".to_string())
+                    .or_insert_with(|| serde_json::json!(line.contains("Yes")));
             }
         }
         
@@ -3995,19 +4008,11 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         }
     }
     
-    // 11. Get disk activity statistics via iostat
-    let iostat_cmd = format!("iostat -d {} 2>/dev/null | tail -1", disk_id);
-    if let Ok(output) = Command::new("sh").args(["-c", &iostat_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = stdout.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let mut iostat_info = serde_json::Map::new();
-            iostat_info.insert("kb_per_transfer".to_string(), serde_json::json!(parts.first().unwrap_or(&"N/A")));
-            iostat_info.insert("transfers_per_sec".to_string(), serde_json::json!(parts.get(1).unwrap_or(&"N/A")));
-            iostat_info.insert("mb_per_sec".to_string(), serde_json::json!(parts.get(2).unwrap_or(&"N/A")));
-            result["disk_activity"] = serde_json::json!(iostat_info);
-        }
-    }
+    // 11. Entfernt: iostat-Statistik. "iostat -d <disk>" ohne Intervall liefert den
+    // Durchschnitt seit Systemstart, nicht die aktuelle Aktivitaet. Transfers/s und
+    // MB/s wurden dadurch ueber die Laufzeit geteilt und waren praktisch immer 0 --
+    // auch waehrend der Datentraeger nachweislich vollstaendig gelesen wurde.
+    // KB/Transfer beschreibt das Zugriffsmuster von macOS, nicht den Datentraeger.
     
     // 12. Get raw hex dump of first sectors (MBR/GPT header preview)
     let hexdump_cmd = format!(
@@ -4131,10 +4136,26 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     fs_details.insert("used_blocks".to_string(), serde_json::json!(parts.get(2).unwrap_or(&"")));
                     fs_details.insert("free_blocks".to_string(), serde_json::json!(parts.get(3).unwrap_or(&"")));
                     fs_details.insert("capacity_percent".to_string(), serde_json::json!(parts.get(4).unwrap_or(&"")));
-                    fs_details.insert("total_inodes".to_string(), serde_json::json!(parts.get(5).unwrap_or(&"")));
-                    fs_details.insert("used_inodes".to_string(), serde_json::json!(parts.get(6).unwrap_or(&"")));
-                    fs_details.insert("free_inodes".to_string(), serde_json::json!(parts.get(7).unwrap_or(&"")));
-                    fs_details.insert("inode_usage_percent".to_string(), serde_json::json!(parts.get(8).unwrap_or(&"")));
+                    // `df -i` liefert: 5=iused, 6=ifree, 7=%iused, 8=Mounted on.
+                    // FAT/exFAT kennen keine Inodes; df meldet dort 0/0/"-".
+                    // Solche Platzhalter nicht als Messwerte ausgeben.
+                    let used_inodes = parts.get(5).copied().unwrap_or("");
+                    let free_inodes = parts.get(6).copied().unwrap_or("");
+                    let inode_percent = parts.get(7).copied().unwrap_or("");
+                    let inode_total = match (used_inodes.parse::<u64>(), free_inodes.parse::<u64>()) {
+                        (Ok(u), Ok(f)) => Some(u + f),
+                        _ => None,
+                    };
+                    if inode_total.is_none_or(|t| t > 0) {
+                        fs_details.insert("used_inodes".to_string(), serde_json::json!(used_inodes));
+                        fs_details.insert("free_inodes".to_string(), serde_json::json!(free_inodes));
+                        if let Some(total) = inode_total {
+                            fs_details.insert("total_inodes".to_string(), serde_json::json!(total.to_string()));
+                        }
+                        if !inode_percent.is_empty() && inode_percent != "-" {
+                            fs_details.insert("inode_usage_percent".to_string(), serde_json::json!(inode_percent));
+                        }
+                    }
                 }
             }
             
@@ -4208,18 +4229,21 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                 }
             }
             
-            // Get directory count
-            let dir_cmd = format!("find {} -type d 2>/dev/null | wc -l", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &dir_cmd]).output() {
-                let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                fs_details.insert("directory_count".to_string(), serde_json::json!(count));
-            }
-            
-            // Get total file count
-            let file_cmd = format!("find {} -type f 2>/dev/null | wc -l", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &file_cmd]).output() {
-                let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                fs_details.insert("total_file_count".to_string(), serde_json::json!(count));
+            // Systemordner (Spotlight-Index, fseventsd, Papierkorb, Windows-Metadaten)
+            // werden im Hintergrund laufend neu geschrieben und lassen die Gesamtzahl
+            // zwischen zwei Scans schwanken. Daher zusaetzlich ohne sie zaehlen.
+            // -mindepth 1 schliesst den Einhaengepunkt selbst aus, der kein Inhalt ist.
+            let count_cmds = [
+                ("directory_count", format!("find {} -mindepth 1 -type d -print 2>/dev/null | wc -l", mp)),
+                ("user_directory_count", format!("find {} -mindepth 1 {} -type d -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
+                ("total_file_count", format!("find {} -type f -print 2>/dev/null | wc -l", mp)),
+                ("user_file_count", format!("find {} {} -type f -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
+            ];
+            for (key, cmd) in count_cmds {
+                if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
+                    let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    fs_details.insert(key.to_string(), serde_json::json!(count));
+                }
             }
             
             // Get symlink count
@@ -4396,12 +4420,13 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if result.get("filesystem_details").is_some() { sources.push("mounted filesystem metadata".to_string()); }
     if result.get("linux_filesystem_details").is_some() { sources.push("Linux filesystem superblock (read-only)".to_string()); }
 
+    // Als Codes ausgeben, damit die Oberflaeche sie uebersetzen kann.
     let mut limitations = Vec::new();
     if result.get("smart_info").is_none() {
-        limitations.push("SMART-Daten wurden vom Gerät oder USB-Adapter nicht bereitgestellt.".to_string());
+        limitations.push("smart_unavailable".to_string());
     }
     if result.get("filesystem_details").is_none() {
-        limitations.push("Datei-Metadaten sind nur für ein von macOS lesbar eingehängtes Dateisystem verfügbar; Linux-Superblock-Metadaten werden bei Erkennung separat gelesen.".to_string());
+        limitations.push("filesystem_metadata_unavailable".to_string());
     }
 
     result["analysis_quality"] = serde_json::json!({
@@ -4772,9 +4797,38 @@ try:
             print(f"GPT:{{has_gpt}}")
             if has_gpt:
                 # Parse GPT header
-                import struct
-                disk_guid = gpt[56:72]
-                print(f"GPT_GUID:{{disk_guid.hex()}}")
+                import struct, uuid
+
+                # GPT speichert GUIDs mixed-endian (erste drei Felder little-endian)
+                print(f"GPT_GUID:{{str(uuid.UUID(bytes_le=gpt[56:72])).upper()}}")
+
+                # Partitionstabelle auswerten - nur hier steht die EFI System
+                # Partition. Im MBR einer GPT-Platte steht ausschliesslich der
+                # Schutzeintrag 0xEE.
+                ESP_TYPE = uuid.UUID('C12A7328-F81F-11D2-BA4B-00A0C93EC93B')
+                entry_lba = struct.unpack_from('<Q', gpt, 72)[0]
+                entry_cnt = struct.unpack_from('<I', gpt, 80)[0]
+                entry_size = struct.unpack_from('<I', gpt, 84)[0]
+                has_efi = False
+                parts = []
+                if 0 < entry_size <= 1024 and 0 < entry_cnt <= 256:
+                    base = entry_lba * 512
+                    for i in range(entry_cnt):
+                        off = base + (i * entry_size)
+                        if off + entry_size > len(data):
+                            break
+                        entry = data[off:off + entry_size]
+                        type_guid = uuid.UUID(bytes_le=entry[0:16])
+                        if int(type_guid) == 0:
+                            continue
+                        name = entry[56:128].decode('utf-16-le', errors='ignore')
+                        name = name.split('\x00')[0].strip()
+                        name = name.replace(';', ' ').replace(':', ' ')
+                        if type_guid == ESP_TYPE:
+                            has_efi = True
+                        parts.append(f"{{i+1}}:{{name if name else '-'}}:{{str(type_guid).upper()}}")
+                print(f"GPT_EFI:{{has_efi}}")
+                print(f"GPT_PARTS:{{';'.join(parts) if parts else 'none'}}")
         
         # ISO 9660 check (at 32KB offset)
         if len(data) >= 0x8006:
@@ -4818,6 +4872,8 @@ except Exception as e:
                     "MBR_SIG" => { boot_info.insert("has_mbr_signature".to_string(), serde_json::json!(value == "True")); },
                     "GPT" => { boot_info.insert("has_gpt".to_string(), serde_json::json!(value == "True")); },
                     "GPT_GUID" => { boot_info.insert("gpt_disk_guid".to_string(), serde_json::json!(value)); },
+                    "GPT_EFI" => { boot_info.insert("has_efi".to_string(), serde_json::json!(value == "True")); },
+                    "GPT_PARTS" => { boot_info.insert("gpt_partitions".to_string(), serde_json::json!(value)); },
                     "PARTITIONS" => { boot_info.insert("mbr_partitions".to_string(), serde_json::json!(value)); },
                     "ISO9660" => { boot_info.insert("is_iso9660".to_string(), serde_json::json!(value == "True")); },
                     "ISO_LABEL" => { boot_info.insert("iso_volume_label".to_string(), serde_json::json!(value)); },
@@ -5312,6 +5368,16 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// Analyze mounted content (files, folders, OS detection)
+/// Ordner, die macOS und Windows selbst anlegen und laufend neu schreiben. Sie
+/// gehoeren nicht zum Nutzerinhalt und machen jede Zaehlung unreproduzierbar:
+/// derselbe Stick lieferte dadurch mal 128, mal 110 Eintraege.
+/// Wird von beiden Zaehlstellen genutzt, damit sie nicht auseinanderlaufen.
+const SYSTEM_PRUNE: &str = concat!(
+    "\\( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.TemporaryItems'",
+    " -o -name '.Trashes' -o -name '.DocumentRevisions-V100'",
+    " -o -name 'System Volume Information' -o -name '$RECYCLE.BIN' \\) -prune -o"
+);
+
 fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     // K-1: Einmal maskieren, danach ausschliesslich den maskierten Wert in
     // Shell-Befehle einsetzen. `mount_point` bleibt fuer Pfadaufbau und
@@ -5319,15 +5385,19 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     let mp = shell_quote(mount_point);
     let mut content = serde_json::Map::new();
     
-    // Count files and folders
-    let count_cmd = format!(
-        "find {} -maxdepth 5 2>/dev/null | head -10000 | wc -l",
-        mp
-    );
-    
-    if let Ok(output) = Command::new("sh").args(["-c", &count_cmd]).output() {
-        if let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
-            content.insert("total_items".to_string(), serde_json::json!(count));
+    // Konsistent zur Zaehlung in filesystem_details: ohne den Einhaengepunkt selbst
+    // und mit getrennt ausgewiesenen Systemordnern. Die frueheren Grenzen -maxdepth 5
+    // und head -10000 haben tiefe bzw. grosse Baeume still unterzaehlt.
+    let count_cmds = [
+        ("total_items", format!("find {} -mindepth 1 -print 2>/dev/null | wc -l", mp)),
+        ("user_items", format!("find {} -mindepth 1 {} -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
+    ];
+
+    for (key, cmd) in count_cmds {
+        if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
+            if let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
+                content.insert(key.to_string(), serde_json::json!(count));
+            }
         }
     }
     
@@ -5715,8 +5785,28 @@ try:
             part_type = mbr[offset + 4]
             if boot_flag == 0x80:
                 has_bootable = True
-            if part_type == 0xEF or part_type == 0xEE:
+            if part_type == 0xEF:
                 has_efi = True
+        
+        # Bei GPT steht die EFI System Partition in der GPT-Tabelle. Im MBR
+        # findet sich dort nur der Schutzeintrag 0xEE - der ist keine EFI-Partition.
+        if has_gpt:
+            import uuid
+            ESP_TYPE = uuid.UUID('C12A7328-F81F-11D2-BA4B-00A0C93EC93B')
+            entry_lba = struct.unpack_from('<Q', gpt_header, 72)[0]
+            entry_cnt = struct.unpack_from('<I', gpt_header, 80)[0]
+            entry_size = struct.unpack_from('<I', gpt_header, 84)[0]
+            if 0 < entry_size <= 1024 and 0 < entry_cnt <= 256:
+                need = (((entry_cnt * entry_size) + 511) // 512) * 512
+                f.seek(entry_lba * 512)
+                table = f.read(need)
+                for i in range(entry_cnt):
+                    off = i * entry_size
+                    if off + entry_size > len(table):
+                        break
+                    if uuid.UUID(bytes_le=table[off:off + 16]) == ESP_TYPE:
+                        has_efi = True
+                        break
         
         # Check for ISO 9660
         f.seek(0x8000)

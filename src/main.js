@@ -25,7 +25,107 @@ document.addEventListener('DOMContentLoaded', async () => {
       .replace(/'/g, '&#39;');
   }
   
-  // Clipboard helper - use native API as fallback
+  // Bekannte GPT-Partitionstyp-GUIDs. Wichtig: Die EFI System Partition (ESP)
+  // steht ausschliesslich in der GPT-Tabelle. Im MBR einer GPT-Platte findet
+  // sich nur der Schutzeintrag 0xEE - der ist KEINE EFI-Partition.
+  const GPT_TYPE_NAMES = {
+    'C12A7328-F81F-11D2-BA4B-00A0C93EC93B': 'EFI System Partition',
+    '7C3457EF-0000-11AA-AA11-00306543ECAC': 'Apple APFS Container',
+    '48465300-0000-11AA-AA11-00306543ECAC': 'Apple HFS+',
+    '426F6F74-0000-11AA-AA11-00306543ECAC': 'Apple Boot (Recovery)',
+    '53746F72-6167-11AA-AA11-00306543ECAC': 'Apple Core Storage',
+    'EBD0A0A2-B9E5-4433-87C0-68B6B72699C7': 'Microsoft Basic Data',
+    'E3C9E316-0B5C-4DB8-817D-F92DF00215AE': 'Microsoft Reserved',
+    'DE94BBA4-06D1-4D40-A16A-BFD50179D6AC': 'Windows Recovery',
+    '0FC63DAF-8483-4772-8E79-3D69D8477DE4': 'Linux Filesystem',
+    '0657FD6D-A4AB-43C4-84E5-0933C84B4F4F': 'Linux Swap',
+    'E6D6D379-F507-44C2-A23C-238F2A3DF928': 'Linux LVM',
+    '21686148-6449-6E6F-744E-656564454649': 'BIOS Boot',
+    '024DEE41-33E7-11D3-9D69-0008C781F39F': 'MBR Partition Scheme'
+  };
+
+  // Wandelt "1:EFI:C12A...;2:Container:7C34..." in lesbare Zeilen um.
+  function formatGptPartitions(raw) {
+    if (!raw || raw === 'none') return [];
+    return String(raw).split(';').filter(Boolean).map((entry) => {
+      const parts = entry.split(':');
+      const num = parts[0] || '?';
+      const name = parts[1] || '';
+      const guid = (parts[2] || '').toUpperCase();
+      const typeName = GPT_TYPE_NAMES[guid] || guid;
+      const hasName = name && name !== '-';
+      const label = hasName ? name : typeName;
+      const suffix = (hasName && typeName && typeName !== name) ? ' — ' + typeName : '';
+      return num + ': ' + label + suffix;
+    });
+  }
+
+  // Einschraenkungs-Hinweise kommen als Code aus dem Backend, damit sie uebersetzbar sind.
+const LIMITATION_KEYS = {
+  smart_unavailable: 'tools.limitSmartUnavailable',
+  filesystem_metadata_unavailable: 'tools.limitFilesystemMetadata'
+};
+
+function translateLimitation(code) {
+  const key = LIMITATION_KEYS[String(code)];
+  return key ? t(key) : String(code);
+}
+
+// Zeigt "110 (14 Nutzdaten, 96 System/Index)". Systemordner werden von macOS
+// laufend neu geschrieben, daher waere die reine Gesamtzahl nicht reproduzierbar.
+function formatCountBreakdown(total, userCount) {
+  const totalNum = Number(total);
+  const userNum = Number(userCount);
+  if (!Number.isFinite(totalNum) || !Number.isFinite(userNum) || userNum > totalNum) {
+    return String(total);
+  }
+  const systemNum = totalNum - userNum;
+  if (systemNum <= 0) return String(total);
+  return totalNum + ' (' + userNum + ' ' + t('tools.forensicUserData') + ', '
+    + systemNum + ' ' + t('tools.forensicSystemData') + ')';
+}
+
+// Rohe Backend-Schluessel wurden bisher nur per _ -> Leerzeichen angezeigt, also
+// "is whole disk" oder "free space in bytes" -- unabhaengig von der Sprache und
+// teils irrefuehrend, weil die Werte gar nicht in Bytes dargestellt werden.
+const FORENSIC_FIELD_KEYS = {
+  exact_size_bytes: 'tools.fieldExactSize',
+  preferred_block_size: 'tools.fieldPreferredBlockSize',
+  physical_block_size: 'tools.fieldPhysicalBlockSize',
+  hardware_removable: 'tools.fieldRemovable',
+  ejectable: 'tools.fieldEjectable',
+  is_whole_disk: 'tools.fieldWholeDisk',
+  storage_name: 'tools.fieldStorageName',
+  size_in_bytes: 'tools.fieldVolumeSize',
+  free_space_in_bytes: 'tools.fieldFreeSpace',
+  writable: 'tools.fieldWritable',
+  ignore_ownership: 'tools.fieldIgnoreOwnership',
+  host_controller: 'tools.fieldHostController',
+  pci_vendor_id: 'tools.fieldPciVendorId',
+  pci_device_id: 'tools.fieldPciDeviceId',
+  pci_revision_id: 'tools.fieldPciRevisionId',
+  usb_bus: 'tools.fieldUsbBus',
+  special_partitions: 'tools.fieldSpecialPartitions',
+  has_windows_recovery: 'tools.fieldWindowsRecovery'
+};
+
+function fieldLabel(key) {
+  const mapped = FORENSIC_FIELD_KEYS[key];
+  if (mapped) {
+    const translated = t(mapped);
+    // t() gibt bei fehlendem Schlüssel den Schlüssel selbst zurueck.
+    if (translated && translated !== mapped) return translated;
+  }
+  return String(key).replace(/_/g, ' ');
+}
+
+// Eigene Helferfunktion, weil yesNo() erst weiter unten als const im SMART-Block
+// definiert wird und hier noch in der temporalen Todzone laege.
+function formatBool(value) {
+  return value ? '✓ ' + t('forensic.yes') : '✗ ' + t('forensic.no');
+}
+
+// Clipboard helper - use native API as fallback
   async function copyToClipboard(text) {
     try {
       if (window.__TAURI__?.clipboard?.writeText) {
@@ -860,12 +960,37 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Format bytes to human readable string
+  // macOS rechnet Speichergroessen durchgehend dezimal: diskutil meldet fuer diesen
+  // Stick "62.3 GB (62264442880 Bytes)". Zuvor wurde hier binaer durch 1024 geteilt,
+  // das Ergebnis aber als "GB" beschriftet -- dadurch stand in der App 57.8 GB, wo
+  // macOS 62.0 GB anzeigt. Das war keine andere Einheit, sondern eine falsche.
   function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n <= 0) return '0 B';
+    // macOS rechnet Speichergroessen seit 10.6 dezimal. Mit k=1024 stuende hier
+    // "57.8 GB", waehrend diskutil und der Finder "62.0 GB" zeigen.
+    const k = 1000;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    const i = Math.min(Math.floor(Math.log(n) / Math.log(k)), sizes.length - 1);
+    // Dezimaltrennzeichen an die App-Sprache koppeln, sonst steht im Deutschen der
+    // Punkt gleichzeitig fuer Nachkomma- und Tausenderstelle.
+    const locale = window.i18n?.currentLang === 'de' ? 'de-DE' : 'en-US';
+    const value = (n / Math.pow(k, i)).toLocaleString(locale, {
+      minimumFractionDigits: i >= 2 ? 1 : 0,
+      maximumFractionDigits: 1
+    });
+    return value + ' ' + sizes[i];
+  }
+
+  // Forensische Darstellung nach Vorbild von diskutil: gerundeter Wert plus exakte
+  // Byte-Zahl. Noetig, weil Felder wie size_in_bytes eine Byte-Angabe versprechen.
+  function formatBytesExact(bytes) {
+    const n = Number(bytes);
+    // Nicht-numerische ioreg-Werte lieber roh zeigen als eine Groesse erfinden.
+    if (!Number.isFinite(n) || n < 0) return String(bytes);
+    // Trennzeichen an die App-Sprache koppeln, nicht an die System-Locale.
+    const locale = window.i18n?.currentLang === 'de' ? 'de-DE' : 'en-US';
+    return formatBytes(n) + ' (' + n.toLocaleString(locale) + ' Bytes)';
   }
 
   // Load disks (with logging)
@@ -2352,7 +2477,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       html += '<section class="forensic-overview" aria-label="Forensik-Überblick">';
       html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.device')) + '</span><strong>' + eh(forensicValue(overviewDevice)) + '</strong></div>';
       html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.size')) + '</span><strong>' + eh(forensicValue(overviewDisk.disk_size)) + '</strong></div>';
-      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.filesystem')) + '</span><strong>' + eh(forensicValue(overviewFilesystem)) + '</strong></div>';
+      html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.forensicFileSystem')) + '</span><strong>' + eh(forensicValue(overviewFilesystem)) + '</strong></div>';
       html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.forensicPartitions')) + '</span><strong>' + overviewPartitions + '</strong></div>';
       html += '<div class="forensic-overview-card ' + (String(overviewHealth).toLowerCase().includes('fail') ? 'critical' : '') + '"><span class="forensic-overview-label">SMART</span><strong>' + eh(forensicValue(overviewHealth)) + '</strong></div>';
       html += '<div class="forensic-overview-card"><span class="forensic-overview-label">' + eh(t('tools.forensicBootable')) + '</span><strong>' + (overviewBootable ? '✓ ' + eh(t('forensic.yes')) : '— ' + eh(t('forensic.no'))) + '</strong></div>';
@@ -2366,7 +2491,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (result.analysis_quality.sections_collected) html += ' <span class="forensic-acquisition-count">' + eh(result.analysis_quality.sections_collected) + ' ' + eh(t('forensic.sectionsCollected')) + '</span>';
         html += '</div>';
         if (sources.length) html += '<div class="forensic-source-list">' + sources.map(source => '<span>' + eh(source) + '</span>').join('') + '</div>';
-        if (limitations.length) html += '<ul class="forensic-limitations">' + limitations.map(note => '<li>' + eh(note) + '</li>').join('') + '</ul>';
+        if (limitations.length) html += '<ul class="forensic-limitations">' + limitations.map(note => '<li>' + eh(translateLimitation(note)) + '</li>').join('') + '</ul>';
         html += '</section>';
       }
       
@@ -2389,12 +2514,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isSDCard = result.usb_info && result.usb_info.hardware_type === 'SD Card';
       
       const diskLabels = {
-        media_name: t('tools.forensicMediaName'), device_id: 'Identifier', device_node: 'Gerätepfad',
+        media_name: t('tools.forensicMediaName'), device_id: 'Identifier', device_node: t('tools.forensicDevicePath'),
         protocol: t('tools.forensicProtocol'), disk_size: t('tools.forensicTotalSize'),
-        block_size: 'Blockgröße', filesystem: t('tools.forensicFileSystem'), content_type: 'Inhaltstyp',
-        volume_name: 'Volume', mount_point: t('tools.mountPoint'), total_space: t('tools.forensicTotalSize'),
+        block_size: t('tools.forensicBlockSize'), filesystem: t('tools.forensicFileSystem'), content_type: t('tools.forensicContentType'),
+        volume_name: 'Volume', mount_point: t('tools.mountPoint'), total_space: t('tools.forensicVolumeCapacity'),
         used_space: t('tools.forensicUsedSpace'), free_space: t('tools.forensicFreeSpace'),
-        removable: t('tools.forensicRemovable'), read_only: 'Schreibgeschützt', is_ssd: 'Solid State',
+        removable: t('tools.forensicRemovable'), read_only: t('tools.forensicReadOnly'), is_ssd: 'Solid State',
         uuid: 'UUID', volume_uuid: 'Volume-UUID', smart_status: 'SMART'
       };
       const primaryDiskFields = ['media_name', 'device_id', 'device_node', 'protocol', 'disk_size', 'block_size',
@@ -2427,7 +2552,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           html += '<strong style="color: #81c784;">📂 ' + partId + '</strong>';
           if (volName !== '-') html += ' - <span style="color: #4fc3f7;">' + volName + '</span>';
           html += '<div class="forensic-grid" style="margin-top: 8px;">';
-          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.filesystem') + ':</span> <span class="forensic-value">' + fs + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.filesystem') + '</span> <span class="forensic-value">' + fs + '</span></div>';
           html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.size') + ':</span> <span class="forensic-value">' + size + '</span></div>';
           
           // Show APFS container info if present
@@ -2560,22 +2685,34 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Use correct key names from Rust backend
         const hasMbr = result.boot_info.has_mbr_signature || result.boot_info.has_mbr;
         const hasGpt = result.boot_info.has_gpt;
-        const hasEfi = result.mbr_analysis?.partition_entries?.some(p => p.type_hex === 'EF') || result.boot_info.has_efi;
+        // Die EFI System Partition steht bei GPT ausschliesslich in der
+        // GPT-Tabelle (Backend liefert has_efi). Nur bei reinem MBR ist sie
+        // als Partitionstyp 0xEF eingetragen.
+        const mbrHasEfType = result.mbr_analysis?.partition_entries?.some(
+          (p) => String(p.type_hex || '').toUpperCase().replace(/^0X/, '') === 'EF'
+        );
+        const hasEfi = hasGpt ? !!result.boot_info.has_efi : (mbrHasEfType || !!result.boot_info.has_efi);
         
-        // Check if this is a GPT Protective MBR (type 0xEE) - this is NOT bootable as Legacy BIOS
+        // Schutz-MBR (Typ 0xEE) ist kein startfaehiger Legacy-BIOS-Eintrag
         const mbrPartitions = result.boot_info.mbr_partitions || '';
-        const isGptProtectiveMbr = mbrPartitions.includes('type=0xee') || mbrPartitions.includes('type=0xEE');
+        const isGptProtectiveMbr = /type=0x?ee/i.test(mbrPartitions);
         
         // Real bootable MBR has actual bootable partitions, not just GPT protective
         const hasRealBootableMbr = hasMbr && !isGptProtectiveMbr && !hasGpt;
         const isBootable = hasRealBootableMbr || (hasGpt && hasEfi) || result.boot_info.is_iso9660;
         
-        html += '<div class="forensic-item"><span class="forensic-label">MBR-Signatur:</span> <span class="forensic-value">' + (hasMbr ? '✓ (55AA)' : '✗') + '</span></div>';
-        html += '<div class="forensic-item"><span class="forensic-label">GPT:</span> <span class="forensic-value">' + (hasGpt ? '✓ (EFI PART)' : '✗') + '</span></div>';
-        if (isGptProtectiveMbr) {
-          html += '<div class="forensic-item"><span class="forensic-label">GPT Protective MBR:</span> <span class="forensic-value">✓ (type 0xEE)</span></div>';
+        // Das Partitionsschema zuerst nennen - es ordnet alle weiteren Angaben ein.
+        let scheme = '—';
+        if (hasGpt) {
+          scheme = isGptProtectiveMbr
+            ? 'GPT (' + (t('tools.forensicProtectiveMbr') || 'mit Schutz-MBR') + ')'
+            : 'GPT';
+        } else if (hasMbr) {
+          scheme = 'MBR';
         }
-        html += '<div class="forensic-item"><span class="forensic-label">EFI-Partition:</span> <span class="forensic-value">' + (hasEfi ? '✓' : '✗') + '</span></div>';
+        html += '<div class="forensic-item"><span class="forensic-label">' + (t('tools.forensicPartScheme') || 'Partitionsschema') + ':</span> <span class="forensic-value">' + eh(scheme) + '</span></div>';
+        html += '<div class="forensic-item"><span class="forensic-label">' + (t('tools.forensicMbrSignature') || 'MBR-Signatur') + ':</span> <span class="forensic-value">' + (hasMbr ? '✓ (55AA)' : '✗') + '</span></div>';
+        html += '<div class="forensic-item"><span class="forensic-label">' + (t('tools.forensicEsp') || 'EFI-System-Partition') + ':</span> <span class="forensic-value">' + (hasEfi ? '✓' : '✗') + '</span></div>';
         
         // Determine boot type
         let bootType = '';
@@ -2602,8 +2739,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           html += '<div class="forensic-item"><span class="forensic-label">El Torito:</span> <span class="forensic-value">' + (result.boot_info.has_el_torito_boot ? '✓' : '✗') + '</span></div>';
         }
         
+        const gptPartitionLines = formatGptPartitions(result.boot_info.gpt_partitions);
+        if (gptPartitionLines.length) {
+          html += '<div class="forensic-item full-width"><span class="forensic-label">' + (t('tools.forensicGptParts') || 'GPT-Partitionen') + ':</span> <span class="forensic-value">' + eh(gptPartitionLines.join(' · ')) + '</span></div>';
+        }
+        
         if (result.boot_info.mbr_partitions && result.boot_info.mbr_partitions !== 'none') {
-          html += '<div class="forensic-item full-width"><span class="forensic-label">MBR-Partitionen:</span> <span class="forensic-value">' + eh(result.boot_info.mbr_partitions) + '</span></div>';
+          html += '<div class="forensic-item full-width"><span class="forensic-label">' + t('tools.forensicMbrPartitions') + ':</span> <span class="forensic-value">' + eh(result.boot_info.mbr_partitions) + '</span></div>';
         }
         
         if (result.boot_info.gpt_disk_guid) {
@@ -2645,9 +2787,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       const linuxFilesystems = result.linux_filesystem_details?.filesystems;
       if (Array.isArray(linuxFilesystems) && linuxFilesystems.length > 0) {
         html += '<div class="forensic-section">';
-        html += '<h5>🐧 Linux-Dateisystem-Details</h5>';
+        html += '<h5>🐧 ' + t('tools.forensicLinuxFsDetails') + '</h5>';
         linuxFilesystems.forEach((filesystem) => {
-          const filesystemName = eh(filesystem.filesystem || 'Linux-Dateisystem');
+          const filesystemName = eh(filesystem.filesystem || t('tools.forensicLinuxFs'));
           const partition = eh(filesystem.partition || '-');
           const bytes = (value) => Number.isFinite(Number(value)) ? formatBytes(Number(value)) : '-';
           const item = (label, value, fullWidth = false) => {
@@ -2661,21 +2803,21 @@ document.addEventListener('DOMContentLoaded', async () => {
           html += '<div class="forensic-grid" style="margin-top: 8px;">';
           html += item('UUID', filesystem.uuid);
           html += item('Label', filesystem.label);
-          html += item('Größe', filesystem.total_bytes !== undefined ? bytes(filesystem.total_bytes) : undefined);
-          html += item('Belegt', filesystem.used_bytes !== undefined ? bytes(filesystem.used_bytes) + (filesystem.used_percent !== undefined ? ' (' + filesystem.used_percent + '%)' : '') : undefined);
-          html += item('Frei', filesystem.free_bytes !== undefined ? bytes(filesystem.free_bytes) : undefined);
-          html += item('Blockgröße', filesystem.block_size_bytes !== undefined ? bytes(filesystem.block_size_bytes) : undefined);
-          html += item('Inode-Größe', filesystem.inode_size_bytes !== undefined ? bytes(filesystem.inode_size_bytes) : undefined);
-          html += item('Inodes', filesystem.inode_count !== undefined ? String(filesystem.inode_count) + (filesystem.free_inodes !== undefined ? ' (' + filesystem.free_inodes + ' frei)' : '') : undefined);
-          html += item('Status', filesystem.state);
-          html += item('Journal', filesystem.has_journal === undefined ? undefined : (filesystem.has_journal ? 'vorhanden' : 'nicht vorhanden'));
-          html += item('Wiederherstellung', filesystem.needs_recovery === undefined ? undefined : (filesystem.needs_recovery ? 'erforderlich' : 'nicht erforderlich'));
-          html += item('Letztes Einhängen', filesystem.last_mounted_at);
-          html += item('Letzter Schreibzugriff', filesystem.last_written_at);
-          html += item('Letzte Prüfung', filesystem.last_checked_at);
-          html += item('Verschlüsselung', filesystem.cipher ? filesystem.cipher + (filesystem.cipher_mode ? ' · ' + filesystem.cipher_mode : '') : undefined);
-          html += item('LUKS-Version', filesystem.luks_version);
-          html += item('Features', filesystem.features, true);
+          html += item(t('tools.size'), filesystem.total_bytes !== undefined ? bytes(filesystem.total_bytes) : undefined);
+          html += item(t('tools.usedSpace'), filesystem.used_bytes !== undefined ? bytes(filesystem.used_bytes) + (filesystem.used_percent !== undefined ? ' (' + filesystem.used_percent + '%)' : '') : undefined);
+          html += item(t('tools.freeSpace'), filesystem.free_bytes !== undefined ? bytes(filesystem.free_bytes) : undefined);
+          html += item(t('tools.forensicBlockSize'), filesystem.block_size_bytes !== undefined ? bytes(filesystem.block_size_bytes) : undefined);
+          html += item(t('tools.forensicInodeSize'), filesystem.inode_size_bytes !== undefined ? bytes(filesystem.inode_size_bytes) : undefined);
+          html += item(t('tools.forensicInodes'), filesystem.inode_count !== undefined ? String(filesystem.inode_count) + (filesystem.free_inodes !== undefined ? ' (' + filesystem.free_inodes + ' ' + t('tools.forensicFreeSuffix') + ')' : '') : undefined);
+          html += item(t('tools.forensicState'), filesystem.state);
+          html += item(t('tools.forensicJournal'), filesystem.has_journal === undefined ? undefined : (filesystem.has_journal ? t('tools.forensicPresent') : t('tools.forensicNotPresent')));
+          html += item(t('tools.forensicRecovery'), filesystem.needs_recovery === undefined ? undefined : (filesystem.needs_recovery ? t('tools.forensicRequired') : t('tools.forensicNotRequired')));
+          html += item(t('tools.forensicLastMounted'), filesystem.last_mounted_at);
+          html += item(t('tools.forensicLastWritten'), filesystem.last_written_at);
+          html += item(t('tools.forensicLastChecked'), filesystem.last_checked_at);
+          html += item(t('tools.forensicEncryption'), filesystem.cipher ? filesystem.cipher + (filesystem.cipher_mode ? ' · ' + filesystem.cipher_mode : '') : undefined);
+          html += item(t('tools.forensicLuksVersion'), filesystem.luks_version);
+          html += item(t('tools.forensicFeatures'), filesystem.features, true);
           html += '</div></div>';
         });
         html += '</div>';
@@ -2690,7 +2832,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           html += '<div class="forensic-item"><span class="forensic-label">Mount:</span> <span class="forensic-value">' + eh(result.content_analysis.mount_point) + '</span></div>';
         }
         if (result.content_analysis.total_items !== undefined) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.forensicTotalItems') + ':</span> <span class="forensic-value">' + eh(result.content_analysis.total_items) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.forensicTotalItems') + ':</span> <span class="forensic-value">' + eh(formatCountBreakdown(result.content_analysis.total_items, result.content_analysis.user_items)) + '</span></div>';
         }
         if (result.content_analysis.detected_os && result.content_analysis.detected_os.length > 0) {
           html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.forensicDetectedOS') + ':</span> <span class="forensic-value">' + eh(result.content_analysis.detected_os.join(', ')) + '</span></div>';
@@ -2708,7 +2850,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<h5>🔎 ' + t('tools.forensicSpecial') + '</h5>';
         html += '<div class="forensic-grid">';
         for (let key in result.special_structures) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(key) + ':</span> <span class="forensic-value">' + (result.special_structures[key] ? '✓' : '✗') + '</span></div>';
+          const value = result.special_structures[key];
+          // special_partitions ist eine Liste von diskutil-Zeilen. Als blosses "✓"
+          // ginge die eigentliche Information verloren.
+          let shown;
+          if (Array.isArray(value)) {
+            shown = value.map(eh).join('<br>');
+          } else if (typeof value === 'boolean') {
+            shown = formatBool(value);
+          } else {
+            shown = eh(value);
+          }
+          html += '<div class="forensic-item"><span class="forensic-label">' + eh(fieldLabel(key)) + ':</span> <span class="forensic-value">' + shown + '</span></div>';
         }
         html += '</div></div>';
       }
@@ -2719,7 +2872,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<summary>🔧 ' + (t('tools.forensicHardwareInfo') || 'Hardware-Details') + '</summary>';
         html += '<div class="forensic-grid">';
         for (let key in result.hardware_info) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(result.hardware_info[key]) + '</span></div>';
+          let value = result.hardware_info[key];
+          if (typeof value === 'boolean') {
+            value = formatBool(value);
+          } else if (key.endsWith('_bytes')) {
+            value = formatBytesExact(value);
+          }
+          html += '<div class="forensic-item"><span class="forensic-label">' + eh(fieldLabel(key)) + ':</span> <span class="forensic-value">' + eh(value) + '</span></div>';
         }
         html += '</div></details>';
       }
@@ -2730,7 +2889,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<summary>🎛️ ' + (t('tools.forensicController') || 'USB-Controller') + '</summary>';
         html += '<div class="forensic-grid">';
         for (let key in result.controller_info) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(result.controller_info[key]) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + eh(fieldLabel(key)) + ':</span> <span class="forensic-value">' + eh(result.controller_info[key]) + '</span></div>';
         }
         html += '</div></details>';
       }
@@ -2742,45 +2901,34 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<div class="forensic-grid">';
         for (let key in result.storage_info) {
           let value = result.storage_info[key];
-          // Format bytes to human-readable
-          if (key.includes('bytes') && typeof value === 'number') {
-            value = formatBytes(value);
+          // Byte-Felder mit exakter Zahl zeigen, sonst widerspricht der Wert dem Namen.
+          if (key.includes('bytes')) {
+            value = formatBytesExact(value);
+          } else if (typeof value === 'boolean') {
+            value = formatBool(value);
           }
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(key.replace(/_/g, ' ')) + ':</span> <span class="forensic-value">' + eh(value) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + eh(fieldLabel(key)) + ':</span> <span class="forensic-value">' + eh(value) + '</span></div>';
         }
-        html += '</div></details>';
-      }
-      
-      // Disk Activity Section
-      if (result.disk_activity) {
-        html += '<details class="forensic-section forensic-disclosure">';
-        html += '<summary>📊 ' + (t('tools.forensicActivity') || 'Disk-Aktivität') + '</summary>';
-        html += '<div class="forensic-grid">';
-        html += '<div class="forensic-item"><span class="forensic-label">KB/Transfer:</span> <span class="forensic-value">' + eh(result.disk_activity.kb_per_transfer) + '</span></div>';
-        html += '<div class="forensic-item"><span class="forensic-label">Transfers/s:</span> <span class="forensic-value">' + eh(result.disk_activity.transfers_per_sec) + '</span></div>';
-        html += '<div class="forensic-item"><span class="forensic-label">MB/s:</span> <span class="forensic-value">' + eh(result.disk_activity.mb_per_sec) + '</span></div>';
         html += '</div></details>';
       }
       
       // MBR Analysis Section
-      if (result.mbr_analysis) {
+      // Signatur und Gueltigkeit stehen bereits unter "Boot-Strukturen". Hier nur
+      // noch die Partitionseintraege, sonst steht dieselbe Angabe zweimal auf der
+      // Seite -- zuvor sogar in zwei verschiedenen Sprachen.
+      const mbrEntries = result.mbr_analysis?.partition_entries;
+      if (mbrEntries && mbrEntries.length > 0) {
         html += '<details class="forensic-section forensic-disclosure">';
         html += '<summary>📀 ' + (t('tools.forensicMbrAnalysis') || 'MBR-Analyse') + '</summary>';
-        html += '<div class="forensic-grid">';
-        html += '<div class="forensic-item"><span class="forensic-label">MBR-Signatur:</span> <span class="forensic-value">' + eh(result.mbr_analysis.mbr_signature) + '</span></div>';
-        html += '<div class="forensic-item"><span class="forensic-label">Gültig:</span> <span class="forensic-value">' + (result.mbr_analysis.valid_mbr ? '✓ Ja' : '✗ Nein') + '</span></div>';
-        html += '</div></details>';
-        if (result.mbr_analysis.partition_entries && result.mbr_analysis.partition_entries.length > 0) {
-          html += '<div class="forensic-partitions" style="margin-top:8px;">';
-          result.mbr_analysis.partition_entries.forEach(p => {
-            html += '<div class="forensic-partition">';
-            html += '<strong>Partition ' + eh(p.number) + '</strong>';
-            html += ' [' + eh(p.type_hex) + '] ' + eh(p.type_name);
-            if (p.bootable) html += ' 🚀 Boot';
-            html += '</div>';
-          });
+        html += '<div class="forensic-partitions">';
+        mbrEntries.forEach(p => {
+          html += '<div class="forensic-partition">';
+          html += '<strong>' + eh(t('tools.partition')) + ' ' + eh(p.number) + '</strong>';
+          html += ' [' + eh(p.type_hex) + '] ' + eh(p.type_name);
+          if (p.bootable) html += ' 🚀 Boot';
           html += '</div>';
-        }
+        });
+        html += '</div></details>';
       }
       
       // GPT Analysis Section
@@ -2788,8 +2936,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<details class="forensic-section forensic-disclosure">';
         html += '<summary>📦 ' + (t('tools.forensicGptAnalysis') || 'GPT-Analyse') + '</summary>';
         html += '<div class="forensic-grid">';
-        html += '<div class="forensic-item"><span class="forensic-label">GPT-Signatur:</span> <span class="forensic-value">' + eh(result.gpt_analysis.gpt_signature) + '</span></div>';
-        html += '<div class="forensic-item"><span class="forensic-label">Gültig:</span> <span class="forensic-value">' + (result.gpt_analysis.valid_gpt ? '✓ Ja' : '✗ Nein') + '</span></div>';
+        html += '<div class="forensic-item"><span class="forensic-label">' + eh(t('forensic.signature')) + ':</span> <span class="forensic-value">' + eh(result.gpt_analysis.gpt_signature) + '</span></div>';
+        html += '<div class="forensic-item"><span class="forensic-label">' + eh(t('forensic.valid')) + ':</span> <span class="forensic-value">' + formatBool(result.gpt_analysis.valid_gpt) + '</span></div>';
         if (result.gpt_analysis.gpt_revision) {
           html += '<div class="forensic-item"><span class="forensic-label">Revision:</span> <span class="forensic-value">' + eh(result.gpt_analysis.gpt_revision) + '</span></div>';
         }
@@ -2802,10 +2950,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += '<h5>📁 ' + t('tools.forensicFsDetails') + '</h5>';
         html += '<div class="forensic-grid">';
         if (result.filesystem_details.total_file_count) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + t('forensic.files') + ':</span> <span class="forensic-value">' + eh(result.filesystem_details.total_file_count) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + t('forensic.files') + ':</span> <span class="forensic-value">' + eh(formatCountBreakdown(result.filesystem_details.total_file_count, result.filesystem_details.user_file_count)) + '</span></div>';
         }
         if (result.filesystem_details.directory_count) {
-          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.directories') + ':</span> <span class="forensic-value">' + eh(result.filesystem_details.directory_count) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.directories') + ':</span> <span class="forensic-value">' + eh(formatCountBreakdown(result.filesystem_details.directory_count, result.filesystem_details.user_directory_count)) + '</span></div>';
         }
         if (result.filesystem_details.hidden_files_count) {
           html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.hiddenFiles') + ':</span> <span class="forensic-value">' + eh(result.filesystem_details.hidden_files_count) + '</span></div>';
@@ -2817,7 +2965,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.capacity') + ':</span> <span class="forensic-value">' + eh(result.filesystem_details.capacity_percent) + '</span></div>';
         }
         if (result.filesystem_details.inode_usage_percent) {
-          html += '<div class="forensic-item"><span class="forensic-label">Inode-Nutzung:</span> <span class="forensic-value">' + eh(result.filesystem_details.inode_usage_percent) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + t('tools.forensicInodeUsage') + ':</span> <span class="forensic-value">' + eh(result.filesystem_details.inode_usage_percent) + '</span></div>';
         }
         html += '</div>';
         
@@ -3358,7 +3506,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         html += `<strong>📂 ${partId}</strong>`;
         if (volName !== '-') html += ` - <span style="color: #1976d2;">${volName}</span>`;
         html += `<div class="grid" style="margin-top: 8px;">`;
-        html += `<div class="item"><span class="label">${t('tools.filesystem')}:</span> <span class="value">${fs}</span></div>`;
+        html += `<div class="item"><span class="label">${t('tools.forensicFileSystem')}:</span> <span class="value">${fs}</span></div>`;
         html += `<div class="item"><span class="label">${t('tools.size')}:</span> <span class="value">${size}</span></div>`;
         
         if (apfsContainer) {
@@ -3501,11 +3649,29 @@ document.addEventListener('DOMContentLoaded', async () => {
       const hasMbr = result.boot_info.has_mbr_signature || result.boot_info.has_mbr;
       const hasGpt = result.boot_info.has_gpt;
       const gptGuid = result.boot_info.gpt_disk_guid;
+      const protectiveMbr = /type=0x?ee/i.test(result.boot_info.mbr_partitions || '');
+      // Gleiche Herleitung wie in der Anzeige: bei GPT zaehlt nur die GPT-Tabelle.
+      const espPresent = hasGpt
+        ? !!result.boot_info.has_efi
+        : (result.mbr_analysis?.partition_entries?.some(
+            (p) => String(p.type_hex || '').toUpperCase().replace(/^0X/, '') === 'EF'
+          ) || !!result.boot_info.has_efi);
+      let scheme = '—';
+      if (hasGpt) {
+        scheme = protectiveMbr ? `GPT (${t('tools.forensicProtectiveMbr') || 'mit Schutz-MBR'})` : 'GPT';
+      } else if (hasMbr) {
+        scheme = 'MBR';
+      }
       html += `<div class="section"><h2>🚀 ${t('forensic.bootStructures')}</h2><div class="grid">`;
+      html += `<div class="item"><span class="label">${t('tools.forensicPartScheme') || 'Partitionsschema'}:</span> <span class="value">${escapeHtml(scheme)}</span></div>`;
       html += `<div class="item"><span class="label">${t('forensic.mbrSignature')}:</span> <span class="value">${hasMbr ? '✓ (55AA)' : '✗'}</span></div>`;
-      html += `<div class="item"><span class="label">${t('forensic.gpt')}:</span> <span class="value">${hasGpt ? '✓ (EFI PART)' : '✗'}</span></div>`;
+      html += `<div class="item"><span class="label">${t('tools.forensicEsp') || 'EFI-System-Partition'}:</span> <span class="value">${espPresent ? '✓' : '✗'}</span></div>`;
+      const gptLines = formatGptPartitions(result.boot_info.gpt_partitions);
+      if (gptLines.length) {
+        html += `<div class="item full-width"><span class="label">${t('tools.forensicGptParts') || 'GPT-Partitionen'}:</span> <span class="value">${escapeHtml(gptLines.join(' · '))}</span></div>`;
+      }
       if (gptGuid) {
-        html += `<div class="item full-width"><span class="label">${t('forensic.gptDiskGuid')}:</span> <span class="value mono">${gptGuid}</span></div>`;
+        html += `<div class="item full-width"><span class="label">${t('forensic.gptDiskGuid')}:</span> <span class="value mono">${escapeHtml(gptGuid)}</span></div>`;
       }
       if (result.boot_info.is_iso9660) {
         html += `<div class="item"><span class="label">ISO 9660:</span> <span class="value">✓</span></div>`;
