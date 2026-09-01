@@ -2190,19 +2190,78 @@ fn ensure_writable_target(disk_id: &str) -> Result<(), String> {
 /// Platte an: aus `disk4` wird beispielsweise Container `disk5` mit Volume
 /// `disk5s1`. Die Volume-Kennung laesst sich daher nicht aus der Zielkennung
 /// ableiten, sondern nur ueber den Rueckverweis der Partition.
+///
+/// Die Partition wird gesucht, nicht geraten. Eine fruehere Fassung nahm fest
+/// `s1` an und scheiterte in der Praxis mit "APFS-Container konnte nicht
+/// ermittelt werden": auf physischen Datentraegern legt macOS unter GPT
+/// zusaetzlich eine EFI-Partition an, der Container liegt dann auf `s2`.
+/// Derselbe Unterschied ist weiter unten fuer NTFS und ext bereits vermerkt.
+/// Auf Disk-Images entfaellt die EFI-Partition — deshalb war der Fehler nur
+/// am echten Geraet sichtbar.
+///
+/// Wiederholt wird, weil das System frisch angelegte Geraete verzoegert
+/// registriert.
 fn find_apfs_volume(disk_id: &str) -> Result<String, String> {
-    let partition = format!("{}s1", disk_id);
-    let output = Command::new("diskutil")
-        .args(["info", "-plist", &partition])
-        .output()
-        .map_err(|e| format!("diskutil info Fehler: {}", e))?;
-    if !output.status.success() {
-        return Err("APFS-Partition nicht gefunden".to_string());
+    let partition_prefix = format!("{}s", disk_id);
+    let mut last_error = "APFS-Partition nicht gefunden".to_string();
+
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        let listing = Command::new("diskutil")
+            .args(["list", "-plist", disk_id])
+            .output()
+            .map_err(|e| format!("diskutil list Fehler: {}", e))?;
+        if !listing.status.success() {
+            last_error = format!("Datenträger {} nicht gefunden", disk_id);
+            continue;
+        }
+
+        let plist = String::from_utf8_lossy(&listing.stdout);
+        for partition in extract_plist_strings(&plist, "DeviceIdentifier") {
+            if !partition.starts_with(&partition_prefix) {
+                continue;
+            }
+            let info = match Command::new("diskutil")
+                .args(["info", "-plist", &partition])
+                .output()
+            {
+                Ok(out) if out.status.success() => out,
+                _ => continue,
+            };
+            let info = String::from_utf8_lossy(&info.stdout);
+            if let Some(container) = extract_plist_string(&info, "APFSContainerReference") {
+                return find_apfs_container_volume(&container);
+            }
+        }
+        last_error = "APFS-Container konnte nicht ermittelt werden".to_string();
     }
+
+    Err(last_error)
+}
+
+/// Ermittelt das erste Volume eines APFS-Containers.
+///
+/// Die Volume-Nummer wird ebenfalls nicht angenommen. Das Listing eines
+/// Containers enthaelt neben seinen Volumes auch den physischen Speicher
+/// (etwa `disk4s2`); gefiltert wird deshalb auf die Kennung des Containers.
+fn find_apfs_container_volume(container: &str) -> Result<String, String> {
+    let output = Command::new("diskutil")
+        .args(["list", "-plist", container])
+        .output()
+        .map_err(|e| format!("diskutil list Fehler: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("APFS-Container {} ist nicht lesbar", container));
+    }
+
     let plist = String::from_utf8_lossy(&output.stdout);
-    let container = extract_plist_string(&plist, "APFSContainerReference")
-        .ok_or("APFS-Container konnte nicht ermittelt werden")?;
-    Ok(format!("{}s1", container))
+    let volume_prefix = format!("{}s", container);
+    extract_plist_strings(&plist, "DeviceIdentifier")
+        .into_iter()
+        .find(|volume| volume.starts_with(&volume_prefix))
+        .ok_or_else(|| format!("Kein Volume im APFS-Container {}", container))
 }
 
 /// Verschluesselt ein APFS-Volume ("FileVault" aktivieren).
@@ -2303,6 +2362,33 @@ fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Sammelt *alle* Werte eines Schluessels aus einem plist.
+///
+/// Gegenstueck zu [`extract_plist_string`], das nur den ersten Treffer
+/// liefert. Wird fuer Listen gebraucht, in denen derselbe Schluessel mehrfach
+/// vorkommt — etwa `DeviceIdentifier` in der Partitionsaufstellung von
+/// `diskutil list -plist`.
+fn extract_plist_strings(plist: &str, key: &str) -> Vec<String> {
+    let key_pattern = format!("<key>{}</key>", key);
+    let mut values = Vec::new();
+    let mut found_key = false;
+    for line in plist.lines() {
+        if found_key {
+            if let (Some(start), Some(end)) = (line.find("<string>"), line.find("</string>")) {
+                let val = &line[start + 8..end];
+                if !val.is_empty() {
+                    values.push(val.to_string());
+                }
+            }
+            found_key = false;
+        }
+        if line.contains(&key_pattern) {
+            found_key = true;
+        }
+    }
+    values
 }
 
 /// V5: Bool-Werte (`<true/>`/`<false/>`) aus einem `diskutil ... -plist`-Output
@@ -6517,5 +6603,121 @@ mod tests {
             let ausgabe = run(&format!("printf '%s' {}", shell_quote(wert)));
             assert_eq!(ausgabe, wert, "Maskierung veraendert den Wert");
         }
+    }
+
+    /// Haengt das Testabbild auch dann wieder ab, wenn der Test scheitert.
+    struct Testabbild {
+        geraet: String,
+        pfad: String,
+    }
+
+    impl Drop for Testabbild {
+        fn drop(&mut self) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", &self.geraet, "-force"])
+                .output();
+            let _ = std::fs::remove_file(&self.pfad);
+        }
+    }
+
+    fn diskutil(args: &[&str]) -> Option<String> {
+        let out = Command::new("diskutil").args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Der APFS-Container liegt nicht zwingend auf `s1`.
+    ///
+    /// Auf physischen Datentraegern legt macOS unter GPT zusaetzlich eine
+    /// EFI-Partition an; der Container rutscht dadurch auf `s2`. Die frueher
+    /// fest verdrahtete Annahme `s1` brach deshalb in der Praxis mit
+    /// "APFS-Container konnte nicht ermittelt werden" ab, obwohl sie auf
+    /// Disk-Images (ohne EFI-Partition) funktionierte.
+    ///
+    /// Der Test stellt dieses Layout nach: eine erste Partition, die *kein*
+    /// APFS ist, und den Container dahinter.
+    #[test]
+    fn find_apfs_volume_findet_container_auch_ausserhalb_von_s1() {
+        let pfad = format!("/tmp/burniso-apfs-test-{}.dmg", std::process::id());
+        let _ = std::fs::remove_file(&pfad);
+
+        let erzeugt = Command::new("hdiutil")
+            .args(["create", "-size", "512m", &pfad])
+            .output();
+        match erzeugt {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                eprintln!("uebersprungen: Testabbild nicht erzeugbar");
+                return;
+            }
+        }
+
+        let angehaengt = Command::new("hdiutil")
+            .args(["attach", "-nomount", &pfad])
+            .output();
+        let geraet = match angehaengt {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .map(str::to_string),
+            _ => None,
+        };
+        let Some(geraet) = geraet else {
+            let _ = std::fs::remove_file(&pfad);
+            eprintln!("uebersprungen: Testabbild nicht anhaengbar");
+            return;
+        };
+
+        let _aufraeumen = Testabbild {
+            geraet: geraet.clone(),
+            pfad: pfad.clone(),
+        };
+        let kennung = geraet.trim_start_matches("/dev/").to_string();
+        assert!(
+            is_valid_disk_id(&kennung),
+            "unerwartete Geraetekennung: {}",
+            kennung
+        );
+
+        // Erste Partition bewusst nicht APFS, Container dahinter.
+        let partitioniert = diskutil(&[
+            "partitionDisk",
+            &geraet,
+            "GPT",
+            "MS-DOS FAT32",
+            "FIRST",
+            "100m",
+            "APFS",
+            "SECOND",
+            "R",
+        ]);
+        if partitioniert.is_none() {
+            eprintln!("uebersprungen: Testabbild nicht partitionierbar");
+            return;
+        }
+
+        // Gegenprobe: Auf `s1` gibt es keinen Container-Rueckverweis. Ohne
+        // diesen Nachweis wuerde der Test auch dann gruen, wenn das Layout
+        // die alte Annahme gar nicht verletzt.
+        let s1 = diskutil(&["info", "-plist", &format!("{}s1", kennung)]).unwrap_or_default();
+        assert!(
+            extract_plist_string(&s1, "APFSContainerReference").is_none(),
+            "Gegenprobe wirkungslos: der Container liegt bereits auf s1"
+        );
+
+        let volume = find_apfs_volume(&kennung)
+            .unwrap_or_else(|e| panic!("Container nicht gefunden: {}", e));
+
+        // Das Ergebnis muss ein echtes APFS-Volume sein, keine geratene Kennung.
+        let info = diskutil(&["info", "-plist", &volume])
+            .unwrap_or_else(|| panic!("gemeldetes Volume {} existiert nicht", volume));
+        assert_eq!(
+            extract_plist_string(&info, "FilesystemType").as_deref(),
+            Some("apfs"),
+            "gemeldetes Volume {} ist kein APFS-Volume",
+            volume
+        );
     }
 }
