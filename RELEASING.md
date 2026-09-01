@@ -10,9 +10,15 @@ Installation erhalten.
   `~/.tauri/burniso-usb-updater.key` und darf niemals ins Repository oder in
   einen GitHub-Release gelangen.
 - Das Developer-ID-Zertifikat und das Notarisierungsprofil
-  `burniso-notary` sind im Schlüsselbund vorhanden.
+  `DesktopProfileManager` sind im Schlüsselbund vorhanden. Ein früher hier
+  genanntes Profil `burniso-notary` existiert nicht mehr und wird von Apple
+  mit HTTP 401 abgewiesen.
 
 ## Release erstellen
+
+Der gesamte unten beschriebene Ablauf steckt in `./release-macos.sh`. Das
+Skript ist der empfohlene Weg; die folgenden Abschnitte erklären, was es tut
+und warum.
 
 Ersetze `1.4.3` durch die neue, bereits in `package.json`, `Cargo.toml` und
 `tauri.conf.json` eingetragene Version.
@@ -29,8 +35,11 @@ Der Build erzeugt unter `src-tauri/target/release/bundle/macos/` mindestens:
 - eine DMG für die manuelle Installation
 
 Notarisiere und staple sowohl die App als auch die DMG mit dem Keychain-Profil
-`burniso-notary`. Wird die gestapelte App anschließend neu archiviert, darf das
-Archiv **keinen** separaten obersten `.app`-Verzeichniseintrag enthalten:
+`DesktopProfileManager`. Wichtig ist die Reihenfolge: erst die App notarisieren
+und stapeln, **danach** Updater-Archiv und DMG aus der gestapelten App
+erzeugen. Nur so tragen beide Auslieferungswege das Ticket und lassen sich
+offline prüfen. Das neu erzeugte Archiv darf **keinen** separaten obersten
+`.app`-Verzeichniseintrag enthalten:
 
 ```zsh
 COPYFILE_DISABLE=1 tar --no-xattrs -C "src-tauri/target/release/bundle/macos" \
