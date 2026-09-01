@@ -5710,6 +5710,92 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Reduziert eine Partitionskennung auf ihren Datentraeger: "disk11s2" -> "disk11".
+///
+/// Ein simples `find('s')` waere falsch, denn das erste 's' steckt bereits in
+/// "disk". Massgeblich ist die Ziffernfolge direkt nach dem Praefix.
+fn whole_disk_of(node: &str) -> String {
+    match node.strip_prefix("disk") {
+        Some(rest) => {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                node.to_string()
+            } else {
+                format!("disk{}", digits)
+            }
+        }
+        None => node.to_string(),
+    }
+}
+
+/// Alle Einhaengepunkte, die tatsaechlich zu diesem Datentraeger gehoeren.
+///
+/// Ein Blick nach `/Volumes/*` waere falsch, denn dort haengen auch fremde
+/// Datentraeger. Umgekehrt genuegt auch der Geraetename nicht: Ein APFS-Volume
+/// wird unter einer *synthetisierten* Disk eingehaengt, ein Stick als disk11
+/// meldet sein Volume also als disk12s1. Die Bruecke zurueck zum echten Geraet
+/// steht im plist-Feld APFSPhysicalStore (hier: disk11s2).
+fn mount_points_for_disk(disk_id: &str) -> Vec<String> {
+    let Ok(output) = Command::new("mount").output() else {
+        return Vec::new();
+    };
+    let mounts = String::from_utf8_lossy(&output.stdout);
+    let mut points = Vec::new();
+
+    for line in mounts.lines() {
+        // "/dev/disk12s1 on /Volumes/USB_STICK 1 (apfs, local, ...)"
+        let Some((device, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some(node) = device.strip_prefix("/dev/") else {
+            continue;
+        };
+        // Der Name darf Leerzeichen enthalten, die Optionen stehen am Zeilenende.
+        let Some(cut) = rest.rfind(" (") else {
+            continue;
+        };
+        let mount_point = &rest[..cut];
+
+        // Haengt das Volume direkt am gesuchten Datentraeger, ist nichts weiter
+        // zu klaeren -- das erspart je Einhaengepunkt einen diskutil-Aufruf.
+        let belongs = if whole_disk_of(node) == disk_id {
+            true
+        } else {
+            let Ok(info) = Command::new("diskutil")
+                .args(["info", "-plist", node])
+                .output()
+            else {
+                continue;
+            };
+            let plist = String::from_utf8_lossy(&info.stdout);
+            // Ein Fusion-Container kann auf mehreren Geraeten liegen.
+            extract_plist_strings(&plist, "APFSPhysicalStore")
+                .iter()
+                .any(|store| whole_disk_of(store) == disk_id)
+        };
+
+        if belongs {
+            points.push(mount_point.to_string());
+        }
+    }
+
+    points
+}
+
+/// Sucht einen Ordner ohne Ruecksicht auf Gross-/Kleinschreibung.
+///
+/// FAT und NTFS unterscheiden sie nicht, ein case-sensitiv formatiertes APFS
+/// dagegen schon. Ein Vergleich auf genau "Recovery" wuerde "RECOVERY"
+/// uebersehen.
+fn contains_dir_named(mount_point: &str, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(mount_point) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|entry| {
+        entry.file_name().to_string_lossy().eq_ignore_ascii_case(name) && entry.path().is_dir()
+    })
+}
+
 /// Detect special structures (hidden partitions, recovery, etc.)
 fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json::Value> {
     let mut special = serde_json::Map::new();
@@ -5728,12 +5814,14 @@ fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json
         }
     }
     
-    // Check for Windows recovery
-    let check_windows_re = "ls -la /Volumes/*/Recovery 2>/dev/null | head -1".to_string();
-    if let Ok(output) = Command::new("sh").args(["-c", &check_windows_re]).output() {
-        if !output.stdout.is_empty() {
-            special.insert("has_windows_recovery".to_string(), serde_json::json!(true));
-        }
+    // Ein Recovery-Ordner zaehlt nur, wenn er auf *diesem* Datentraeger liegt.
+    // Die Pruefung lief zuvor ueber "ls /Volumes/*/Recovery" und meldete damit
+    // auch Funde auf fremden, gleichzeitig eingehaengten Datentraegern.
+    let has_recovery = mount_points_for_disk(disk_id)
+        .iter()
+        .any(|mp| contains_dir_named(mp, "Recovery"));
+    if has_recovery {
+        special.insert("has_windows_recovery".to_string(), serde_json::json!(true));
     }
     
     if special.is_empty() {
@@ -6809,5 +6897,90 @@ mod tests {
             "gemeldetes Volume {} ist kein APFS-Volume",
             volume
         );
+    }
+
+    /// Das erste 's' steckt bereits in "disk".
+    ///
+    /// Eine Zerlegung am ersten 's' haette aus "disk11s2" das unsinnige "disk"
+    /// gemacht und damit jede Zuordnung zum Datentraeger zerstoert.
+    #[test]
+    fn whole_disk_of_trennt_erst_nach_der_geraetenummer() {
+        assert_eq!(whole_disk_of("disk11s2"), "disk11");
+        assert_eq!(whole_disk_of("disk3s1s1"), "disk3");
+        // Ein ganzer Datentraeger bleibt unveraendert.
+        assert_eq!(whole_disk_of("disk10"), "disk10");
+        // Unerwartete Eingaben duerfen nicht zu einem falschen Treffer fuehren.
+        assert_eq!(whole_disk_of("nvme0n1"), "nvme0n1");
+        assert_eq!(whole_disk_of("disk"), "disk");
+    }
+
+    /// Ein Einhaengepunkt darf nur dem Datentraeger zugeordnet werden, auf dem
+    /// er wirklich liegt.
+    ///
+    /// Die Windows-Recovery-Erkennung suchte frueher ueber `/Volumes/*/Recovery`
+    /// und meldete deshalb auch Funde auf fremden, gleichzeitig eingehaengten
+    /// Datentraegern. Der Test nutzt das Startvolume, weil es auf jedem Mac den
+    /// kniffligen Fall abbildet: "/" liegt auf einer synthetisierten APFS-Disk,
+    /// der Ruecweg zum Geraet fuehrt nur ueber APFSPhysicalStore.
+    #[test]
+    fn mount_points_for_disk_ordnet_nur_eigene_volumes_zu() {
+        let root = diskutil(&["info", "-plist", "/"]).expect("diskutil kennt / nicht");
+        let store = extract_plist_string(&root, "APFSPhysicalStore")
+            .expect("Startvolume ohne APFSPhysicalStore -- Test traegt nicht");
+        let eigner = whole_disk_of(&store);
+
+        assert!(
+            mount_points_for_disk(&eigner).iter().any(|mp| mp == "/"),
+            "Startvolume wurde seinem Datentraeger {} nicht zugeordnet",
+            eigner
+        );
+
+        // Gegenprobe: ein anderes *physisches* Geraet darf "/" nicht fuer sich
+        // reklamieren. Genau das war der behobene Fehler.
+        // Die synthetisierte APFS-Disk (hier disk3) traegt "/" dagegen zu Recht,
+        // sie scheidet als Kandidat deshalb aus.
+        let fremder = run("diskutil list physical")
+            .lines()
+            .filter_map(|l| l.strip_prefix("/dev/"))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|d| d.to_string())
+            .find(|d| *d != eigner);
+
+        if let Some(fremder) = fremder {
+            assert!(
+                !mount_points_for_disk(&fremder).iter().any(|mp| mp == "/"),
+                "Datentraeger {} reklamiert faelschlich das Startvolume",
+                fremder
+            );
+        }
+
+        // Eine unbekannte Kennung darf ueberhaupt nichts liefern. Diese Probe
+        // laeuft unabhaengig davon, welche Geraete gerade angeschlossen sind.
+        assert!(
+            mount_points_for_disk("disk999").is_empty(),
+            "unbekannte Kennung liefert Einhaengepunkte"
+        );
+    }
+
+    /// Ein Recovery-Ordner heisst auf FAT haeufig "RECOVERY".
+    ///
+    /// Ein Vergleich auf genau "Recovery" wuerde ihn uebersehen, ein zu lascher
+    /// Vergleich dagegen auch gleichnamige *Dateien* melden.
+    #[test]
+    fn contains_dir_named_achtet_auf_schreibweise_und_typ() {
+        assert!(contains_dir_named("/", "Applications"));
+        assert!(contains_dir_named("/", "APPLICATIONS"));
+        assert!(contains_dir_named("/", "applications"));
+
+        // "/.file" ist eine Datei, kein Ordner -- und damit kein Treffer.
+        assert!(
+            std::path::Path::new("/.file").is_file(),
+            "Gegenprobe traegt nicht: /.file ist keine Datei mehr"
+        );
+        assert!(!contains_dir_named("/", ".file"));
+
+        assert!(!contains_dir_named("/", "GibtEsHierNicht"));
+        // Ein unlesbarer Pfad darf nicht in Panik enden.
+        assert!(!contains_dir_named("/Volumes/NichtVorhanden", "Recovery"));
     }
 }
