@@ -83,7 +83,7 @@
 - Für XZ-komprimierte Images: `xz` (bei Bedarf: `brew install xz`)
 
 ### Download
-1. Lade die neueste Version von der [Releases-Seite](https://github.com/nojan01/burniso-tauri/releases) herunter
+1. Lade die neueste Version von der [Releases-Seite](https://github.com/nojan01/burnISOtoUSB-tauri/releases) herunter
 2. Entpacke die ZIP-Datei
 3. Ziehe **BurnISO to USB.app** in den Programme-Ordner
 4. Beim ersten Start: Rechtsklick → Öffnen (wegen Gatekeeper)
@@ -91,8 +91,8 @@
 ### Aus Quellcode bauen
 ```bash
 # Repository klonen
-git clone https://github.com/nojan01/burniso-tauri.git
-cd burniso-tauri
+git clone https://github.com/nojan01/burnISOtoUSB-tauri.git
+cd burnISOtoUSB-tauri
 
 # Abhängigkeiten installieren (Rust und Node.js erforderlich)
 cargo tauri build
@@ -241,7 +241,7 @@ cargo tauri build
 
 ### Projekt-Struktur
 ```
-burniso-tauri/
+burnISOtoUSB-tauri/
 ├── src/                    # Frontend (HTML, CSS, JS)
 │   ├── index.html
 │   ├── styles.css

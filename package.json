@@ -1,17 +1,17 @@
 {
   "name": "burniso-to-usb",
   "private": true,
-  "version": "1.4.8",
+  "version": "1.4.9",
   "description": "ISO to USB writer, USB backup, disk diagnostics and forensic analysis tool for macOS",
   "license": "MIT",
   "author": "Norbert Jander",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nojan01/burniso-tauri.git"
+    "url": "git+https://github.com/nojan01/burnISOtoUSB-tauri.git"
   },
-  "homepage": "https://github.com/nojan01/burniso-tauri#readme",
+  "homepage": "https://github.com/nojan01/burnISOtoUSB-tauri#readme",
   "bugs": {
-    "url": "https://github.com/nojan01/burniso-tauri/issues"
+    "url": "https://github.com/nojan01/burnISOtoUSB-tauri/issues"
   },
   "type": "module",
   "scripts": {

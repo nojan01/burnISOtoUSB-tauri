@@ -6478,13 +6478,13 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
         "Free and open source software, licensed under the MIT License.\n\
          Provided \"as is\", without warranty of any kind.\n\n\
          Source code and full license text:\n\
-         https://github.com/nojan01/burniso-tauri\n\n\
+         https://github.com/nojan01/burnISOtoUSB-tauri\n\n\
          Third-party components are listed in THIRD_PARTY_NOTICES.md."
     } else {
         "Freie Open-Source-Software unter der MIT-Lizenz.\n\
          Bereitstellung ohne jede Gewährleistung.\n\n\
          Quellcode und vollständiger Lizenztext:\n\
-         https://github.com/nojan01/burniso-tauri\n\n\
+         https://github.com/nojan01/burnISOtoUSB-tauri\n\n\
          Komponenten Dritter sind in THIRD_PARTY_NOTICES.md aufgeführt."
     };
     
@@ -6514,7 +6514,7 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
         copyright: Some("© 2026 Norbert Jander".to_string()),
         comments: Some(about_comments.to_string()),
         license: Some("MIT".to_string()),
-        website: Some("https://github.com/nojan01/burniso-tauri".to_string()),
+        website: Some("https://github.com/nojan01/burnISOtoUSB-tauri".to_string()),
         credits: Some(about_credits.to_string()),
         ..Default::default()
     };
@@ -6717,7 +6717,7 @@ pub fn run() {
                         }
                         "github" => {
                             let _ = Command::new("open")
-                                .arg("https://github.com/nojan01/burniso-tauri")
+                                .arg("https://github.com/nojan01/burnISOtoUSB-tauri")
                                 .spawn();
                         }
                         _ => {}

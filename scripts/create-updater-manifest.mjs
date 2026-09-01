@@ -31,7 +31,7 @@ const manifest = {
   platforms: {
     [platform]: {
       signature,
-      url: `https://github.com/nojan01/burniso-tauri/releases/download/v${version}/${encodeURIComponent(assetName)}`
+      url: `https://github.com/nojan01/burnISOtoUSB-tauri/releases/download/v${version}/${encodeURIComponent(assetName)}`
     }
   }
 };

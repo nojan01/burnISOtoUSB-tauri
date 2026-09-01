@@ -1,11 +1,11 @@
 [package]
 name = "burniso-usb"
-version = "1.4.8"
+version = "1.4.9"
 description = "Burn ISO to USB und USB Backup Tool für macOS"
 authors = ["Norbert Jander"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/nojan01/burniso-tauri"
+repository = "https://github.com/nojan01/burnISOtoUSB-tauri"
 readme = "../README.md"
 publish = false
 
