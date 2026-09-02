@@ -23,7 +23,12 @@ if (!signature) {
   process.exit(1);
 }
 
-const assetName = basename(artifactPath);
+// GitHub benennt hochgeladene Release-Dateien um: Alles ausserhalb von
+// [A-Za-z0-9._-] wird zu einem Punkt. Aus "BurnISO to USB.app.tar.gz" wird
+// also "BurnISO.to.USB.app.tar.gz". Wer hier stattdessen den Originalnamen
+// prozentkodiert, erzeugt eine Adresse mit %20, die es auf GitHub nie gibt -
+// der Updater bekommt dann stillschweigend 404 und bietet nie ein Update an.
+const assetName = basename(artifactPath).replace(/[^A-Za-z0-9._-]/g, '.');
 const manifest = {
   version,
   notes: `BurnISO to USB ${version}`,
