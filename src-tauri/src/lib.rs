@@ -166,31 +166,26 @@ fn kill_process_group(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// W4: Externes Kommando mit Watchdog-Timeout ausfuehren. Fuer kurze Hilfskommandos
-/// (z. B. `diskutil mountDisk/unmountDisk` im Verify-Pfad), die theoretisch haengen
-/// koennen. Bei Ablauf des Timeouts wird der Prozess gekillt und ein TimedOut-Fehler
-/// zurueckgegeben.
-fn run_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> std::io::Result<std::process::Output> {
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(_status) = child.try_wait()? {
-            return child.wait_with_output();
-        }
-        if start.elapsed().as_secs() >= timeout_secs {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("{} timed out after {}s", cmd, timeout_secs),
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+/// Bestimmt, warum die Verifizierung nicht durchgelaufen ist.
+///
+/// Die eigentliche Ursache steht ausschliesslich im stderr des Pruefskripts.
+/// sudo mischt dort seine Kennwortabfrage hinein - mangels Zeilenumbruch oft
+/// direkt vor der Fehlermeldung -, deshalb wird "Password:" abgeschnitten
+/// statt die ganze Zeile zu verwerfen.
+fn verify_failure_reason(stderr: &str, status_text: &str) -> String {
+    let mut grund = stderr
+        .lines()
+        .map(|zeile| zeile.trim().trim_start_matches("Password:").trim())
+        .rfind(|zeile| !zeile.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if let Some(rest) = grund.strip_prefix("ERROR: ") {
+        grund = rest.trim().to_string();
     }
+    if grund.is_empty() {
+        grund = status_text.to_string();
+    }
+    grund
 }
 
 /// Versucht alle Partitionen einer Disk auszuhängen und meldet Fehler an
@@ -6254,8 +6249,16 @@ async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: S
     let source_label = if is_xz { "Entpacke und schreibe XZ-Image auf USB..." } else { "Schreibe Image auf USB..." };
     emit_progress(&app, 0, source_label, "burn");
     
+    // Brennen und Pruefen laufen bewusst in EINEM Prozess mit EINER offenen
+    // Geraetekennung. macOS haengt einen Datentraeger erst dann ein, wenn der
+    // schreibende Prozess das Rohgeraet schliesst - und schreibt dabei
+    // Metadaten (FSInfo, Belegungstabellen, .fseventsd, .Spotlight-V100) auf
+    // jede FAT-Partition. Ein danach gestarteter zweiter Pruefprozess verglich
+    // also gegen einen bereits veraenderten Datentraeger und meldete
+    // Abweichungen, die der Brenner nie verursacht hat. Solange die Kennung
+    // offen bleibt, kommt niemand dazwischen.
     let python_script = format!(
-        r#"import os, sys, subprocess
+        r#"import os, sys, subprocess, time
 iso_path = {}
 xz_path = {}
 disk_path = "{}"
@@ -6263,65 +6266,142 @@ buffer_size = 8 * 1024 * 1024
 progress_interval = 32 * 1024 * 1024
 total_size = {}
 is_xz = {}
+do_verify = {}
 copied = 0
 next_progress = progress_interval
 xz_process = None
-try:
+
+def quelle_oeffnen():
+    # Liefert (Datenstrom, Prozess). Bei XZ entpackt ein eigener Prozess in eine Roehre.
     if is_xz:
         # Two decoder threads keep decompression ahead of USB write speed
         # without competing with the writer for all CPU cores and memory.
-        xz_process = subprocess.Popen(
+        prozess = subprocess.Popen(
             [xz_path, '--threads=2', '--decompress', '--stdout', '--', iso_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if xz_process.stdout is None:
+        if prozess.stdout is None:
             raise OSError('could not open XZ output stream')
-        src = xz_process.stdout
-    else:
-        src = open(iso_path, 'rb')
-    with src:
-        fd = os.open(disk_path, os.O_WRONLY)
-        with os.fdopen(fd, 'wb', buffering=0) as dst:
-            while True:
-                chunk = src.read(buffer_size)
-                if not chunk: break
-                view = memoryview(chunk)
-                while view:
-                    count = dst.write(view)
-                    if count is None or count <= 0:
-                        raise OSError("short write to destination device")
-                    view = view[count:]
-                copied += len(chunk)
-                if copied >= next_progress or copied == total_size:
-                    print(f"BYTES:{{copied}}", flush=True)
-                    next_progress = copied + progress_interval
-            dst.flush()
-            os.fsync(dst.fileno())
-    if xz_process is not None:
-        xz_error = xz_process.stderr.read().decode('utf-8', errors='replace').strip()
-        if xz_process.wait() != 0:
-            raise OSError(xz_error or 'XZ-Dekomprimierung fehlgeschlagen')
+        return prozess.stdout, prozess
+    return open(iso_path, 'rb'), None
+
+def quelle_schliessen(strom, prozess):
+    strom.close()
+    if prozess is not None:
+        meldung = prozess.stderr.read().decode('utf-8', errors='replace').strip()
+        if prozess.wait() != 0:
+            raise OSError(meldung or 'XZ-Dekomprimierung fehlgeschlagen')
+
+def geraet_oeffnen():
+    # Virenscanner und Indexdienste greifen einen frisch erkannten Datentraeger
+    # sofort. Ein paar Anlaeufe kosten nichts und ersparen einen Fehlschlag.
+    letzter = None
+    for _ in range(8):
+        try:
+            return os.open(disk_path, os.O_RDWR)
+        except OSError as exc:
+            letzter = exc
+            time.sleep(1)
+    raise OSError("Rohgeraet %s liess sich nicht oeffnen: errno=%s %s"
+                  % (disk_path, getattr(letzter, 'errno', '?'), letzter))
+
+def lies_genau(leser, anzahl):
+    # Das Rohgeraet wird ungepuffert gelesen: dort fuehrt ein Lesevorgang genau
+    # einen Systemaufruf aus und darf weniger als die angeforderte Menge liefern.
+    # Ohne Nachfassen verschoebe sich der Lesezeiger gegenueber dem Abbild - und
+    # ab da meldete jeder weitere Block eine Abweichung, die es gar nicht gibt.
+    teile = []
+    rest = anzahl
+    while rest > 0:
+        stueck = leser(rest)
+        if not stueck:
+            break
+        teile.append(stueck)
+        rest -= len(stueck)
+    return b"".join(teile)
+
+fd = None
+try:
+    fd = geraet_oeffnen()
+    src, xz_process = quelle_oeffnen()
+    while True:
+        chunk = src.read(buffer_size)
+        if not chunk: break
+        view = memoryview(chunk)
+        while view:
+            count = os.write(fd, view)
+            if count is None or count <= 0:
+                raise OSError("short write to destination device")
+            view = view[count:]
+        copied += len(chunk)
+        if copied >= next_progress or copied == total_size:
+            print(f"BYTES:{{copied}}", flush=True)
+            next_progress = copied + progress_interval
+    os.fsync(fd)
+    quelle_schliessen(src, xz_process)
+    xz_process = None
+    print("WRITE_SUCCESS", flush=True)
+
+    if do_verify:
+        # Zurueck auf Byte 0 - ohne die Kennung zwischendurch zu schliessen.
+        os.lseek(fd, 0, os.SEEK_SET)
+        src, xz_process = quelle_oeffnen()
+        geprueft = 0
+        fehler = 0
+        next_progress = progress_interval
+        while geprueft < total_size:
+            soll = lies_genau(src.read, min(buffer_size, total_size - geprueft))
+            if not soll: break
+            ist = lies_genau(lambda anzahl: os.read(fd, anzahl), len(soll))
+            if soll != ist:
+                fehler += 1
+            geprueft += len(soll)
+            if geprueft >= next_progress or geprueft == total_size:
+                print(f"VERIFY:{{geprueft}}:{{fehler}}", flush=True)
+                next_progress = geprueft + progress_interval
+        quelle_schliessen(src, xz_process)
+        xz_process = None
+        if fehler == 0:
+            print("VERIFY_SUCCESS", flush=True)
+        else:
+            print(f"VERIFY_FAILED:{{fehler}}", flush=True)
 except OSError as exc:
     print(f"ERROR: {{exc}}", file=sys.stderr)
     sys.exit(1)
 finally:
     if xz_process is not None and xz_process.poll() is None:
         xz_process.kill()
-print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
+    if fd is not None:
+        os.close(fd)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size,
+        if is_xz { "True" } else { "False" }, if verify { "True" } else { "False" });
 
     let mut child = Command::new("sudo").args(["-S", &python3_path, "-c", &python_script])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("Fehler beim Starten: {}", e))?;
-    
+
     if let Some(ref mut stdin) = child.stdin {
         writeln!(stdin, "{}", password).ok();
     }
-    
+
+    // stderr muss nebenlaeufig geleert werden. Bliebe die Roehre ungelesen,
+    // liefe ihr Puffer voll und das Skript haenge beim naechsten Schreiben fest
+    // - und der einzige Hinweis auf die wahre Ursache ginge verloren.
+    let stderr_job = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = err.read_to_string(&mut text);
+            text
+        })
+    });
+
     let stdout = child.stdout.take().ok_or("Kein stdout")?;
     let reader = BufReader::new(stdout);
     let mut write_success = false;
-    
+    let mut verify_success = false;
+    let mut verify_errors: u32 = 0;
+    let mut verify_done_bytes: u64 = 0;
+
     for line in reader.lines().map_while(Result::ok) {
         if CANCEL_BURN.load(Ordering::SeqCst) {
             let _ = child.kill();
@@ -6334,143 +6414,73 @@ print("WRITE_SUCCESS", flush=True)"#, iso_path_literal, xz_path_literal, rdisk_p
             }
         } else if line.contains("WRITE_SUCCESS") {
             write_success = true;
+            if verify {
+                let _ = app.emit("burn_phase", "verifying");
+                emit_progress(&app, 0, "VERIFIZIEREN: 0%", "burn");
+            }
+        } else if let Some(stripped) = line.strip_prefix("VERIFY:") {
+            let mut teile = stripped.split(':');
+            if let (Some(bytes_str), Some(err_str)) = (teile.next(), teile.next()) {
+                if let (Ok(bytes), Ok(errs)) = (bytes_str.parse::<u64>(), err_str.parse::<u32>()) {
+                    verify_done_bytes = bytes;
+                    let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
+                    let status_msg = if errs > 0 {
+                        format!("VERIFIZIEREN: {}% ({} Fehler)", percent.min(100), errs)
+                    } else {
+                        format!("VERIFIZIEREN: {}%", percent.min(100))
+                    };
+                    emit_progress(&app, percent.min(100), &status_msg, "burn");
+                }
+            }
+        } else if line.contains("VERIFY_SUCCESS") {
+            verify_success = true;
+        } else if let Some(stripped) = line.strip_prefix("VERIFY_FAILED:") {
+            verify_errors = stripped.parse().unwrap_or(1);
         }
     }
-    
+
     let status = child.wait().map_err(|e| format!("Prozess Fehler: {}", e))?;
-    
+    let fehlertext = stderr_job.and_then(|job| job.join().ok()).unwrap_or_default();
+
     if !status.success() || !write_success {
         let _ = app.emit("burn_phase", "error");
-        let mut error_msg = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut error_msg);
-        }
-        return if error_msg.trim().is_empty() {
+        return if fehlertext.trim().is_empty() {
             Err("Brennvorgang fehlgeschlagen".to_string())
         } else {
-            Err(format!("Brennvorgang fehlgeschlagen: {}", error_msg.trim()))
+            Err(format!("Brennvorgang fehlgeschlagen: {}", fehlertext.trim()))
         };
     }
-    
-    if verify {
-        let _ = app.emit("burn_phase", "verifying");
-        emit_progress(&app, 0, "Synchronisiere Daten...", "burn");
-        
-        // Wichtig: Cache leeren und Disk neu einbinden für zuverlässige Verifizierung
-        let _ = Command::new("sync").output();
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        
-        // Disk kurz einhängen und wieder aushängen, um gepufferte Daten zu schreiben
-        // (W4: Timeout 30s, damit ein hängender diskutil-Daemon den Verify nicht blockiert)
-        let _ = run_with_timeout("diskutil", &["mountDisk", &disk_path], 30);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = run_with_timeout("diskutil", &["unmountDisk", &disk_path], 30);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        
-        emit_progress(&app, 0, "VERIFIZIEREN: 0%", "burn");
-        
-        let verify_script = format!(
-            r#"import os, sys, subprocess
-iso_path = {}
-xz_path = {}
-disk_path = "{}"
-buffer_size = 8 * 1024 * 1024
-progress_interval = 32 * 1024 * 1024
-total_size = {}
-is_xz = {}
-verified = 0
-errors = 0
-next_progress = progress_interval
-xz_process = None
-try:
-    if is_xz:
-        xz_process = subprocess.Popen(
-            [xz_path, '--threads=2', '--decompress', '--stdout', '--', iso_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if xz_process.stdout is None:
-            raise OSError('could not open XZ output stream')
-        iso_file = xz_process.stdout
-    else:
-        iso_file = open(iso_path, 'rb')
-    with iso_file:
-        fd = os.open(disk_path, os.O_RDONLY)
-        with os.fdopen(fd, 'rb', buffering=0) as disk_file:
-            while verified < total_size:
-                iso_chunk = iso_file.read(buffer_size)
-                if not iso_chunk: break
-                disk_chunk = disk_file.read(len(iso_chunk))
-                if iso_chunk != disk_chunk:
-                    errors += 1
-                    print(f"MISMATCH:{{verified}}", flush=True)
-                verified += len(iso_chunk)
-                if verified >= next_progress or verified == total_size:
-                    print(f"VERIFY:{{verified}}:{{errors}}", flush=True)
-                    next_progress = verified + progress_interval
-    if xz_process is not None:
-        xz_error = xz_process.stderr.read().decode('utf-8', errors='replace').strip()
-        if xz_process.wait() != 0:
-            raise OSError(xz_error or 'XZ-Dekomprimierung fehlgeschlagen')
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-finally:
-    if xz_process is not None and xz_process.poll() is None:
-        xz_process.kill()
-if errors == 0:
-    print("VERIFY_SUCCESS", flush=True)
-else:
-    print(f"VERIFY_FAILED:{{errors}}", flush=True)
-    sys.exit(1)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size, if is_xz { "True" } else { "False" });
 
-        let mut verify_child = Command::new("sudo").args(["-S", &python3_path, "-c", &verify_script])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-            .map_err(|e| format!("Verifizierung Fehler: {}", e))?;
-        
-        if let Some(ref mut stdin) = verify_child.stdin {
-            writeln!(stdin, "{}", password).ok();
-        }
-        
-        let verify_stdout = verify_child.stdout.take().ok_or("Kein stdout")?;
-        let verify_reader = BufReader::new(verify_stdout);
-        let mut verify_success = false;
-        let mut verify_errors = 0u32;
-        
-        for line in verify_reader.lines().map_while(Result::ok) {
-            if CANCEL_BURN.load(Ordering::SeqCst) {
-                let _ = verify_child.kill();
-                return Err("Verifizierung abgebrochen".to_string());
-            }
-            if let Some(stripped) = line.strip_prefix("VERIFY:") {
-                let parts: Vec<&str> = stripped.split(':').collect();
-                if let (Some(bytes_str), Some(err_str)) = (parts.first(), parts.get(1)) {
-                    if let (Ok(bytes), Ok(errs)) = (bytes_str.parse::<u64>(), err_str.parse::<u32>()) {
-                        let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
-                        let status_msg = if errs > 0 {
-                            format!("VERIFIZIEREN: {}% ({} Fehler)", percent.min(100), errs)
-                        } else {
-                            format!("VERIFIZIEREN: {}%", percent.min(100))
-                        };
-                        emit_progress(&app, percent.min(100), &status_msg, "burn");
-                    }
-                }
-            } else if line.contains("VERIFY_SUCCESS") {
-                verify_success = true;
-            } else if let Some(stripped) = line.strip_prefix("VERIFY_FAILED:") {
-                verify_errors = stripped.parse().unwrap_or(1);
-            }
-        }
-        
-        let _ = verify_child.wait();
-        
-        if !verify_success || verify_errors > 0 {
+    if verify {
+        if verify_errors > 0 {
+            // Echte Abweichungen zwischen Abbild und Datentraeger.
             let _ = app.emit("burn_phase", "error");
             emit_progress(&app, 100, &format!("FEHLER: {} Blöcke stimmen nicht überein!", verify_errors), "burn");
             if eject {
                 let _ = Command::new("diskutil").args(["eject", &disk_path]).output();
             }
             return Err(format!("Verifizierung fehlgeschlagen: {} fehlerhafte Blöcke", verify_errors));
+        }
+
+        if !verify_success {
+            // Die Pruefung ist gar nicht erst durchgelaufen. Von "0 fehlerhaften
+            // Bloecken" zu sprechen waere hier irrefuehrend: verglichen wurde nichts.
+            let _ = app.emit("burn_phase", "error");
+            let status_text = format!("Brennprozess endete mit {}", status);
+            let grund = verify_failure_reason(&fehlertext, &status_text);
+            let wie_weit = if verify_done_bytes > 0 {
+                format!(" (abgebrochen nach {} von {} MB)", verify_done_bytes / 1_048_576, image_size / 1_048_576)
+            } else {
+                String::new()
+            };
+            emit_progress(&app, 100, "FEHLER: Verifizierung konnte nicht durchgeführt werden", "burn");
+            if eject {
+                let _ = Command::new("diskutil").args(["eject", &disk_path]).output();
+            }
+            return Err(format!(
+                "Verifizierung konnte nicht durchgeführt werden{}: {}",
+                wie_weit, grund
+            ));
         }
     }
     
@@ -7220,5 +7230,52 @@ mod tests {
         // FAT32 bleibt unveraendert.
         assert_eq!(result["partitions"][0]["filesystem"], "MS-DOS FAT32");
         assert_eq!(result["partitions"][0]["filesystem_name"], "MS-DOS FAT32");
+    }
+
+    // --- Verifizierung: warum sie scheiterte ---------------------------------
+    // Hintergrund: Frueher lautete die Bedingung `!verify_success || errors > 0`
+    // und meldete daraufhin stur "{errors} Bloecke stimmen nicht ueberein".
+    // Starb das Pruefskript vor dem ersten Vergleich, stand dort die widersinnige
+    // Aussage "0 Bloecke stimmen nicht ueberein" - und die echte Ursache aus
+    // stderr wurde weggeworfen.
+
+    use super::verify_failure_reason;
+
+    #[test]
+    fn grund_nennt_die_meldung_aus_stderr() {
+        let stderr = "ERROR: [Errno 1] Operation not permitted: '/dev/rdisk10'\n";
+        assert_eq!(
+            verify_failure_reason(stderr, "Prüfskript endete mit exit status: 1"),
+            "[Errno 1] Operation not permitted: '/dev/rdisk10'"
+        );
+    }
+
+    #[test]
+    fn grund_loest_die_kennwortabfrage_von_sudo_ab() {
+        // sudo schreibt "Password:" ohne Zeilenumbruch, die Fehlermeldung des
+        // Skripts klebt deshalb unmittelbar dahinter.
+        let stderr = "Password:ERROR: /dev/rdisk10 liess sich nicht oeffnen";
+        assert_eq!(
+            verify_failure_reason(stderr, "egal"),
+            "/dev/rdisk10 liess sich nicht oeffnen"
+        );
+    }
+
+    #[test]
+    fn grund_faellt_auf_den_beendigungsstatus_zurueck() {
+        // Leeres stderr darf nicht in einer leeren Begruendung enden.
+        assert_eq!(
+            verify_failure_reason("Password:\n   \n", "Prüfskript endete mit exit status: 1"),
+            "Prüfskript endete mit exit status: 1"
+        );
+    }
+
+    #[test]
+    fn grund_nimmt_die_letzte_aussagekraeftige_zeile() {
+        let stderr = "Password:\nsudo: Hinweis\nERROR: [Errno 2] No such file\n\n";
+        assert_eq!(
+            verify_failure_reason(stderr, "egal"),
+            "[Errno 2] No such file"
+        );
     }
 }

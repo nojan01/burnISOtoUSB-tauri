@@ -39,3 +39,6 @@ secrets.json
 *.pem
 *.p12
 *.pfx
+
+# Erzeugtes Updater-Manifest, gehoert ins Release, nicht ins Archiv
+latest.json
