@@ -1,7 +1,7 @@
 {
   "name": "burniso-to-usb",
   "private": true,
-  "version": "1.4.9",
+  "version": "1.4.10",
   "description": "ISO to USB writer, USB backup, disk diagnostics and forensic analysis tool for macOS",
   "license": "MIT",
   "author": "Norbert Jander",
@@ -22,7 +22,7 @@
     "@tauri-apps/cli": "^2"
   },
   "dependencies": {
-    "@tauri-apps/plugin-dialog": "~2.6.0",
+    "@tauri-apps/plugin-dialog": "~2.7.3",
     "@tauri-apps/plugin-updater": "^2.10.1"
   }
 }

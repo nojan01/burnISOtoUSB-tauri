@@ -249,7 +249,7 @@
     "formatTitle": "Formatieren",
     "filesystem": "Dateisystem:",
     "encryption": "Verschlüsselung:",
-    "encryptionHint": "(nur APFS/HFS+)",
+    "encryptionHint": "(nur APFS)",
     "encryptionPassword": "Passwort:",
     "encryptionPasswordPlaceholder": "Verschlüsselungspasswort",
     "encryptionPasswordTooShort": "Verschlüsselungspasswort muss mindestens 4 Zeichen haben",

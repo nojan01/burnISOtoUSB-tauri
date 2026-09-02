@@ -2070,11 +2070,16 @@ function formatBool(value) {
   // Toggle encryption options based on filesystem selection
   function updateEncryptionVisibility() {
     const fs = formatFilesystem.value;
-    const supportsEncryption = fs === 'APFS' || fs === 'HFS+';
+    // Nur APFS: verschluesseltes HFS+ setzte CoreStorage voraus, das aktuelle
+    // macOS-Versionen nicht mehr anbieten (`diskutil listFilesystems`).
+    const supportsEncryption = fs === 'APFS';
     encryptionRow.style.display = supportsEncryption ? 'flex' : 'none';
     if (!supportsEncryption) {
       formatEncrypted.checked = false;
       encryptionPasswordRow.style.display = 'none';
+      // Das Zuruecksetzen per Skript loest kein change-Ereignis aus, daher wird
+      // das Passwort hier ausdruecklich verworfen statt nur ausgeblendet.
+      formatEncryptionPassword.value = '';
     }
   }
   

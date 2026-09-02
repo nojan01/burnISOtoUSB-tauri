@@ -396,31 +396,55 @@ fn extract_ntfs_size(buffer: &[u8]) -> (Option<u64>, Option<u64>) {
     (Some(total_bytes), None)
 }
 
+/// Bestimmt die ext-Version allein aus den Feature-Flags des Superblocks.
+///
+/// Hintergrund: Bei installiertem Paragon-Treiber meldet `diskutil` fuer
+/// **jedes** ext-Volume die Personality `UFSD_EXTFS4` und den Namen `extFS 4`
+/// — nachgemessen sowohl fuer ext2-Datentraeger als auch fuer ein eigens mit
+/// `newfs_ufsd_ExtFS -3` erzeugtes, journalfuehrendes ext3. Die Personality
+/// traegt also keine Versionsinformation und darf nicht ausgewertet werden.
+/// Belastbar sind ausschliesslich die Feature-Flags im Superblock.
+///
+/// Regel — deckungsgleich mit der Auswertung in `analyze_linux_filesystems`,
+/// damit beide Wege nicht auseinanderlaufen koennen:
+/// * ext4, sobald ein ext4-eigenes incompat- oder ro_compat-Merkmal gesetzt ist
+/// * sonst ext3, wenn ein Journal vorhanden ist (compat 0x04)
+/// * sonst ext2
+fn ext_version_from_flags(compat: u32, incompat: u32, ro_compat: u32) -> &'static str {
+    // extents, 64bit, mmp, flex_bg, ea_inode, encrypt, casefold
+    const EXT4_INCOMPAT: u32 = 0x40 | 0x80 | 0x100 | 0x200 | 0x8000 | 0x10000 | 0x20000;
+    // huge_file, gdt_csum, dir_nlink, extra_isize, bigalloc, metadata_csum, project
+    const EXT4_RO_COMPAT: u32 = 0x08 | 0x10 | 0x20 | 0x40 | 0x200 | 0x400 | 0x4000;
+    const COMPAT_HAS_JOURNAL: u32 = 0x04;
+
+    if incompat & EXT4_INCOMPAT != 0 || ro_compat & EXT4_RO_COMPAT != 0 {
+        "ext4"
+    } else if compat & COMPAT_HAS_JOURNAL != 0 {
+        "ext3"
+    } else {
+        "ext2"
+    }
+}
+
 fn extract_ext_info(buffer: &[u8]) -> (String, Option<String>, Option<u64>, Option<u64>) {
     let superblock_offset = 0x400; // 1024 bytes
-    
-    // Determine EXT version from feature flags
-    let fs_type = if buffer.len() > superblock_offset + 0x60 {
-        let incompat_features = u32::from_le_bytes([
-            buffer[superblock_offset + 0x60],
-            buffer[superblock_offset + 0x61],
-            buffer[superblock_offset + 0x62],
-            buffer[superblock_offset + 0x63],
-        ]);
-        // INCOMPAT_EXTENTS = 0x40 indicates EXT4
-        if incompat_features & 0x40 != 0 {
-            "EXT4"
-        } else if buffer.len() > superblock_offset + 0xE0 {
-            // Check for journal (EXT3)
-            let compat_features = u32::from_le_bytes([
-                buffer[superblock_offset + 0x5C],
-                buffer[superblock_offset + 0x5D],
-                buffer[superblock_offset + 0x5E],
-                buffer[superblock_offset + 0x5F],
-            ]);
-            if compat_features & 0x04 != 0 { "EXT3" } else { "EXT2" }
-        } else {
-            "EXT2"
+
+    // Version ueber die gemeinsame Regel bestimmen. Die frueher hier
+    // eingebaute Pruefung kannte nur INCOMPAT_EXTENTS und hat ext4-Volumes
+    // ohne Extents faelschlich als ext3 oder ext2 ausgewiesen.
+    let fs_type = if buffer.len() > superblock_offset + 0x68 {
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes([
+                buffer[superblock_offset + offset],
+                buffer[superblock_offset + offset + 1],
+                buffer[superblock_offset + offset + 2],
+                buffer[superblock_offset + offset + 3],
+            ])
+        };
+        match ext_version_from_flags(read_u32(0x5C), read_u32(0x60), read_u32(0x64)) {
+            "ext4" => "EXT4",
+            "ext3" => "EXT3",
+            _ => "EXT2",
         }
     } else {
         "EXT"
@@ -2737,9 +2761,9 @@ async fn format_disk(
         ("FAT32", _) => "MS-DOS FAT32",
         ("ExFAT", _) => "ExFAT",
         ("NTFS", _) => "UFSD_NTFS", // Paragon NTFS driver
-        ("ext2", _) => "UFSD_EXTFS", // Paragon extFS driver
-        ("ext3", _) => "UFSD_EXTFS", // Paragon extFS driver
-        ("ext4", _) => "UFSD_EXTFS", // Paragon extFS driver
+        ("ext2", _) => "UFSD_EXTFS",  // Paragon extFS -- erzeugt ext2 (ohne Journal)
+        ("ext3", _) => "UFSD_EXTFS3", // Paragon extFS -- erzeugt ext3 (mit Journal)
+        ("ext4", _) => "UFSD_EXTFS4", // Paragon extFS -- erzeugt ext4
         ("APFS", false) => "APFS",
         // Seit dem Wegfall von CoreStorage kennt diskutil keine verschluesselten
         // Personalitaeten mehr (siehe `diskutil listFilesystems`). Verschluesselte
@@ -2747,6 +2771,8 @@ async fn format_disk(
         // `diskutil apfs encryptVolume`.
         ("APFS", true) => "APFS",
         ("HFS+", false) => "JHFS+",
+        // Die Oberflaeche bietet Verschluesselung nur noch fuer APFS an; dieser
+        // Zweig bleibt als Absicherung fuer direkt abgesetzte Aufrufe bestehen.
         ("HFS+", true) => {
             return Err("Verschlüsseltes HFS+ wird von macOS nicht mehr unterstützt. \
                         Bitte APFS als Dateisystem wählen.".to_string())
@@ -2805,12 +2831,18 @@ async fn format_disk(
     } else if is_ext {
         // For ext2/3/4 with Paragon extFS:
         // 1. Create a single partition disk with FAT32 first
-        // 2. Reformat the first partition as ext2/3/4 using UFSD_EXTFS
+        // 2. Reformat the first partition using the version-specific personality
         // GPT creates disk#s2 as main partition, MBR creates disk#s1
+        //
+        // Wichtig: Hier muss `fs_type` stehen. Eine feste Angabe von
+        // "UFSD_EXTFS" hat die Auswahl des Nutzers stillschweigend verworfen
+        // und immer ext2 erzeugt -- nachgemessen ueber `diskutil
+        // listFilesystems` (UFSD_EXTFS = "extFS 2") und am Superblock:
+        // UFSD_EXTFS ohne Journal, UFSD_EXTFS3 und UFSD_EXTFS4 mit Journal.
         let partition_suffix = if scheme_type == "GPT" { "s2" } else { "s1" };
         format!(
-            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && sleep 1 && echo "y" | diskutil eraseVolume UFSD_EXTFS "{}" {}{}"#,
-            volume_name, scheme_type, disk_path, volume_name, disk_path, partition_suffix
+            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && sleep 1 && echo "y" | diskutil eraseVolume {} "{}" {}{}"#,
+            volume_name, scheme_type, disk_path, fs_type, volume_name, disk_path, partition_suffix
         )
     } else if is_encrypted {
         let enc_pass = encryption_password.clone().unwrap_or_default();
@@ -3868,6 +3900,12 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if let Some(linux_info) = analyze_linux_filesystems(&disk_id, &password) {
         result["linux_filesystem_details"] = linux_info;
     }
+
+    // Muss nach analyze_linux_filesystems laufen: Erst dort liegt der aus dem
+    // Superblock gelesene, tatsaechliche ext-Typ vor. Ohne diesen Schritt
+    // zeigt die Oberflaeche Paragons Sammelangabe "UFSD_EXTFS4" auch fuer
+    // ext2- und ext3-Datentraeger.
+    correct_ext_filesystem_labels(&mut result);
     
     // 6. Get file count and directory structure (if mounted)
     if let Some(mount_point) = result.get("disk_info")
@@ -4967,7 +5005,10 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
         }
     }
     
-    // First, try to get filesystem info from diskutil (more reliable for Paragon drivers)
+    // Erste Quelle: diskutil. Liefert Dateisystemfamilie und Namen auch fuer
+    // Volumes, die macOS nicht selbst einhaengen kann. Achtung: Bei
+    // ext-Volumes traegt die Paragon-Personality keine Versionsangabe (siehe
+    // ext_version_from_flags) — die Version stammt allein aus dem Superblock.
     for part_id in &partitions {
         if part_id == disk_id {
             continue; // Skip whole disk, only check partitions
@@ -4988,17 +5029,13 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             
             // Map Paragon UFSD personalities to filesystem names
             let fs_name = if personality.starts_with("UFSD_EXTFS") {
-                // UFSD_EXTFS, UFSD_EXTFS2, UFSD_EXTFS3, UFSD_EXTFS4
-                if personality.ends_with("4") {
-                    Some("ext4")
-                } else if personality.ends_with("3") {
-                    Some("ext3")
-                } else if personality.ends_with("2") {
-                    Some("ext2")
-                } else {
-                    // Just "UFSD_EXTFS" - check superblock for version
-                    None
-                }
+                // Die Ziffer der Personality ist wertlos: Der Paragon-Treiber
+                // meldet fuer ext2, ext3 und ext4 gleichermassen
+                // "UFSD_EXTFS4" (nachgemessen an einem eigens erzeugten ext3
+                // und an zwei ext2-Sticks). Hier wird deshalb nur die Familie
+                // festgehalten; die tatsaechliche Version traegt
+                // correct_ext_filesystem_labels aus dem Superblock nach.
+                Some("ext")
             } else if personality.starts_with("UFSD_NTFS") {
                 Some("NTFS")
             } else if personality.contains("APFS") {
@@ -5197,6 +5234,121 @@ except Exception as e:
     }
     
     None
+}
+
+/// Setzt einen berichtigten ext-Namen in ein Anzeigeobjekt.
+///
+/// Ersetzt wird ausschliesslich ein Wert, der erkennbar vom Paragon-Treiber
+/// oder aus dem Partitionstyp stammt — echte Angaben anderer Dateisysteme
+/// bleiben unberuehrt. Ist die Version nicht belegt (`real` = `None`), wird die
+/// Ziffer entfernt statt eine unbewiesene zu behaupten.
+fn apply_ext_correction(obj: &mut serde_json::Map<String, serde_json::Value>, real: Option<&str>) {
+    let is_unreliable_ext = |value: &str| {
+        let lower = value.to_ascii_lowercase();
+        lower.starts_with("ufsd_extfs") || lower.starts_with("extfs") || lower.contains("ext2/3/4")
+    };
+
+    if let Some(current) = obj.get("filesystem").and_then(|v| v.as_str()).map(String::from) {
+        if is_unreliable_ext(&current) {
+            let replacement = real.unwrap_or("ext");
+            obj.insert("filesystem".to_string(), serde_json::json!(replacement));
+        }
+    }
+
+    if let Some(current) = obj.get("filesystem_name").and_then(|v| v.as_str()).map(String::from) {
+        if is_unreliable_ext(&current) {
+            let replacement = match real {
+                Some(version) => format!("extFS {}", version.trim_start_matches("ext")),
+                None => "extFS".to_string(),
+            };
+            obj.insert("filesystem_name".to_string(), serde_json::json!(replacement));
+        }
+    }
+}
+
+/// Berichtigt die angezeigten ext-Dateisystemnamen anhand des Superblocks.
+///
+/// Ohne diese Korrektur zeigt die Oberflaeche fuer jeden ext-Datentraeger
+/// "UFSD_EXTFS4" bzw. "ext4", weil `diskutil` bei installiertem
+/// Paragon-Treiber genau das meldet — unabhaengig vom tatsaechlichen
+/// Dateisystem. Nachgemessen: ein mit `newfs_ufsd_ExtFS -3` erzeugtes ext3
+/// (Journal vorhanden) und zwei ext2-Sticks (kein Journal) wurden alle drei
+/// als `UFSD_EXTFS4` / `extFS 4` ausgewiesen.
+///
+/// `analyze_linux_filesystems` liest den Superblock jeder Partition bereits
+/// und bestimmt den Typ korrekt. Dieses Ergebnis wird hier auf die
+/// Anzeigefelder uebertragen, damit es nur eine Wahrheitsquelle gibt.
+fn correct_ext_filesystem_labels(result: &mut serde_json::Value) {
+    // Partition -> tatsaechlicher Typ, ausschliesslich aus dem Superblock.
+    let mut real_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(entries) = result
+        .get("linux_filesystem_details")
+        .and_then(|details| details.get("filesystems"))
+        .and_then(|list| list.as_array())
+    {
+        for entry in entries {
+            let partition = entry.get("partition").and_then(|v| v.as_str());
+            let filesystem = entry.get("filesystem").and_then(|v| v.as_str());
+            if let (Some(partition), Some(filesystem)) = (partition, filesystem) {
+                if filesystem.starts_with("ext") {
+                    real_types.insert(partition.to_string(), filesystem.to_string());
+                }
+            }
+        }
+    }
+
+    // Einzelne Partitionen: nur der eigene Superblock zaehlt.
+    if let Some(partitions) = result.get_mut("partitions").and_then(|p| p.as_array_mut()) {
+        for partition in partitions.iter_mut() {
+            if let Some(part_obj) = partition.as_object_mut() {
+                let real = part_obj
+                    .get("partition_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| real_types.get(id))
+                    .cloned();
+                apply_ext_correction(part_obj, real.as_deref());
+            }
+        }
+    }
+
+    // Uebersicht: passende Partition bevorzugen. Traegt die Disk genau ein
+    // ext-Dateisystem, ist dessen Typ auch fuer die Gesamtansicht eindeutig.
+    if let Some(disk_info) = result.get_mut("disk_info").and_then(|d| d.as_object_mut()) {
+        let real = disk_info
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .and_then(|id| real_types.get(id))
+            .cloned()
+            .or_else(|| {
+                if real_types.len() == 1 {
+                    real_types.values().next().cloned()
+                } else {
+                    None
+                }
+            });
+        apply_ext_correction(disk_info, real.as_deref());
+    }
+
+    // Signaturliste, Eintraege der Form "ext4 (disk10s2)".
+    if let Some(detected) = result
+        .get_mut("filesystem_signatures")
+        .and_then(|s| s.get_mut("detected_filesystems"))
+        .and_then(|d| d.as_array_mut())
+    {
+        for item in detected.iter_mut() {
+            let Some(text) = item.as_str() else { continue };
+            let Some((name, remainder)) = text.split_once(" (") else { continue };
+            if !name.starts_with("ext") {
+                continue;
+            }
+            let partition = remainder.trim_end_matches(')');
+            if let Some(real) = real_types.get(partition) {
+                if real != name {
+                    *item = serde_json::json!(format!("{} ({})", real, partition));
+                }
+            }
+        }
+    }
 }
 
 /// Read non-sensitive Linux filesystem metadata directly from on-disk
@@ -6982,5 +7134,85 @@ mod tests {
         assert!(!contains_dir_named("/", "GibtEsHierNicht"));
         // Ein unlesbarer Pfad darf nicht in Panik enden.
         assert!(!contains_dir_named("/Volumes/NichtVorhanden", "Recovery"));
+    }
+
+    /// Die Versionsbestimmung muss allein den Feature-Flags folgen.
+    ///
+    /// Die Werte stammen aus echten Messungen: zwei ext2-Sticks und ein eigens
+    /// mit `newfs_ufsd_ExtFS -3` erzeugtes ext3. Beide Faelle meldete
+    /// `diskutil` uebereinstimmend als `UFSD_EXTFS4` — genau deshalb darf die
+    /// Personality nicht in die Bewertung einfliessen.
+    #[test]
+    fn ext_version_folgt_den_feature_flags() {
+        // Gemessen an /dev/rdisk10s2 und /dev/rdisk11s2: kein Journal.
+        assert_eq!(ext_version_from_flags(0x0000_0038, 0x0000_0002, 0x0000_0003), "ext2");
+
+        // Gemessen am Testabbild: identisch, nur zusaetzlich has_journal (0x04).
+        assert_eq!(ext_version_from_flags(0x0000_003C, 0x0000_0002, 0x0000_0003), "ext3");
+
+        // ext4, gemessen an einem mit `diskutil eraseVolume UFSD_EXTFS4`
+        // erzeugten Volume: 0x2C2 enthaelt extents (0x40), 64bit (0x80) und
+        // flex_bg (0x200).
+        assert_eq!(ext_version_from_flags(0x0000_003C, 0x0000_02C2, 0x0000_046B), "ext4");
+        // Ein ext4 ohne Extents, erkennbar nur am ro_compat-Merkmal
+        // metadata_csum (0x400) -- eine Pruefung allein auf Extents wuerde es
+        // faelschlich als ext3 ausweisen.
+        assert_eq!(ext_version_from_flags(0x0000_003C, 0x0000_0002, 0x0000_0403), "ext4");
+    }
+
+    /// Der aus dem Superblock gelesene Typ muss die Anzeige ueberschreiben.
+    #[test]
+    fn korrektur_ersetzt_paragon_sammelangabe() {
+        let mut result = serde_json::json!({
+            "disk_info": {
+                "device_id": "disk10",
+                "filesystem": "UFSD_EXTFS4",
+                "filesystem_name": "extFS 4"
+            },
+            "partitions": [{
+                "partition_id": "disk10s2",
+                "filesystem": "UFSD_EXTFS4",
+                "filesystem_name": "extFS 4"
+            }],
+            "filesystem_signatures": {
+                "detected_filesystems": ["ext4 (disk10s2)"]
+            },
+            "linux_filesystem_details": {
+                "filesystems": [{ "partition": "disk10s2", "filesystem": "ext2" }]
+            }
+        });
+
+        correct_ext_filesystem_labels(&mut result);
+
+        assert_eq!(result["partitions"][0]["filesystem"], "ext2");
+        assert_eq!(result["partitions"][0]["filesystem_name"], "extFS 2");
+        // Die Disk traegt genau ein ext-Dateisystem, also ist auch die
+        // Uebersicht eindeutig bestimmt.
+        assert_eq!(result["disk_info"]["filesystem"], "ext2");
+        assert_eq!(result["disk_info"]["filesystem_name"], "extFS 2");
+        assert_eq!(result["filesystem_signatures"]["detected_filesystems"][0], "ext2 (disk10s2)");
+    }
+
+    /// Ohne lesbaren Superblock darf keine Version behauptet werden — und
+    /// fremde Dateisysteme duerfen nicht angefasst werden.
+    #[test]
+    fn korrektur_erfindet_keine_version_und_schont_andere_dateisysteme() {
+        let mut result = serde_json::json!({
+            "disk_info": { "device_id": "disk10", "filesystem": "UFSD_EXTFS4", "filesystem_name": "extFS 4" },
+            "partitions": [
+                { "partition_id": "disk10s1", "filesystem": "MS-DOS FAT32", "filesystem_name": "MS-DOS FAT32" },
+                { "partition_id": "disk10s2", "filesystem": "UFSD_EXTFS4", "filesystem_name": "extFS 4" }
+            ]
+        });
+
+        correct_ext_filesystem_labels(&mut result);
+
+        // Kein linux_filesystem_details -> Ziffer entfernen statt raten.
+        assert_eq!(result["partitions"][1]["filesystem"], "ext");
+        assert_eq!(result["partitions"][1]["filesystem_name"], "extFS");
+        assert_eq!(result["disk_info"]["filesystem"], "ext");
+        // FAT32 bleibt unveraendert.
+        assert_eq!(result["partitions"][0]["filesystem"], "MS-DOS FAT32");
+        assert_eq!(result["partitions"][0]["filesystem_name"], "MS-DOS FAT32");
     }
 }
