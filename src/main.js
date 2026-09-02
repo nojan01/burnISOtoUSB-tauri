@@ -125,6 +125,20 @@ function formatBool(value) {
   return value ? '✓ ' + t('forensic.yes') : '✗ ' + t('forensic.no');
 }
 
+// Geraetename fuer Dateinamen und Berichtstitel.
+// Das Backend liefert disk_info durchgehend in snake_case: diskutils
+// "Device Identifier" wird in lib.rs zu device_id umbenannt. Die frueher hier
+// gelesenen Schluessel Device und "Device Identifier" existierten deshalb nie,
+// sodass jeder Bericht auf den Platzhalter "usb" zurueckfiel -- mehrere
+// gepruefte Datentraeger ueberschrieben einander stillschweigend, und kein
+// Bericht nannte den Traeger, zu dem er gehoerte.
+function forensicDeviceName(result, fallback) {
+  const info = result?.disk_info || {};
+  const raw = info.device_id || info.device_node || result?.disk_id || '';
+  const name = String(raw).replace('/dev/', '').trim();
+  return name || fallback;
+}
+
 // Clipboard helper - use native API as fallback
   async function copyToClipboard(text) {
     try {
@@ -3372,7 +3386,7 @@ function formatBool(value) {
     if (!lastForensicResult) return;
     
     try {
-      const deviceName = (lastForensicResult.disk_info?.Device || lastForensicResult.disk_info?.['Device Identifier'] || 'usb').replace('/dev/', '');
+      const deviceName = forensicDeviceName(lastForensicResult, 'usb');
       const filePath = await save({
         defaultPath: 'forensic-report-' + deviceName + '.json',
         filters: [{ name: 'JSON', extensions: ['json'] }]
@@ -3397,7 +3411,7 @@ function formatBool(value) {
     if (!lastForensicResult) return;
     
     try {
-      const deviceName = (lastForensicResult.disk_info?.Device || lastForensicResult.disk_info?.['Device Identifier'] || 'usb').replace('/dev/', '');
+      const deviceName = forensicDeviceName(lastForensicResult, 'usb');
       const filePath = await save({
         defaultPath: 'forensic-report-' + deviceName + '.html',
         filters: [{ name: 'HTML', extensions: ['html'] }]
@@ -3415,7 +3429,7 @@ function formatBool(value) {
   
   // Helper function to generate standalone HTML report
   function generateForensicHtmlReport(result) {
-    const deviceName = result.disk_info?.Device || result.disk_info?.['Device Identifier'] || 'USB';
+    const deviceName = forensicDeviceName(result, 'USB');
     const currentLang = window.i18n.currentLang;
     const renderedReport = forensicResult.querySelector('.forensic-report');
     if (renderedReport) {
