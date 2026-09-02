@@ -3322,6 +3322,12 @@ function formatBool(value) {
         forensicResult.innerHTML = '<div class="forensic-error">' + escapeHtml(t('messages.error') + ': ' + err) + '</div>';
       }
       forensicResult.classList.remove('hidden');
+      // Nach einem Fehlschlag darf der Export nicht mehr angeboten werden.
+      // Sonst exportiert ein Klick stillschweigend das Ergebnis des ZUVOR
+      // geprueften Datentraegers, waehrend der Bildschirm einen Fehler zeigt --
+      // in einem Forensik-Werkzeug ein Bericht ueber den falschen Stick.
+      lastForensicResult = null;
+      forensicExportSection.classList.add('hidden');
     } finally {
       forensicBtn.disabled = !selectedForensicDisk;
     }
@@ -3490,7 +3496,7 @@ function formatBool(value) {
       if (isSDCardExport && key === 'smart_status') continue;
       
       if (result.disk_info[key]) {
-        html += `<div class="item"><span class="label">${key}:</span> <span class="value">${result.disk_info[key]}</span></div>`;
+        html += `<div class="item"><span class="label">${escapeHtml(fieldLabel(key))}:</span> <span class="value">${escapeHtml(result.disk_info[key])}</span></div>`;
       }
     }
     html += `</div></div>`;
@@ -3689,34 +3695,92 @@ function formatBool(value) {
       }
       html += `</div></div>`;
     }
+
+    // Hardware-, Controller- und Speicher-Details.
+    // Diese drei Abschnitte standen zuvor nur auf dem Bildschirm, nicht im
+    // Bericht -- der Export war damit unvollstaendiger als die Anzeige.
+    // Die Aufbereitung der Werte ist bewusst identisch zur Anzeige, sonst
+    // stuende im Bericht z. B. eine rohe Byte-Zahl statt "62,3 GB (62264442880 Bytes)".
+    if (result.hardware_info) {
+      html += `<div class="section"><h2>🔧 ${escapeHtml(t('tools.forensicHardwareInfo') || 'Hardware-Details')}</h2><div class="grid">`;
+      for (let key in result.hardware_info) {
+        let value = result.hardware_info[key];
+        if (typeof value === 'boolean') {
+          value = formatBool(value);
+        } else if (key.endsWith('_bytes')) {
+          value = formatBytesExact(value);
+        }
+        html += `<div class="item"><span class="label">${escapeHtml(fieldLabel(key))}:</span> <span class="value">${escapeHtml(value)}</span></div>`;
+      }
+      html += `</div></div>`;
+    }
+
+    if (result.controller_info) {
+      html += `<div class="section"><h2>🎛️ ${escapeHtml(t('tools.forensicController') || 'USB-Controller')}</h2><div class="grid">`;
+      for (let key in result.controller_info) {
+        html += `<div class="item"><span class="label">${escapeHtml(fieldLabel(key))}:</span> <span class="value">${escapeHtml(result.controller_info[key])}</span></div>`;
+      }
+      html += `</div></div>`;
+    }
+
+    if (result.storage_info) {
+      html += `<div class="section"><h2>💿 ${escapeHtml(t('tools.forensicStorageInfo') || 'Speicher-Details')}</h2><div class="grid">`;
+      for (let key in result.storage_info) {
+        let value = result.storage_info[key];
+        if (key.includes('bytes')) {
+          value = formatBytesExact(value);
+        } else if (typeof value === 'boolean') {
+          value = formatBool(value);
+        }
+        html += `<div class="item"><span class="label">${escapeHtml(fieldLabel(key))}:</span> <span class="value">${escapeHtml(value)}</span></div>`;
+      }
+      html += `</div></div>`;
+    }
     
     // MBR Analysis
-    if (result.mbr_analysis) {
-      html += `<div class="section"><h2>📀 ${t('forensic.mbrAnalysis')}</h2><div class="grid">`;
-      html += `<div class="item"><span class="label">${t('forensic.signature')}:</span> <span class="value">${result.mbr_analysis.mbr_signature}</span></div>`;
-      html += `<div class="item"><span class="label">${t('forensic.valid')}:</span> <span class="value">${result.mbr_analysis.valid_mbr ? '✓ ' + t('forensic.yes') : '✗ ' + t('forensic.no')}</span></div>`;
+    // Signatur und Gueltigkeit stehen bereits unter "Boot-Strukturen". Standen sie
+    // hier ein zweites Mal, wiederholte der Bericht dieselbe Angabe -- durch die
+    // getrennten Uebersetzungsschluessel sogar unter zwei verschiedenen Namen.
+    // Die Anzeige zeigt hier ebenfalls nur noch die Partitionseintraege.
+    const mbrEntriesExport = result.mbr_analysis?.partition_entries;
+    if (mbrEntriesExport && mbrEntriesExport.length > 0) {
+      html += `<div class="section"><h2>📀 ${escapeHtml(t('forensic.mbrAnalysis'))}</h2>`;
+      mbrEntriesExport.forEach(p => {
+        const bootLabel = p.bootable ? ' 🚀 Boot' : '';
+        html += `<div class="partition"><strong>${escapeHtml(t('tools.partition'))} ${escapeHtml(p.number)}</strong> [${escapeHtml(p.type_hex)}] ${escapeHtml(p.type_name)}${bootLabel}</div>`;
+      });
       html += `</div>`;
-      if (result.mbr_analysis.partition_entries && result.mbr_analysis.partition_entries.length > 0) {
-        result.mbr_analysis.partition_entries.forEach(p => {
-          const isProtectiveMbr = p.type_hex === '0xEE';
-          const bootLabel = isProtectiveMbr ? '' : (p.bootable ? '🚀 Boot' : '');
-          html += `<div class="partition"><strong>${t('tools.partition')} ${p.number}</strong> [${p.type_hex}] ${p.type_name} ${bootLabel}</div>`;
-        });
+    }
+
+    // GPT-Analyse. Auf dem Bildschirm vorhanden, im Bericht bisher nicht.
+    if (result.gpt_analysis) {
+      html += `<div class="section"><h2>📦 ${escapeHtml(t('tools.forensicGptAnalysis') || 'GPT-Analyse')}</h2><div class="grid">`;
+      html += `<div class="item"><span class="label">${escapeHtml(t('forensic.signature'))}:</span> <span class="value">${escapeHtml(result.gpt_analysis.gpt_signature)}</span></div>`;
+      html += `<div class="item"><span class="label">${escapeHtml(t('forensic.valid'))}:</span> <span class="value">${escapeHtml(formatBool(result.gpt_analysis.valid_gpt))}</span></div>`;
+      if (result.gpt_analysis.gpt_revision) {
+        html += `<div class="item"><span class="label">Revision:</span> <span class="value">${escapeHtml(result.gpt_analysis.gpt_revision)}</span></div>`;
       }
-      html += `</div>`;
+      html += `</div></div>`;
     }
     
     // Mounted Content Analysis
     if (result.mounted_content) {
-      html += `<div class="section"><h2>📁 ${t('forensic.mountedContent')}</h2><div class="grid">`;
-      if (result.mounted_content.total_items) {
-        html += `<div class="item"><span class="label">${t('forensic.totalEntries')}:</span> <span class="value">${result.mounted_content.total_items}</span></div>`;
+      const mc = result.mounted_content;
+      html += `<div class="section"><h2>📁 ${escapeHtml(t('forensic.mountedContent'))}</h2><div class="grid">`;
+      // Gleiche Aufschluesselung wie auf dem Bildschirm: Gesamtzahl und davon
+      // Nutzerdaten. Ohne sie widersprach der Bericht der Anzeige, weil die von
+      // macOS und Windows angelegten Systemordner stillschweigend mitzaehlten.
+      if (mc.total_items !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('forensic.totalEntries'))}:</span> <span class="value">${escapeHtml(formatCountBreakdown(mc.total_items, mc.user_items))}</span></div>`;
       }
-      if (result.mounted_content.file_count) {
-        html += `<div class="item"><span class="label">${t('forensic.files')}:</span> <span class="value">${result.mounted_content.file_count}</span></div>`;
+      if (mc.file_count !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('forensic.files'))}:</span> <span class="value">${escapeHtml(formatCountBreakdown(mc.file_count, mc.user_file_count))}</span></div>`;
       }
-      if (result.mounted_content.used_space) {
-        html += `<div class="item"><span class="label">${t('forensic.usedStorage')}:</span> <span class="value">${result.mounted_content.used_space}</span></div>`;
+      if (mc.directory_count !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('tools.directories'))}:</span> <span class="value">${escapeHtml(formatCountBreakdown(mc.directory_count, mc.user_directory_count))}</span></div>`;
+      }
+      if (mc.used_space) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('forensic.usedStorage'))}:</span> <span class="value">${escapeHtml(mc.used_space)}</span></div>`;
       }
       html += `</div>`;
       
@@ -3732,6 +3796,59 @@ function formatBool(value) {
       html += `</div>`;
     }
     
+    // Dateisystem-Details. Bisher nur auf dem Bildschirm. Die Zaehlungen nutzen
+    // dieselbe Aufschluesselung "gesamt (davon N Nutzerdaten)" wie die Anzeige,
+    // sonst widerspraeche der Bericht den Zahlen auf dem Schirm.
+    if (result.filesystem_details) {
+      const fd = result.filesystem_details;
+      html += `<div class="section"><h2>📁 ${escapeHtml(t('tools.forensicFsDetails'))}</h2><div class="grid">`;
+      if (fd.total_file_count !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('forensic.files'))}:</span> <span class="value">${escapeHtml(formatCountBreakdown(fd.total_file_count, fd.user_file_count))}</span></div>`;
+      }
+      if (fd.directory_count !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('tools.directories'))}:</span> <span class="value">${escapeHtml(formatCountBreakdown(fd.directory_count, fd.user_directory_count))}</span></div>`;
+      }
+      if (fd.hidden_files_count !== undefined) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('tools.hiddenFiles'))}:</span> <span class="value">${escapeHtml(fd.hidden_files_count)}</span></div>`;
+      }
+      if (fd.symlink_count !== undefined) {
+        html += `<div class="item"><span class="label">Symlinks:</span> <span class="value">${escapeHtml(fd.symlink_count)}</span></div>`;
+      }
+      if (fd.capacity_percent) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('tools.capacity'))}:</span> <span class="value">${escapeHtml(fd.capacity_percent)}</span></div>`;
+      }
+      if (fd.inode_usage_percent) {
+        html += `<div class="item"><span class="label">${escapeHtml(t('tools.forensicInodeUsage'))}:</span> <span class="value">${escapeHtml(fd.inode_usage_percent)}</span></div>`;
+      }
+      html += `</div>`;
+
+      if (fd.largest_files && fd.largest_files.length > 0) {
+        html += `<div style="margin-top: 10px;"><strong>${escapeHtml(t('tools.forensicLargestFiles') || 'Größte Dateien')}:</strong><div class="filelist">`;
+        fd.largest_files.forEach(f => {
+          const sizeFormatted = formatBytes(parseInt(f.size_bytes) || 0);
+          html += `<div class="file-item"><span class="mono">${escapeHtml(sizeFormatted)}</span> ${escapeHtml(f.path)}</div>`;
+        });
+        html += `</div></div>`;
+      }
+
+      if (fd.file_type_distribution && fd.file_type_distribution.length > 0) {
+        html += `<div style="margin-top: 10px;"><strong>${escapeHtml(t('tools.forensicFileTypes') || 'Dateitypen')}:</strong><br/>`;
+        fd.file_type_distribution.forEach(ft => {
+          html += `<span class="type-badge">${escapeHtml(ft.extension)} (${escapeHtml(ft.count)})</span>`;
+        });
+        html += `</div>`;
+      }
+
+      if (fd.recently_modified && fd.recently_modified.length > 0) {
+        html += `<div style="margin-top: 10px;"><strong>${escapeHtml(t('tools.forensicRecent') || 'Kürzlich geändert (7 Tage)')}:</strong><div class="filelist">`;
+        fd.recently_modified.forEach(f => {
+          html += `<div class="file-item">${escapeHtml(f)}</div>`;
+        });
+        html += `</div></div>`;
+      }
+      html += `</div>`;
+    }
+
     // SMART Info Section for HTML export
     if (result.smart_info) {
       html += `<div class="section"><h2>🔬 ${t('forensic.smartData')}</h2>`;

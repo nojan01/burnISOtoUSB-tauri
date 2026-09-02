@@ -5562,18 +5562,24 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         }
     }
     
-    // Get file count
-    let file_count_cmd = format!("find {} -type f 2>/dev/null | wc -l", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &file_count_cmd]).output() {
-        let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        content.insert("file_count".to_string(), serde_json::json!(count));
-    }
-    
-    // Get directory count
-    let dir_count_cmd = format!("find {} -type d 2>/dev/null | wc -l", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &dir_count_cmd]).output() {
-        let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        content.insert("directory_count".to_string(), serde_json::json!(count));
+    // Dateien und Ordner getrennt zaehlen, jeweils gesamt und ohne Systemordner.
+    // Drei Fehler waren hier zuvor eingebaut: ohne -mindepth 1 zaehlte -type d den
+    // Einhaengepunkt selbst mit (+1), ohne SYSTEM_PRUNE flossen genau die Ordner ein,
+    // die total_items/user_items darueber bereits herausrechnen, und die Zahl wurde
+    // als String abgelegt, waehrend total_items eine Zahl liefert.
+    let detail_cmds = [
+        ("file_count", format!("find {} -mindepth 1 -type f -print 2>/dev/null | wc -l", mp)),
+        ("user_file_count", format!("find {} -mindepth 1 {} -type f -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
+        ("directory_count", format!("find {} -mindepth 1 -type d -print 2>/dev/null | wc -l", mp)),
+        ("user_directory_count", format!("find {} -mindepth 1 {} -type d -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
+    ];
+
+    for (key, cmd) in detail_cmds {
+        if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
+            if let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
+                content.insert(key.to_string(), serde_json::json!(count));
+            }
+        }
     }
     
     // Detect OS installations

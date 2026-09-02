@@ -1,7 +1,7 @@
 {
   "name": "burniso-to-usb",
   "private": true,
-  "version": "1.4.10",
+  "version": "1.4.11",
   "description": "ISO to USB writer, USB backup, disk diagnostics and forensic analysis tool for macOS",
   "license": "MIT",
   "author": "Norbert Jander",
