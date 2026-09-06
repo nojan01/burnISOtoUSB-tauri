@@ -36,7 +36,8 @@
 ### 🔍 USB prüfen (NEU!)
 - **Surface Scan** - Liest alle Sektoren und findet Lesefehler (nicht-destruktiv, Daten bleiben erhalten)
 - **Volltest** - Schreibt Testmuster (0x00, 0xFF) und verifiziert (destruktiv, löscht alle Daten!)
-- **Geschwindigkeitstest** - Misst Lese- und Schreibgeschwindigkeit in MB/s
+- **Geschwindigkeitstest** - Kurztest oder Einzelmessungen mit 1/4/16 MiB; Durchsatz in MiB/s
+- **Stichproben-Scan** - Schnelle, ausdrücklich begrenzte Leseprüfung verteilter Bereiche
 - **S.M.A.R.T. Status** - Zeigt Gesundheitsdaten für USB-Festplatten (mit [smartmontools](https://www.smartmontools.org/))
 - **Echtzeit-Statistiken** - Geprüfte Sektoren, gefundene Fehler, Geschwindigkeit
 
@@ -155,13 +156,27 @@ cargo tauri build
 
 2. **Testmodus wählen**
    - **🔍 Surface Scan**: Liest alle Sektoren ohne Daten zu löschen
+   - **🔎 Stichproben-Scan**: Liest bis zu 16 verteilte Bereiche (höchstens 128 MiB); zeigt den tatsächlich abgearbeiteten Anteil. Keine Aussage über ungeprüfte Bereiche.
    - **⚠️ Volltest**: Schreibt Testmuster und verifiziert (LÖSCHT ALLE DATEN!)
    - **⚡ Geschwindigkeitstest**: Misst Lese-/Schreibgeschwindigkeit (LÖSCHT ALLE DATEN!)
+     - **Kurz**: 8-MiB-Blöcke, je ca. 30 Sekunden Schreiben und Lesen; Vorbereitung und Synchronisieren zusätzlich. Kleine Medien können mehrfach durchlaufen werden.
+     - **Ausführlich**: Separate Messungen mit 1, 4 und 16 MiB im gleichen Anfangsbereich des Mediums. Kein vollständiger Kapazitätstest.
+     - Die Tabelle zeigt Datenmengen und Einzelwerte. Der Gesamtdurchsatz ist Gesamtbytes / Gesamtzeit, kein Spitzenwert. Schreibzeiten enthalten das abschließende Synchronisieren. Alle Werte verwenden MiB/s (1 MiB = 1.048.576 Bytes).
 
 3. **Test starten**
    - Klicke auf "🔍 Test starten" oder `⌘D`
    - Gib dein macOS-Passwort ein
    - Fortschritt und Statistiken werden in Echtzeit angezeigt
+
+Surface- und Stichproben-Scans zeigen laufenden Lesedurchsatz und eine geschätzte
+Restzeit. Bei E/A-Lesefehlern wird einmal wiederholt und der betroffene Bereich
+bis auf 64 KiB eingegrenzt; anschließend läuft die Prüfung weiter. Gemeldet
+werden **nicht lesbare Bereiche**, keine vermeintlich exakt defekten Sektoren.
+Bis zu 256 Bereiche werden aufgelistet, die Gesamtfehlerzahl bleibt vollständig.
+Geräteverlust, Zugriffsfehler oder ein vorzeitiges Dateiende brechen den Scan ab.
+Die Wiederholungen der App sind begrenzt; zusätzliche Wartezeiten im Gerät oder
+macOS-Treiber lassen sich dadurch nicht begrenzen. Ein erfolgreicher Lesescan
+belegt Lesbarkeit, nicht die inhaltliche Integrität vorhandener Dateien.
 
 > 💡 **Tipp**: Für erweiterte S.M.A.R.T.-Daten bei USB-Festplatten: `brew install smartmontools`
 
@@ -276,6 +291,58 @@ cargo tauri build
 ```
 
 ---
+
+### Regressionstests und Release-Prüfung
+
+Ohne angeschlossene Datenträger (ausschließlich temporäre Testdateien):
+
+```bash
+cargo test --offline --manifest-path src-tauri/Cargo.toml --lib --examples
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+node --test tests/*.test.mjs
+cargo clippy --offline --manifest-path src-tauri/Cargo.toml --lib --examples -- -D warnings
+```
+
+Die zwei ausdrücklich als `ignored` markierten Rust-Integrationstests benötigen
+macOS-DiskManagement. Einer davon partitioniert ein eigens erzeugtes Testabbild.
+Sie gehören bewusst nicht zum automatischen Standardlauf.
+
+Für einen UI-Smoke-Test kann das Projekt lokal mit
+`python3 -m http.server 8765 --bind 127.0.0.1` bereitgestellt werden.
+`tests/app-preview.html` startet die echte
+Oberfläche mit einer simulierten Tauri-Schnittstelle **ohne Gerätezugriff**;
+`tests/forensic-preview.html` prüft zusätzlich die berechnete Schriftgröße.
+
+`scripts/verify-update.sh ARCHIV VERSION` entpackt das Update mit Rust `tar`
+(derselbe Entpackweg wie im Tauri-Updater) in ein neues temporäres App-Verzeichnis.
+Anschließend werden Versionsnummer, Codesignatur, Notarisierungsticket und
+Gatekeeper geprüft. AppleDouble-Dateien (`._*`), ungültige Pfade und unvollständige
+Bundles führen zum Fehler. Das Release-Skript führt diesen Test verpflichtend aus.
+Die macOS-Sicherheitsprüfungen brauchen Zugriff auf die normalen Systemdienste;
+eine eingeschränkte Sandbox kann sonst eine ungültige Signatur vortäuschen.
+
+**Destruktive Hardwaretests sind immer separat und ausdrücklich freizugeben.**
+`tests/hardware_smoke.py --erase 'diskN:EXAKTE_BYTES:MEDIENNAME'` prüft Raw/XZ,
+Verifizierung, Backup, Testmuster und Lesen am Anfang des angegebenen Mediums.
+Es überschreibt 64 MiB + 512 Bytes einschließlich Partitionstabelle und verweigert
+interne Medien, abweichende Identitäten sowie Medien über 128 GiB.
+Es ist kein vollständiger Kapazitäts- oder Langzeittest. Gerätekennungen sind vor
+jedem Lauf neu zu bestimmen; Beispiele niemals ungeprüft übernehmen.
+
+### Sicherheits- und Datenmodell
+
+- Nur ein Datenträgerauftrag oder eine Update-Installation kann gleichzeitig
+  aktiv sein. Die Sperre bleibt bis zum bestätigten Prozessende bestehen.
+- Der Raw-Backupmodus sichert die vom Backend ermittelte gesamte Kapazität.
+  ISO-9660-Extraktion ist ein eigener, ausdrücklich auszuwählender Modus.
+- Backups werden erst nach vollständigem Lesen und Synchronisieren atomar
+  veröffentlicht. Bei Fehler oder Abbruch bleibt eine `.partial`-Datei zurück;
+  bestehende Ziel- und Teildateien werden nicht überschrieben.
+- Der Writer berechnet beim Schreiben SHA-256-Prüfsummen je Block. Die optionale
+  Verifizierung liest den Datenträger zurück, ohne XZ erneut zu dekomprimieren.
+- Die Forensik verwendet einen begrenzten nativen Verzeichnisdurchlauf pro
+  Mountpunkt. Lesefehler, ausgelassene Mount-Grenzen und Listenlimits werden
+  im Tab und in beiden Exportformaten ausgewiesen. JSON-Schema: `1.1`.
 
 ## Lizenz
 

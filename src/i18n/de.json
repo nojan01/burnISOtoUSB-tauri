@@ -70,6 +70,13 @@
     "sectionsCollected": "Datenbereiche erfasst"
   },
   "burn": {
+    "writtenVerified": "Image geschrieben und vollständig verifiziert",
+    "written": "Image vollständig geschrieben (ohne Verifizierung)",
+    "finalizing": "Schreibvorgang abgeschlossen – Datenträger-Abschluss läuft …",
+    "incompleteResult": "Vollständige Schreibbestätigung fehlt",
+    "failed": "Brennvorgang fehlgeschlagen",
+    "mountWarning": "Warnung: Das anschließende Wiedereinhängen ist fehlgeschlagen. Der Schreibvorgang bleibt erfolgreich. Nicht unterstützte Linux-Dateisysteme müssen nicht eingehängt werden; falls der ganze Stick nicht mehr angezeigt wird, bitte erneut verbinden.",
+    "ejectWarning": "Warnung: Das automatische Auswerfen ist fehlgeschlagen. Der Schreibvorgang bleibt erfolgreich. Den Datenträger vor dem Abziehen in macOS sicher auswerfen.",
     "selectIso": "ISO-Datei auswählen",
     "selectUsb": "USB-Stick auswählen",
     "options": "Optionen",
@@ -102,7 +109,9 @@
     "filesystemDescription": "Nur belegte Dateien - schneller und komprimiert",
     "filesystemSupported": "Dateisystem unterstützt:",
     "backupButton": "💿 USB sichern",
-    "cancel": "Abbrechen"
+    "cancel": "Abbrechen",
+    "isoMode": "ISO extrahieren",
+    "isoDescription": "Nur ISO-9660-Inhalt; keine vollständige Datenträgersicherung"
   },
   "diagnose": {
     "selectUsb": "USB-Stick auswählen",
@@ -163,7 +172,35 @@
     "powerCycles": "Ein-/Ausschaltzyklen:",
     "reallocatedSectors": "Umgemappte Sektoren:",
     "pendingSectors": "Wartende Sektoren:",
-    "uncorrectableSectors": "Unkorrigierbare Sektoren:"
+    "uncorrectableSectors": "Unkorrigierbare Sektoren:",
+    "sampleLabel": "🔎 Stichproben-Scan (Nur Lesen)",
+    "sampleDescription": "Bis zu 16 verteilte Bereiche, insgesamt höchstens 128 MiB. Kein vollständiger Surface Scan.",
+    "speedProfile": "Messumfang",
+    "quickProfile": "Kurz: ca. 30 s Schreiben + 30 s Lesen",
+    "detailedProfile": "Ausführlich: 1 / 4 / 16 MiB",
+    "quickCaveat": "Kurztest mit 8-MiB-Blöcken: je ca. 30 s Schreiben und Lesen. Vorbereitung und Synchronisieren können zusätzlich dauern. Kein Dauertest; kleine Medien werden ggf. mehrfach durchlaufen.",
+    "detailedCaveat": "Ausführlicher Test mit 1-, 4- und 16-MiB-Blöcken. Je Blockgröße wird derselbe Anfangsbereich geschrieben und gelesen; kein vollständiger Kapazitätstest.",
+    "weightedAverage": "Die Statistik zeigt Gesamtbytes geteilt durch die gesamte Messzeit, nicht den höchsten Einzelwert. Schreibzeiten enthalten das abschließende Synchronisieren.",
+    "blockSize": "Blockgröße",
+    "writtenRead": "Geschrieben / gelesen",
+    "measurementComplete": "Geschwindigkeitsmessung abgeschlossen",
+    "sampleComplete": "Stichprobe ohne bleibende Lesefehler – keine Aussage über ungeprüfte Bereiche",
+    "scanComplete": "Vollständiger Surface Scan ohne Lesefehler abgeschlossen",
+    "scanRetried": "Surface Scan abgeschlossen; Lesefehler durch Wiederholung überwunden",
+    "scanFailed": "Scan beendet: nicht lesbare Bereiche gefunden",
+    "sampleCaveat": "STICHPROBE: Nur die angegebenen Bereiche wurden geprüft. Dies ersetzt keinen vollständigen Surface Scan.",
+    "fullCoverage": "Vollständiger Surface Scan: Lesbarkeit des gesamten Mediums geprüft, keine Prüfung der Dateiinhalte.",
+    "coverage": "Abgearbeiteter Anteil",
+    "unreadable": "Nicht lesbare Daten",
+    "retryCount": "Wiederholungsversuche",
+    "regionCaveat": "Fehlerbereiche sind höchstens 64 KiB groß. Darin ist nicht zwingend jedes einzelne Byte defekt.",
+    "byteRange": "Bytebereich (einschließlich Grenzen)",
+    "truncatedRanges": "Die Liste ist auf 256 Fehlerbereiche begrenzt; die Fehlerzahl enthält alle Funde.",
+    "readingPhase": "Lesen",
+    "writingPhase": "Schreiben",
+    "retryingPhase": "Lesefehler: Wiederholung / Eingrenzung",
+    "syncPhase": "Schreibdaten synchronisieren",
+    "remaining": "Restzeit"
   },
   "dialogs": {
     "warning": "Warnung",
@@ -534,7 +571,13 @@
     "fieldPciRevisionId": "PCI-Revisions-ID",
     "fieldUsbBus": "USB-Bus",
     "fieldSpecialPartitions": "Spezielle Partitionen",
-    "fieldWindowsRecovery": "Windows-Wiederherstellung"
+    "fieldWindowsRecovery": "Windows-Wiederherstellung",
+    "scanComplete": "Verzeichnisprüfung vollständig",
+    "scanIncomplete": "Verzeichnisprüfung unvollständig; Zahlen sind Mindestwerte",
+    "scanErrors": "Lesefehler",
+    "scanSkippedMounts": "Ausgelassene Mount-Grenzen",
+    "scanListLimit": "Listen sind begrenzt: größte Dateien 10, Dateitypen und kürzlich geändert 15, oberste Ebene 30. Symlinks werden nicht verfolgt.",
+    "scanTypeOverflow": "Die Dateitypen-Verteilung wurde wegen zu vieler unterschiedlicher Typen begrenzt."
   },
   "dependencies": {
     "missingTitle": "Optionale Tools fehlen",

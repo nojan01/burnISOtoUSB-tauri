@@ -70,6 +70,13 @@
     "sectionsCollected": "data sections collected"
   },
   "burn": {
+    "writtenVerified": "Image written and fully verified",
+    "written": "Image fully written (without verification)",
+    "finalizing": "Data processing complete – finishing device operation …",
+    "incompleteResult": "Complete write confirmation is missing",
+    "failed": "Image writing failed",
+    "mountWarning": "Warning: Remounting failed after writing. The write operation remains successful. Unsupported Linux file systems do not need to be mounted; if the entire drive is no longer listed, reconnect it.",
+    "ejectWarning": "Warning: Automatic ejection failed. The write operation remains successful. Safely eject the drive in macOS before unplugging it.",
     "selectIso": "Select ISO File",
     "selectUsb": "Select USB Drive",
     "options": "Options",
@@ -102,7 +109,9 @@
     "filesystemDescription": "Only used files - faster and compressed",
     "filesystemSupported": "Filesystem supported:",
     "backupButton": "💿 Backup USB",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "isoMode": "Extract ISO",
+    "isoDescription": "ISO-9660 content only; not a complete disk backup"
   },
   "diagnose": {
     "selectUsb": "Select USB Drive",
@@ -163,7 +172,35 @@
     "powerCycles": "Power Cycles:",
     "reallocatedSectors": "Reallocated Sectors:",
     "pendingSectors": "Pending Sectors:",
-    "uncorrectableSectors": "Uncorrectable Sectors:"
+    "uncorrectableSectors": "Uncorrectable Sectors:",
+    "sampleLabel": "🔎 Sample scan (read only)",
+    "sampleDescription": "Up to 16 distributed regions, at most 128 MiB in total. Not a full surface scan.",
+    "speedProfile": "Measurement scope",
+    "quickProfile": "Quick: approx. 30 s write + 30 s read",
+    "detailedProfile": "Detailed: 1 / 4 / 16 MiB",
+    "quickCaveat": "Quick test using 8-MiB blocks: approx. 30 s each for writing and reading. Preparation and synchronization may take extra time. Not a sustained-performance test; small devices may be traversed repeatedly.",
+    "detailedCaveat": "Detailed test using 1-, 4- and 16-MiB blocks. Each block size writes and reads the same initial region; not a full capacity test.",
+    "weightedAverage": "Statistics show total bytes divided by total measurement time, not the highest individual result. Write times include final synchronization.",
+    "blockSize": "Block size",
+    "writtenRead": "Written / read",
+    "measurementComplete": "Speed measurement complete",
+    "sampleComplete": "Sample has no persistent read errors – untested regions remain unknown",
+    "scanComplete": "Full surface scan completed without read errors",
+    "scanRetried": "Surface scan complete; read errors recovered after retrying",
+    "scanFailed": "Scan complete: unreadable regions found",
+    "sampleCaveat": "SAMPLE ONLY: Only the specified regions were checked. This does not replace a full surface scan.",
+    "fullCoverage": "Full surface scan: readability of the entire device checked, not file content correctness.",
+    "coverage": "Processed coverage",
+    "unreadable": "Unreadable data",
+    "retryCount": "Retries",
+    "regionCaveat": "Error regions are at most 64 KiB. Not every individual byte in each region is necessarily defective.",
+    "byteRange": "Byte range (inclusive)",
+    "truncatedRanges": "The list is limited to 256 error regions; the error count includes all findings.",
+    "readingPhase": "Reading",
+    "writingPhase": "Writing",
+    "retryingPhase": "Read error: retry / localization",
+    "syncPhase": "Synchronizing written data",
+    "remaining": "Remaining"
   },
   "dialogs": {
     "warning": "Warning",
@@ -534,7 +571,13 @@
     "fieldPciRevisionId": "PCI Revision ID",
     "fieldUsbBus": "USB Bus",
     "fieldSpecialPartitions": "Special Partitions",
-    "fieldWindowsRecovery": "Windows Recovery"
+    "fieldWindowsRecovery": "Windows Recovery",
+    "scanComplete": "Directory scan complete",
+    "scanIncomplete": "Directory scan incomplete; counts are lower bounds",
+    "scanErrors": "Read errors",
+    "scanSkippedMounts": "Skipped mount boundaries",
+    "scanListLimit": "Lists are limited: largest files 10, file types and recent files 15, top level 30. Symlinks are not followed.",
+    "scanTypeOverflow": "File type distribution was limited because too many distinct types were found."
   },
   "dependencies": {
     "missingTitle": "Optional tools missing",

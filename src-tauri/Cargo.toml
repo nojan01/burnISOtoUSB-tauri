@@ -1,6 +1,6 @@
 [package]
 name = "burniso-usb"
-version = "1.4.13"
+version = "1.4.14"
 description = "Burn ISO to USB und USB Backup Tool für macOS"
 authors = ["Norbert Jander"]
 edition = "2021"
@@ -30,3 +30,8 @@ chrono = "0.4"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+[dev-dependencies]
+tar = "=0.4.46"
+flate2 = "=1.1.10"
+tempfile = "3"

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BurnISO to USB</title>
   <link rel="stylesheet" href="styles.css?v=forensic-typography-2" />
+  <link rel="stylesheet" href="forensic.css" />
 </head>
 <body>
   <!-- Confirm Dialog Modal -->
@@ -142,6 +143,7 @@
           <span class="eta-text" id="burn-eta"></span>
         </div>
         <div id="burn-phase" class="phase-text"></div>
+        <div id="burn-warning" class="note warning hidden" role="status"></div>
       </div>
 
       <div class="button-row">
@@ -184,6 +186,13 @@
             <span class="radio-text">
               <strong data-i18n="backup.rawMode">Sektorgenau (Raw)</strong>
               <small data-i18n="backup.rawDescription">Komplettes Image inkl. aller Sektoren - langsamer aber exakt</small>
+            </span>
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="backup-mode" value="iso" />
+            <span class="radio-text">
+              <strong data-i18n="backup.isoMode">ISO extrahieren</strong>
+              <small data-i18n="backup.isoDescription">Nur ISO-9660-Inhalt; keine vollständige Datenträgersicherung</small>
             </span>
           </label>
           <label class="radio-label" id="filesystem-mode-label">
@@ -488,6 +497,13 @@
             </span>
           </label>
           <label class="radio-label">
+            <input type="radio" name="diagnose-mode" value="sample" />
+            <span class="radio-text">
+              <strong data-i18n="diagnose.sampleLabel">🔎 Stichproben-Scan (Nur Lesen)</strong>
+              <small data-i18n="diagnose.sampleDescription">Bis zu 16 verteilte Bereiche; kein vollständiger Surface Scan</small>
+            </span>
+          </label>
+          <label class="radio-label">
             <input type="radio" name="diagnose-mode" value="full" />
             <span class="radio-text">
               <strong data-i18n="diagnose.fullTest">⚠️ Volltest (Schreiben + Lesen)</strong>
@@ -501,6 +517,14 @@
               <small data-i18n="diagnose.speedDescription">Misst Lese- und Schreibgeschwindigkeit - LÖSCHT ALLE DATEN!</small>
             </span>
           </label>
+        </div>
+        <div id="speed-profile-options" class="hidden">
+          <label for="speed-profile" data-i18n="diagnose.speedProfile">Messumfang</label>
+          <select id="speed-profile">
+            <option value="quick" data-i18n="diagnose.quickProfile">Kurz: ca. 30 s Schreiben + 30 s Lesen</option>
+            <option value="detailed" data-i18n="diagnose.detailedProfile">Ausführlich: 1 / 4 / 16 MiB</option>
+          </select>
+          <p id="speed-profile-note" class="note" data-i18n="diagnose.quickCaveat">Synchronisieren kann zusätzlich dauern. Kein Dauertest.</p>
         </div>
         <div id="diagnose-warning" class="note warning hidden">
           ⚠️ <span data-i18n="diagnose.dataWarning">WARNUNG: Dieser Test löscht alle Daten auf dem USB-Stick!</span>
@@ -547,6 +571,7 @@
         </div>
       </div>
 
+      <div id="diagnose-details" class="section hidden" aria-live="polite"></div>
       <div class="button-row">
         <button id="diagnose-btn" class="btn primary large" disabled><span data-i18n="diagnose.startTest">🔍 Test starten</span></button>
         <button id="cancel-diagnose-btn" class="btn danger" disabled data-i18n="diagnose.cancel">Abbrechen</button>
@@ -734,6 +759,6 @@
   </div>
 
   <script src="i18n.js"></script>
-  <script src="main.js"></script>
+  <script type="module" src="main.js"></script>
 </body>
 </html>

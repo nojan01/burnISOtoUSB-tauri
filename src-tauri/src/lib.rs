@@ -1,11 +1,15 @@
+mod operations;
+mod burn_completion;
+mod diagnostics;
+mod process_runner;
+mod forensic_scan;
 // burnISOtoUSB - Tauri Backend
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri::menu::{Menu, MenuItem, Submenu, PredefinedMenuItem, AboutMetadata};
 
@@ -13,27 +17,14 @@ use tauri::menu::{Menu, MenuItem, Submenu, PredefinedMenuItem, AboutMetadata};
 /// Schreibvorgängen aufgerufen, damit ein fehlgeschlagenes `unmountDisk`
 /// nicht stillschweigend zu Datenverlust auf einer noch gemounteten
 /// Partition führt (siehe Code-Review K5).
-fn is_disk_mounted(disk_id: &str) -> bool {
-    let output = match Command::new("diskutil").args(["info", "-plist", disk_id]).output() {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let plist = String::from_utf8_lossy(&output.stdout);
-    // "MountPoint" wird im plist als <string>…</string> direkt nach dem Key gelistet.
-    // Ein nicht gemountetes Volume hat einen leeren String oder fehlt.
-    let mut iter = plist.split("<key>MountPoint</key>");
-    let _ = iter.next();
-    for rest in iter {
-        if let Some(start) = rest.find("<string>") {
-            if let Some(end) = rest[start + 8..].find("</string>") {
-                let mp = &rest[start + 8..start + 8 + end];
-                if !mp.trim().is_empty() {
-                    return true;
-                }
-            }
-        }
+fn verify_disk_unmounted(disk_id: &str) -> Result<(), String> {
+    let python = get_python3_path().ok_or("Python 3 fehlt zur Mountprüfung")?;
+    let out = Command::new(python).args(["-c", include_str!("check_mounts.py"), disk_id])
+        .output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    false
+    Ok(())
 }
 
 /// Führt ein Shell-Skript unter `sudo -S sh -c …` aus und übergibt das
@@ -146,32 +137,13 @@ fn is_valid_disk_id(disk_id: &str) -> bool {
         .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Beendet den gesamten Prozessbaum des privilegierten Schreibvorgangs.
-/// `sudo` kann den eigentlichen Writer als Kindprozess starten; nur den
-/// direkten `sudo`-Prozess zu töten würde den destruktiven Schreibvorgang
-/// sonst weiterlaufen lassen.
-#[cfg(unix)]
-fn kill_process_group(child: &mut Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: Der Kindprozess wird vor dem Start in eine eigene Prozessgruppe
-    // gesetzt. Eine negative PID adressiert genau diese Gruppe via kill(2).
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut Child) {
-    let _ = child.kill();
-}
-
 /// Bestimmt, warum die Verifizierung nicht durchgelaufen ist.
 ///
 /// Die eigentliche Ursache steht ausschliesslich im stderr des Pruefskripts.
 /// sudo mischt dort seine Kennwortabfrage hinein - mangels Zeilenumbruch oft
 /// direkt vor der Fehlermeldung -, deshalb wird "Password:" abgeschnitten
 /// statt die ganze Zeile zu verwerfen.
+#[cfg(test)]
 fn verify_failure_reason(stderr: &str, status_text: &str) -> String {
     let mut grund = stderr
         .lines()
@@ -191,7 +163,7 @@ fn verify_failure_reason(stderr: &str, status_text: &str) -> String {
 /// Versucht alle Partitionen einer Disk auszuhängen und meldet Fehler an
 /// das Frontend. Gibt einen Fehler zurück, wenn die Disk anschließend
 /// immer noch gemountet ist (verhindert Schreibzugriff auf gemountete FS).
-fn ensure_disk_unmounted(app: &AppHandle, disk_id: &str) -> Result<(), String> {
+fn ensure_disk_unmounted(_app: &AppHandle, disk_id: &str) -> Result<(), String> {
     let disk_path = format!("/dev/{}", disk_id);
     let output = Command::new("diskutil")
         .args(["unmountDisk", "force", &disk_path])
@@ -200,16 +172,10 @@ fn ensure_disk_unmounted(app: &AppHandle, disk_id: &str) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = app.emit("log", format!("Warnung: unmountDisk meldete Fehler: {}", stderr.trim()));
+        return Err(format!("Aushängen fehlgeschlagen: {}", stderr.trim()));
     }
 
-    if is_disk_mounted(disk_id) {
-        return Err(format!(
-            "Disk {} ist nach unmountDisk noch gemountet – Abbruch zum Schutz vor Datenverlust.",
-            disk_id
-        ));
-    }
-    Ok(())
+    verify_disk_unmounted(disk_id)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -250,14 +216,14 @@ struct DetectedFilesystem {
 /// This works even for filesystems macOS doesn't natively support
 fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
     let device_path = format!("/dev/r{}", disk_id); // Use raw device for direct access
-    
+
     let mut file = File::open(&device_path).ok()?;
     let mut buffer = vec![0u8; 131072]; // 128KB buffer for various superblocks
-    
+
     file.read_exact(&mut buffer).ok()?;
-    
+
     // Check for various filesystem signatures
-    
+
     // 1. NTFS: "NTFS    " at offset 3
     if buffer.len() > 10 && &buffer[3..11] == b"NTFS    " {
         let label = extract_ntfs_label(&buffer);
@@ -269,7 +235,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             total_bytes: total,
         });
     }
-    
+
     // 2. EXT2/3/4: Magic number 0xEF53 at offset 1080 (0x438)
     if buffer.len() > 1082 && buffer[0x438] == 0x53 && buffer[0x439] == 0xEF {
         let (fs_type, label, total, used) = extract_ext_info(&buffer);
@@ -280,7 +246,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             total_bytes: total,
         });
     }
-    
+
     // 3. FAT32: "FAT32   " at offset 82
     if buffer.len() > 90 && &buffer[82..90] == b"FAT32   " {
         let label = extract_fat_label(&buffer, 71);
@@ -291,7 +257,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             total_bytes: None,
         });
     }
-    
+
     // 4. FAT16: "FAT16   " or "FAT12   " at offset 54
     if buffer.len() > 62 {
         if &buffer[54..62] == b"FAT16   " {
@@ -313,7 +279,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             });
         }
     }
-    
+
     // 5. exFAT: "EXFAT   " at offset 3
     if buffer.len() > 11 && &buffer[3..11] == b"EXFAT   " {
         return Some(DetectedFilesystem {
@@ -323,7 +289,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             total_bytes: None,
         });
     }
-    
+
     // 6. ISO 9660: "CD001" at offset 32769 (0x8001) - need to read more
     if let Ok(mut f) = File::open(&device_path) {
         let mut iso_buf = vec![0u8; 6];
@@ -338,7 +304,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
                 });
             }
     }
-    
+
     // 7. Btrfs: "_BHRfS_M" at offset 0x10040
     if let Ok(mut f) = File::open(&device_path) {
         let mut btrfs_buf = vec![0u8; 8];
@@ -352,7 +318,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
                 });
             }
     }
-    
+
     // 8. XFS: "XFSB" at offset 0
     if buffer.len() > 4 && &buffer[0..4] == b"XFSB" {
         return Some(DetectedFilesystem {
@@ -362,7 +328,7 @@ fn detect_filesystem_from_device(disk_id: &str) -> Option<DetectedFilesystem> {
             total_bytes: None,
         });
     }
-    
+
     None
 }
 
@@ -385,7 +351,7 @@ fn extract_ntfs_size(buffer: &[u8]) -> (Option<u64>, Option<u64>) {
         buffer[0x28], buffer[0x29], buffer[0x2A], buffer[0x2B],
         buffer[0x2C], buffer[0x2D], buffer[0x2E], buffer[0x2F],
     ]);
-    
+
     let total_bytes = total_sectors * bytes_per_sector;
     // Used bytes would require reading $Bitmap - return None
     (Some(total_bytes), None)
@@ -444,7 +410,7 @@ fn extract_ext_info(buffer: &[u8]) -> (String, Option<String>, Option<u64>, Opti
     } else {
         "EXT"
     };
-    
+
     // Extract volume label (16 bytes at offset 0x78 in superblock)
     let label = if buffer.len() > superblock_offset + 0x88 {
         let label_bytes = &buffer[superblock_offset + 0x78..superblock_offset + 0x88];
@@ -456,7 +422,7 @@ fn extract_ext_info(buffer: &[u8]) -> (String, Option<String>, Option<u64>, Opti
     } else {
         None
     };
-    
+
     // Calculate size
     let (total, used) = if buffer.len() > superblock_offset + 0x28 {
         let block_count = u32::from_le_bytes([
@@ -478,14 +444,14 @@ fn extract_ext_info(buffer: &[u8]) -> (String, Option<String>, Option<u64>, Opti
             buffer[superblock_offset + 0x1B],
         ]);
         let block_size = 1024u64 << log_block_size;
-        
+
         let total_bytes = block_count * block_size;
         let used_bytes = (block_count - free_blocks) * block_size;
         (Some(total_bytes), Some(used_bytes))
     } else {
         (None, None)
     };
-    
+
     (fs_type.to_string(), label, total, used)
 }
 
@@ -523,28 +489,28 @@ fn extract_iso_label(device_path: &str) -> Option<String> {
 /// - Logical Block Size at offset 128 (2 bytes little-endian + 2 bytes big-endian)
 fn extract_iso_size(device_path: &str) -> Option<u64> {
     let mut file = File::open(device_path).ok()?;
-    
+
     // Read Primary Volume Descriptor (starts at 0x8000, 2048 bytes)
     file.seek(SeekFrom::Start(0x8000)).ok()?;
     let mut pvd = vec![0u8; 2048];
     file.read_exact(&mut pvd).ok()?;
-    
+
     // Check it's a Primary Volume Descriptor (type 1, "CD001")
     if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
         return None;
     }
-    
+
     // Volume Space Size (number of logical blocks) at offset 80
     // Little-endian 32-bit value
     let volume_space_size = u32::from_le_bytes([pvd[80], pvd[81], pvd[82], pvd[83]]) as u64;
-    
+
     // Logical Block Size at offset 128 (usually 2048)
     // Little-endian 16-bit value
     let logical_block_size = u16::from_le_bytes([pvd[128], pvd[129]]) as u64;
-    
+
     // Total size = blocks * block_size
     let total_size = volume_space_size * logical_block_size;
-    
+
     if total_size > 0 {
         Some(total_size)
     } else {
@@ -572,7 +538,7 @@ fn format_bytes(bytes: u64) -> String {
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
     const TB: u64 = GB * 1024;
-    
+
     if bytes >= TB {
         format!("{:.2} TB", bytes as f64 / TB as f64)
     } else if bytes >= GB {
@@ -633,10 +599,8 @@ static CANCEL_DIAGNOSE: AtomicBool = AtomicBool::new(false);
 // W5: monoton steigender Operation-Counter. Beim Start jeder Top-Level-Operation
 // um 1 erhöht; Events tragen diese ID, das Frontend ignoriert verspaetete Events
 // einer abgebrochenen/vorherigen Operation.
-static CURRENT_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
-
-fn start_operation() -> u64 {
-    CURRENT_OPERATION_ID.fetch_add(1, Ordering::SeqCst) + 1
+fn start_operation(resource: &str) -> Result<operations::Guard, String> {
+    operations::begin(resource)
 }
 
 /// SMART data structure - Extended with all smartctl -x data
@@ -721,6 +685,7 @@ pub struct DiagnoseProgressEvent {
     pub read_speed_mbps: f64,
     pub write_speed_mbps: f64,
     pub operation_id: u64,
+    pub details: Option<serde_json::Value>,
 }
 
 /// Diagnose result
@@ -734,6 +699,7 @@ pub struct DiagnoseResult {
     pub read_speed_mbps: f64,
     pub write_speed_mbps: f64,
     pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 #[tauri::command]
@@ -750,13 +716,13 @@ fn get_smartctl_path() -> Option<String> {
         "/usr/bin/smartctl",             // System path
         "/usr/sbin/smartctl",            // System path
     ];
-    
+
     for path in paths {
         if std::path::Path::new(path).exists() {
             return Some(path.to_string());
         }
     }
-    
+
     // Fallback: try which command
     if let Ok(output) = Command::new("which").arg("smartctl").output() {
         if output.status.success() {
@@ -766,7 +732,7 @@ fn get_smartctl_path() -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
@@ -775,13 +741,13 @@ fn get_smartctl_path() -> Option<String> {
 fn write_text_file(path: String, content: String) -> Result<(), String> {
     use std::fs::File;
     use std::io::Write;
-    
+
     let mut file = File::create(&path)
         .map_err(|e| format!("Datei konnte nicht erstellt werden: {}", e))?;
-    
+
     file.write_all(content.as_bytes())
         .map_err(|e| format!("Schreibfehler: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -795,14 +761,14 @@ fn check_paragon_drivers() -> serde_json::Value {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("UFSD_NTFS"))
         .unwrap_or(false);
-    
+
     // Check for Paragon extFS driver (UFSD_EXTFS)
     let extfs_installed = Command::new("diskutil")
         .args(["listFilesystems"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("UFSD_EXTFS"))
         .unwrap_or(false);
-    
+
     serde_json::json!({
         "ntfs": ntfs_installed,
         "extfs": extfs_installed
@@ -823,13 +789,13 @@ fn get_e2fsprogs_path() -> Option<String> {
         "/usr/local/sbin/e2label",                    // Manual install
         "/usr/sbin/e2label",                          // System path
     ];
-    
+
     for path in paths {
         if std::path::Path::new(path).exists() {
             return Some(path.to_string());
         }
     }
-    
+
     // Try which command as fallback
     if let Ok(output) = Command::new("which").arg("e2label").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -838,7 +804,7 @@ fn get_e2fsprogs_path() -> Option<String> {
             return Some(path.to_string());
         }
     }
-    
+
     None
 }
 
@@ -849,24 +815,24 @@ fn check_dependencies() -> serde_json::Value {
     let smartctl = get_smartctl_path().is_some();
     let e2fsprogs = get_e2fsprogs_path().is_some();
     let python3 = get_python3_path().is_some();
-    
+
     // Check if Homebrew is installed
     let homebrew_installed = std::path::Path::new("/opt/homebrew/bin/brew").exists()
         || std::path::Path::new("/usr/local/bin/brew").exists();
-    
+
     // Build missing packages list
     let mut missing_brew_packages = Vec::new();
     if !smartctl { missing_brew_packages.push("smartmontools"); }
     if !e2fsprogs { missing_brew_packages.push("e2fsprogs"); }
     if !python3 { missing_brew_packages.push("python"); }
-    
+
     // Build install command
     let install_command: Option<String> = if !missing_brew_packages.is_empty() {
         Some(format!("brew install {}", missing_brew_packages.join(" ")))
     } else {
         None
     };
-    
+
     serde_json::json!({
         "smartmontools": smartctl,
         "e2fsprogs": e2fsprogs,
@@ -886,12 +852,12 @@ fn get_smart_data(disk_id: String) -> SmartData {
     if let Some(data) = try_smartctl(&disk_id) {
         return data;
     }
-    
+
     // Fallback: Try to get basic info from diskutil (limited but always available)
     if let Some(data) = try_diskutil_smart(&disk_id) {
         return data;
     }
-    
+
     // No SMART data available
     SmartData::not_available("SMART data not available for this device. USB sticks and SD cards typically do not support SMART. For USB hard drives, you can install 'smartmontools' (brew install smartmontools).")
 }
@@ -947,7 +913,7 @@ impl SmartData {
             total_lbas_read: None,
         }
     }
-    
+
     /// Create basic SmartData with health status
     fn basic(health_status: String, source: &str, error_message: Option<&str>) -> Self {
         SmartData {
@@ -1003,23 +969,23 @@ impl SmartData {
 fn try_smartctl(disk_id: &str) -> Option<SmartData> {
     // Get smartctl path
     let smartctl_path = get_smartctl_path()?;
-    
+
     let device_path = format!("/dev/{}", disk_id);
     #[cfg(debug_assertions)] eprintln!("[SMART Debug] Checking disk: {} with smartctl: {}", device_path, smartctl_path);
-    
+
     // First, quick check if SMART is supported at all (fast command)
     let info_output = Command::new(&smartctl_path)
         .args(["-i", &device_path])
         .output()
         .ok()?;
-    
+
     let info_text = String::from_utf8_lossy(&info_output.stdout);
     let info_stderr = String::from_utf8_lossy(&info_output.stderr);
-    
+
     #[cfg(debug_assertions)] eprintln!("[SMART Debug] -i output contains 'SMART support': {}", info_text.contains("SMART support is:"));
-    
+
     // Check for common indicators that SMART is not supported
-    if info_text.contains("Unknown USB bridge") 
+    if info_text.contains("Unknown USB bridge")
         || info_text.contains("Device type: unknown")
         || info_stderr.contains("Unable to detect device type")
         || info_stderr.contains("Unknown USB bridge")
@@ -1027,147 +993,147 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
         #[cfg(debug_assertions)] eprintln!("[SMART Debug] SMART not supported (early check failed)");
         return None;
     }
-    
+
     // Check if SMART is explicitly unavailable
-    if info_text.contains("SMART support is: Unavailable") 
+    if info_text.contains("SMART support is: Unavailable")
         || info_text.contains("Device does not support SMART") {
         #[cfg(debug_assertions)] eprintln!("[SMART Debug] SMART explicitly unavailable");
         return None;
     }
-    
+
     #[cfg(debug_assertions)] eprintln!("[SMART Debug] Running smartctl -x -j ...");
-    
+
     // Run smartctl -x -j (extended info with JSON output) for full data
     let output = Command::new(&smartctl_path)
         .args(["-x", "-j", &device_path])
         .output()
         .ok()?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     #[cfg(debug_assertions)] eprintln!("[SMART Debug] Got {} bytes of JSON output", stdout.len());
-    
+
     // Parse JSON output
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
         #[cfg(debug_assertions)] eprintln!("[SMART Debug] JSON parsed successfully");
-        
+
         // Check if device type is recognized
         let device_type_val = json.get("device").and_then(|d| d.get("type")).and_then(|t| t.as_str());
         if device_type_val == Some("unknown") {
             #[cfg(debug_assertions)] eprintln!("[SMART Debug] Device type is unknown");
             return None;
         }
-        
+
         // Basic health status
         let smart_status = json.get("smart_status")
             .and_then(|s| s.get("passed"))
             .and_then(|p| p.as_bool());
-        
+
         let health_status = match smart_status {
             Some(true) => "PASSED ✅".to_string(),
             Some(false) => "FAILED ❌".to_string(),
             None => "Unbekannt".to_string(),
         };
-        
+
         // Temperature (check multiple sources)
         let temperature = json.get("temperature")
             .and_then(|t| t.get("current"))
             .and_then(|c| c.as_i64())
             .map(|t| t as i32);
-        
+
         let power_on_hours = json.get("power_on_time")
             .and_then(|p| p.get("hours"))
             .and_then(|h| h.as_u64());
-        
+
         let power_cycle_count = json.get("power_cycle_count")
             .and_then(|p| p.as_u64());
-        
+
         // Extended device info
         let model_family = json.get("model_family").and_then(|v| v.as_str()).map(|s| s.to_string());
         let device_model = json.get("model_name").and_then(|v| v.as_str()).map(|s| s.to_string());
         let serial_number = json.get("serial_number").and_then(|v| v.as_str()).map(|s| s.to_string());
         let firmware_version = json.get("firmware_version").and_then(|v| v.as_str()).map(|s| s.to_string());
-        
+
         let user_capacity_bytes = json.get("user_capacity")
             .and_then(|c| c.get("bytes"))
             .and_then(|b| b.as_u64());
-        
+
         let logical_block_size = json.get("logical_block_size")
             .and_then(|b| b.as_u64())
             .map(|b| b as u32);
-        
+
         let physical_block_size = json.get("physical_block_size")
             .and_then(|b| b.as_u64())
             .map(|b| b as u32);
-        
+
         let rotation_rate = json.get("rotation_rate")
             .and_then(|r| r.as_u64())
             .map(|r| r as u32);
-        
+
         let form_factor = json.get("form_factor")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
             .map(|s| s.to_string());
-        
+
         let device_type = json.get("device")
             .and_then(|d| d.get("type"))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string());
-        
+
         let protocol = json.get("device")
             .and_then(|d| d.get("protocol"))
             .and_then(|p| p.as_str())
             .map(|s| s.to_string());
-        
+
         // ATA/SATA versions
         let ata_version = json.get("ata_version")
             .and_then(|v| v.get("string"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
-        
+
         let sata_version = json.get("sata_version")
             .and_then(|v| v.get("string"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
-        
+
         // Interface speed
         let interface_speed_max = json.get("interface_speed")
             .and_then(|i| i.get("max"))
             .and_then(|m| m.get("string"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
-        
+
         let interface_speed_current = json.get("interface_speed")
             .and_then(|i| i.get("current"))
             .and_then(|c| c.get("string"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
-        
+
         // SMART capabilities
         let smart_enabled = json.get("smart_support")
             .and_then(|s| s.get("enabled"))
             .and_then(|e| e.as_bool());
-        
+
         let read_lookahead_enabled = json.get("read_lookahead")
             .and_then(|r| r.get("enabled"))
             .and_then(|e| e.as_bool());
-        
+
         let write_cache_enabled = json.get("write_cache")
             .and_then(|w| w.get("enabled"))
             .and_then(|e| e.as_bool());
-        
+
         let trim_supported = json.get("trim")
             .and_then(|t| t.get("supported"))
             .and_then(|s| s.as_bool());
-        
+
         // ATA Security
         let ata_security_enabled = json.get("ata_security")
             .and_then(|a| a.get("enabled"))
             .and_then(|e| e.as_bool());
-        
+
         let ata_security_frozen = json.get("ata_security")
             .and_then(|a| a.get("frozen"))
             .and_then(|f| f.as_bool());
-        
+
         // SCT Temperature data (more detailed than basic temperature)
         let sct_temp = json.get("ata_sct_status").and_then(|s| s.get("temperature"));
         let sct_temperature_current = sct_temp
@@ -1186,7 +1152,7 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
             .and_then(|t| t.get("op_limit_max"))
             .and_then(|m| m.as_i64())
             .map(|t| t as i32);
-        
+
         // Self-test info
         let self_test_status = json.get("ata_smart_data")
             .and_then(|d| d.get("self_test"))
@@ -1194,43 +1160,43 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
             .and_then(|st| st.get("string"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
-        
+
         let self_test_short_minutes = json.get("ata_smart_data")
             .and_then(|d| d.get("self_test"))
             .and_then(|s| s.get("polling_minutes"))
             .and_then(|p| p.get("short"))
             .and_then(|s| s.as_u64())
             .map(|m| m as u32);
-        
+
         let self_test_extended_minutes = json.get("ata_smart_data")
             .and_then(|d| d.get("self_test"))
             .and_then(|s| s.get("polling_minutes"))
             .and_then(|p| p.get("extended"))
             .and_then(|e| e.as_u64())
             .map(|m| m as u32);
-        
+
         // Error logs
         let error_log_count = json.get("ata_smart_error_log")
             .and_then(|e| e.get("summary"))
             .and_then(|s| s.get("count"))
             .and_then(|c| c.as_u64())
             .map(|c| c as u32);
-        
+
         let self_test_log_count = json.get("ata_smart_self_test_log")
             .and_then(|l| l.get("standard"))
             .and_then(|s| s.get("count"))
             .and_then(|c| c.as_u64())
             .map(|c| c as u32);
-        
+
         // SSD-specific: endurance and spare
         let endurance_used_percent = json.get("endurance_used")
             .and_then(|e| e.as_u64())
             .map(|e| e as u32);
-        
+
         let spare_available_percent = json.get("spare_available")
             .and_then(|s| s.as_u64())
             .map(|s| s as u32);
-        
+
         // Parse SMART attributes with extended fields
         let mut attributes = Vec::new();
         let mut reallocated_sectors = None;
@@ -1238,7 +1204,7 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
         let mut uncorrectable_sectors = None;
         let mut total_lbas_written: Option<u64> = None;
         let mut total_lbas_read: Option<u64> = None;
-        
+
         if let Some(attrs) = json.get("ata_smart_attributes").and_then(|a| a.get("table")).and_then(|t| t.as_array()) {
             for attr in attrs {
                 let id = attr.get("id").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
@@ -1247,17 +1213,17 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
                 let worst = attr.get("worst").and_then(|w| w.as_u64()).map(|w| w.to_string());
                 let threshold = attr.get("thresh").and_then(|t| t.as_u64()).map(|t| t.to_string());
                 let raw_value = attr.get("raw").and_then(|r| r.get("value")).and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or("-".to_string());
-                
+
                 // Extended attribute flags
                 let flags = attr.get("flags")
                     .and_then(|f| f.get("string"))
                     .and_then(|s| s.as_str())
                     .map(|s| s.trim().to_string());
-                
+
                 let prefailure = attr.get("flags")
                     .and_then(|f| f.get("prefailure"))
                     .and_then(|p| p.as_bool());
-                
+
                 // Check for critical attributes and extract special values
                 let raw = attr.get("raw").and_then(|r| r.get("value")).and_then(|v| v.as_u64()).unwrap_or(0);
                 let status = match id {
@@ -1286,7 +1252,7 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
                     },
                     _ => "ok".to_string()
                 };
-                
+
                 attributes.push(SmartAttribute {
                     id,
                     name,
@@ -1300,7 +1266,7 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
                 });
             }
         }
-        
+
         return Some(SmartData {
             available: true,
             health_status,
@@ -1350,15 +1316,15 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
             total_lbas_read,
         });
     }
-    
+
     // Try plain text parsing if JSON fails
     let output_text = Command::new(&smartctl_path)
         .args(["-H", "-A", &device_path])
         .output()
         .ok()?;
-    
+
     let text = String::from_utf8_lossy(&output_text.stdout);
-    
+
     if text.contains("SMART support is:") && !text.contains("Unavailable") {
         let health_status = if text.contains("PASSED") {
             "PASSED ✅".to_string()
@@ -1367,14 +1333,14 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
         } else {
             "Unbekannt".to_string()
         };
-        
+
         return Some(SmartData::basic(
             health_status,
             "smartctl",
             Some("Detailed SMART data could not be read.")
         ));
     }
-    
+
     None
 }
 
@@ -1384,19 +1350,19 @@ fn try_diskutil_smart(disk_id: &str) -> Option<SmartData> {
         .args(["info", disk_id])
         .output()
         .ok()?;
-    
+
     let text = String::from_utf8_lossy(&output.stdout);
-    
+
     // Check if SMART Status is present
     for line in text.lines() {
         if line.contains("SMART Status:") {
             let status = line.split(':').nth(1)?.trim();
-            
+
             // "Not Supported" means SMART is not available for this device
             if status.contains("Not Supported") || status.contains("not supported") {
                 return None;
             }
-            
+
             let health_status = if status.contains("Verified") || status.contains("OK") {
                 "PASSED ✅".to_string()
             } else if status.contains("Fail") {
@@ -1404,7 +1370,7 @@ fn try_diskutil_smart(disk_id: &str) -> Option<SmartData> {
             } else {
                 status.to_string()
             };
-            
+
             return Some(SmartData::basic(
                 health_status,
                 "diskutil",
@@ -1412,12 +1378,12 @@ fn try_diskutil_smart(disk_id: &str) -> Option<SmartData> {
             ));
         }
     }
-    
+
     None
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_diagnose_progress(app: &AppHandle, percent: u32, status: &str, phase: &str, 
+fn emit_diagnose_progress(app: &AppHandle, percent: u32, status: &str, phase: &str,
     sectors_checked: u64, errors_found: u64, read_speed: f64, write_speed: f64) {
     let _ = app.emit("diagnose_progress", DiagnoseProgressEvent {
         percent,
@@ -1427,679 +1393,83 @@ fn emit_diagnose_progress(app: &AppHandle, percent: u32, status: &str, phase: &s
         errors_found,
         read_speed_mbps: read_speed,
         write_speed_mbps: write_speed,
-        operation_id: CURRENT_OPERATION_ID.load(Ordering::SeqCst),
+        operation_id: operations::current_id(),
+        details:None,
     });
 }
 
-/// Parse dd output to extract bytes transferred and time in seconds
-/// dd outputs: "8388608 bytes transferred in 0.5 secs (16777216 bytes/sec)"
-/// Returns (bytes, seconds) or None if parsing fails
-fn parse_dd_bytes_and_time(output: &str) -> Option<(u64, f64)> {
-    // Look for "X bytes transferred in Y secs" pattern
-    if let Some(bytes_pos) = output.find(" bytes transferred in ") {
-        let before_bytes = &output[..bytes_pos];
-        let bytes_str = before_bytes.split_whitespace().last()?;
-        let bytes: u64 = bytes_str.parse().ok()?;
-        
-        let after_in = &output[bytes_pos + 22..];
-        let time_str = after_in.split_whitespace().next()?;
-        let time: f64 = time_str.parse().ok()?;
-        
-        if time > 0.0 && bytes > 0 {
-            return Some((bytes, time));
-        }
-    }
-    
-    None
-}
-
-/// Surface scan - read all sectors and detect read errors (non-destructive)
-#[tauri::command]
-async fn diagnose_surface_scan(app: AppHandle, disk_id: String, password: String) -> Result<DiagnoseResult, String> {
+/// Destructive two-pattern, full-byte validation.
+async fn run_diagnostic(app: AppHandle, disk_id: String, password: String, full: bool) -> Result<DiagnoseResult, String> {
+    let guard = start_operation(&disk_id)?;
     CANCEL_DIAGNOSE.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    
-    // Nur-lesende Operation: Kennung pruefen, damit keine Metazeichen in die
-    // privilegierten dd-Kommandos gelangen (diese laufen als root).
-    if !is_valid_disk_id(&disk_id) {
-        return Err("Invalid disk identifier".to_string());
-    }
-    let device_path = format!("/dev/r{}", disk_id);
-    
-    // First unmount all partitions and verify (K5)
-    ensure_disk_unmounted(&app, &disk_id)?;
-    
-    // Get disk size
-    let size_output = Command::new("diskutil").args(["info", "-plist", &disk_id]).output()
-        .map_err(|e| format!("Failed to get disk info: {}", e))?;
-    let plist = String::from_utf8_lossy(&size_output.stdout);
-    let total_bytes = extract_plist_value(&plist, "TotalSize")
-        .ok_or("Failed to get disk size")?;
-    
-    const BLOCK_SIZE: u64 = 16 * 1024 * 1024; // 16MB blocks for better performance
-    let total_blocks = total_bytes.div_ceil(BLOCK_SIZE);
-    let total_sectors = total_bytes / 512;
-    
-    emit_diagnose_progress(&app, 0, "Starting surface scan...", "reading", 0, 0, 0.0, 0.0);
-    
-    // Run in blocking thread to avoid freezing UI
-    let app_clone = app.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut sectors_checked: u64 = 0;
-        let mut errors_found: u64 = 0;
-        let bad_sectors: Vec<u64> = Vec::new();
-        let start_time = std::time::Instant::now();
-        let mut bytes_read: u64 = 0;
-        
-        // Read using dd with sudo - use larger blocks for speed
-        for block in 0..total_blocks {
-            if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                return DiagnoseResult {
-                    success: false,
-                    total_sectors,
-                    sectors_checked,
-                    errors_found,
-                    bad_sectors,
-                    read_speed_mbps: 0.0,
-                    write_speed_mbps: 0.0,
-                    message: "Scan cancelled".to_string(),
-                };
+    app.emit("operation_start", guard.id).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        if !is_valid_disk_id(&disk_id) { return Err("Invalid disk identifier".into()); }
+        if full { ensure_writable_target(&disk_id)?; }
+        let size = get_disk_size(&disk_id)?;
+        ensure_disk_unmounted(&app, &disk_id)?;
+        let cfg = serde_json::json!({"mode":if full {"full"} else {"surface"},
+            "device":format!("/dev/r{disk_id}"), "size":size});
+        let mut read_seconds = 0.0f64;
+        let mut write_seconds = 0.0f64;
+        let mut checked = 0;
+        let mut read_bytes = 0;
+        let mut write_bytes = 0;
+        let result = process_runner::run(&cfg, Some(&password), &CANCEL_DIAGNOSE, |line| {
+            let fields: Vec<_> = line.split(':').collect();
+            if fields.len() == 4 && fields[0] == "TIMING" {
+                let seconds = fields[3].parse::<f64>().unwrap_or(0.0);
+                if fields[1] == "read" { read_seconds += seconds; } else { write_seconds += seconds; }
+                return;
             }
-            
-            // Use dd to read 16MB at a time with sudo
-            let dd_cmd = format!(
-                "dd if={} bs=16m skip={} count=1 2>/dev/null | wc -c",
-                device_path,
-                block
-            );
-            
-            let result = sudo_sh(&password, &dd_cmd);
-            
-            match result {
-                Ok(output) => {
-                    let bytes_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let read_bytes: u64 = bytes_str.parse().unwrap_or(0);
-                    if read_bytes > 0 {
-                        bytes_read += read_bytes;
-                        sectors_checked += read_bytes / 512;
-                    } else {
-                        errors_found += 1;
-                    }
-                }
-                Err(_) => {
-                    errors_found += 1;
-                }
-            }
-            
-            let percent = ((block + 1) * 100 / total_blocks) as u32;
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let read_speed = if elapsed > 0.0 { (bytes_read as f64 / 1024.0 / 1024.0) / elapsed } else { 0.0 };
-            
-            // Update progress every block (since blocks are now 16MB)
-            let status = format!("Reading {:.0} MB / {:.0} MB", bytes_read as f64 / 1024.0 / 1024.0, total_bytes as f64 / 1024.0 / 1024.0);
-            emit_diagnose_progress(&app_clone, percent.min(99), &status, "reading", sectors_checked, errors_found, read_speed, 0.0);
-        }
-        
-        let elapsed = start_time.elapsed().as_secs_f64();
-        let read_speed = if elapsed > 0.0 { (bytes_read as f64 / 1024.0 / 1024.0) / elapsed } else { 0.0 };
-        
-        let message = if errors_found == 0 {
-            format!("Surface scan complete. No errors found. Read speed: {:.1} MB/s", read_speed)
-        } else {
-            format!("Surface scan complete. {} errors found!", errors_found)
-        };
-        
-        emit_diagnose_progress(&app_clone, 100, &message, "complete", sectors_checked, errors_found, read_speed, 0.0);
-        
-        DiagnoseResult {
-            success: errors_found == 0,
-            total_sectors,
-            sectors_checked,
-            errors_found,
-            bad_sectors,
-            read_speed_mbps: read_speed,
-            write_speed_mbps: 0.0,
-            message,
-        }
-    }).await.map_err(|e| e.to_string())?;
-    
-    Ok(result)
+            if fields.len() != 4 || fields[0] != "DIAG" { return; }
+            let bytes = fields[1].parse::<u64>().unwrap_or(0);
+            let writing = fields[2] == "write";
+            let second = fields[3] == "255";
+            let phase = if full { (if second {2} else {0}) + if writing {0} else {1} } else {0};
+            let fraction = bytes as f64 / size as f64;
+            let percent = (((phase as f64 + fraction) / if full {4.0} else {1.0}) * 100.0) as u32;
+            if writing { write_bytes = bytes + if second {size} else {0}; }
+            else { read_bytes = bytes + if second {size} else {0}; checked = bytes / 512; }
+            emit_diagnose_progress(&app, percent, &format!("{}: {bytes}/{size} Bytes", fields[2]),
+                if writing {"writing"} else {"reading"}, checked, 0, 0.0, 0.0);
+        });
+        let _ = Command::new("diskutil").args(["mountDisk", &disk_id]).output();
+        result?;
+        Ok(DiagnoseResult { success:true, total_sectors:size/512, sectors_checked:size/512,
+            errors_found:0, bad_sectors:Vec::new(), read_speed_mbps:read_bytes as f64 / read_seconds.max(0.000001) / 1048576.0,
+            write_speed_mbps:write_bytes as f64 / write_seconds.max(0.000001) / 1048576.0, message:"Alle angeforderten Bytes geprüft.".into(), details:None })
+    }).await.map_err(|e| e.to_string())?
 }
-
-/// Full test - write patterns and verify (destructive!)
+#[tauri::command]
+async fn diagnose_surface_scan(app: AppHandle, disk_id: String, password: String, sampled: Option<bool>) -> Result<DiagnoseResult, String> {
+    diagnostics::run(app, disk_id, password, if sampled.unwrap_or(false) {"sample"} else {"surface"}, "quick").await
+}
 #[tauri::command]
 async fn diagnose_full_test(app: AppHandle, disk_id: String, password: String) -> Result<DiagnoseResult, String> {
-    CANCEL_DIAGNOSE.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    
-    // Schreibende Operation: Kennung und Zieleignung pruefen.
-    ensure_writable_target(&disk_id)?;
-    // Use rdisk for raw device access (like speed test)
-    let device_path = format!("/dev/r{}", disk_id);
-    
-    // Unmount all partitions and verify (K5)
-    ensure_disk_unmounted(&app, &disk_id)?;
-    
-    // Get disk size
-    let size_output = Command::new("diskutil").args(["info", "-plist", &disk_id]).output()
-        .map_err(|e| format!("Failed to get disk info: {}", e))?;
-    let plist = String::from_utf8_lossy(&size_output.stdout);
-    let total_bytes = extract_plist_value(&plist, "TotalSize")
-        .ok_or("Failed to get disk size")?;
-    
-    const BLOCK_SIZE: u64 = 64 * 1024 * 1024; // 64MB blocks for maximum throughput
-    let total_blocks = total_bytes / BLOCK_SIZE;
-    let total_sectors = total_bytes / 512;
-    
-    emit_diagnose_progress(&app, 0, "Starting full test...", "writing", 0, 0, 0.0, 0.0);
-    
-    // Run in blocking thread
-    let app_clone = app.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // Test patterns - reduced to 2 for speed (0x00 and 0xFF catch most errors)
-        let patterns: [(u8, &str); 2] = [
-            (0x00, "zeros"),
-            (0xFF, "ones"),
-        ];
-        
-        let mut sectors_checked: u64 = 0;
-        let mut errors_found: u64 = 0;
-        let bad_sectors: Vec<u64> = Vec::new();
-        let mut total_write_time: f64 = 0.0;
-        let mut total_read_time: f64 = 0.0;
-        let mut total_write_bytes: u64 = 0;
-        let mut total_read_bytes: u64 = 0;
-        
-        for (pattern_idx, (pattern, pattern_name)) in patterns.iter().enumerate() {
-            if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                return DiagnoseResult {
-                    success: false,
-                    total_sectors,
-                    sectors_checked,
-                    errors_found,
-                    bad_sectors,
-                    read_speed_mbps: 0.0,
-                    write_speed_mbps: 0.0,
-                    message: "Test cancelled".to_string(),
-                };
-            }
-            
-            // Create temp file with pattern
-            let temp_pattern = format!("/tmp/burniso_pattern_{:02X}.bin", pattern);
-            let write_buffer: Vec<u8> = vec![*pattern; BLOCK_SIZE as usize];
-            if let Ok(mut tf) = File::create(&temp_pattern) {
-                let _ = tf.write_all(&write_buffer);
-            }
-            
-            // Write phase
-            let write_start = std::time::Instant::now();
-            
-            for block in 0..total_blocks {
-                if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                    let _ = std::fs::remove_file(&temp_pattern);
-                    return DiagnoseResult {
-                        success: false,
-                        total_sectors,
-                        sectors_checked,
-                        errors_found,
-                        bad_sectors,
-                        read_speed_mbps: 0.0,
-                        write_speed_mbps: 0.0,
-                        message: "Test cancelled".to_string(),
-                    };
-                }
-                
-                // dd write command with 64MB blocks
-                let dd_cmd = format!(
-                    "dd if={} of={} bs=64m seek={} count=1 conv=notrunc 2>/dev/null",
-                    temp_pattern,
-                    device_path,
-                    block
-                );
-                
-                if sudo_sh(&password, &dd_cmd).is_ok() {
-                    total_write_bytes += BLOCK_SIZE;
-                }
-                
-                // Update GUI every block
-                // Total: 4 phases (2 patterns × write + verify), each phase = 25%
-                // Pattern 0 Write: 0-25%, Pattern 0 Verify: 25-50%
-                // Pattern 1 Write: 50-75%, Pattern 1 Verify: 75-100%
-                let phase_progress = (block + 1) as f64 / total_blocks as f64; // 0.0 to 1.0
-                let base_percent = (pattern_idx * 50) as f64;
-                let percent = (base_percent + phase_progress * 25.0) as u32;
-                let status = format!("Writing {} ({}/{})", pattern_name, block + 1, total_blocks);
-                emit_diagnose_progress(&app_clone, percent.min(99), &status, "writing", sectors_checked, errors_found, 0.0, 0.0);
-            }
-            
-            total_write_time += write_start.elapsed().as_secs_f64();
-            let _ = Command::new("sync").output();
-            
-            // Verify phase using dd
-            let read_start = std::time::Instant::now();
-            
-            for block in 0..total_blocks {
-                if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                    let _ = std::fs::remove_file(&temp_pattern);
-                    break;
-                }
-                
-                // Read block using dd - just check first byte for speed
-                let dd_read = format!(
-                    "dd if={} bs=64m skip={} count=1 2>/dev/null | head -c 1 | xxd -p",
-                    device_path,
-                    block
-                );
-                
-                let result = sudo_sh(&password, &dd_read);
-                
-                match result {
-                    Ok(output) => {
-                        let hex = String::from_utf8_lossy(&output.stdout);
-                        // Check if pattern matches (first bytes should be pattern)
-                        let expected = format!("{:02x}", pattern);
-                        if !hex.is_empty() {
-                            total_read_bytes += BLOCK_SIZE;
-                            sectors_checked += BLOCK_SIZE / 512;
-                            if !hex.starts_with(&expected) && !hex.starts_with(&expected.to_uppercase()) {
-                                errors_found += 1;
-                            }
-                        } else {
-                            errors_found += 1;
-                        }
-                    }
-                    Err(_) => {
-                        errors_found += 1;
-                    }
-                }
-                
-                // Update GUI every block
-                // Pattern 0 Verify: 25-50%, Pattern 1 Verify: 75-100%
-                let phase_progress = (block + 1) as f64 / total_blocks as f64;
-                let base_percent = (pattern_idx * 50 + 25) as f64;
-                let percent = (base_percent + phase_progress * 25.0) as u32;
-                let status = format!("Verifying {} ({}/{})", pattern_name, block + 1, total_blocks);
-                emit_diagnose_progress(&app_clone, percent.min(99), &status, "verifying", sectors_checked, errors_found, 0.0, 0.0);
-            }
-            
-            total_read_time += read_start.elapsed().as_secs_f64();
-            let _ = std::fs::remove_file(&temp_pattern);
-        }
-        
-        let write_speed = if total_write_time > 0.0 { (total_write_bytes as f64 / 1024.0 / 1024.0) / total_write_time } else { 0.0 };
-        let read_speed = if total_read_time > 0.0 { (total_read_bytes as f64 / 1024.0 / 1024.0) / total_read_time } else { 0.0 };
-        
-        let message = if errors_found == 0 {
-            format!("Full test complete. No errors. Write: {:.1} MB/s, Read: {:.1} MB/s", write_speed, read_speed)
-        } else {
-            format!("Full test complete. {} errors found!", errors_found)
-        };
-        
-        emit_diagnose_progress(&app_clone, 100, &message, "complete", sectors_checked, errors_found, read_speed, write_speed);
-        
-        DiagnoseResult {
-            success: errors_found == 0,
-            total_sectors,
-            sectors_checked,
-            errors_found,
-            bad_sectors,
-            read_speed_mbps: read_speed,
-            write_speed_mbps: write_speed,
-            message,
-        }
-    }).await.map_err(|e| e.to_string())?;
-    
-    Ok(result)
+    run_diagnostic(app, disk_id, password, true).await
 }
 
 /// Speed test - measure read and write performance (destructive for write!)
 #[tauri::command]
-async fn diagnose_speed_test(app: AppHandle, disk_id: String, password: String) -> Result<DiagnoseResult, String> {
-    CANCEL_DIAGNOSE.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    
-    // Schreibende Operation: Kennung und Zieleignung pruefen.
-    ensure_writable_target(&disk_id)?;
-    let device_path = format!("/dev/r{}", disk_id);
-    
-    // Show progress immediately
-    emit_diagnose_progress(&app, 0, "USB-Stick wird vorbereitet...", "preparing", 0, 0, 0.0, 0.0);
-    
-    // Unmount and verify (K5)
-    ensure_disk_unmounted(&app, &disk_id)?;
-    
-    emit_diagnose_progress(&app, 0, "Lese Disk-Informationen...", "preparing", 0, 0, 0.0, 0.0);
-    
-    // Get disk size
-    let size_output = Command::new("diskutil").args(["info", "-plist", &disk_id]).output()
-        .map_err(|e| format!("Failed to get disk info: {}", e))?;
-    let plist = String::from_utf8_lossy(&size_output.stdout);
-    let total_bytes = extract_plist_value(&plist, "TotalSize")
-        .ok_or("Failed to get disk size")?;
-    
-    // Test with different block sizes for accurate speed measurement
-    // Larger blocks = more realistic max speed, smaller blocks = more IO overhead
-    // Test ~10% of total disk capacity for meaningful results (min 100MB, max 50GB per test)
-    // For a 256GB drive, this means testing ~26GB total (split across 3 block sizes)
-    let test_percentage = 0.10; // 10% of disk capacity
-    let total_test_bytes = (total_bytes as f64 * test_percentage) as u64;
-    let per_test_bytes = total_test_bytes / 3; // Split across 3 block size tests
-    
-    // Minimum 100MB, maximum 50GB per test for practical limits
-    let min_test_bytes: u64 = 100 * 1024 * 1024;       // 100 MB minimum
-    let max_test_bytes: u64 = 50 * 1024 * 1024 * 1024; // 50 GB maximum
-    let capped_test_bytes = per_test_bytes.max(min_test_bytes).min(max_test_bytes);
-    
-    // Calculate block counts based on capped test size
-    let count_1m = capped_test_bytes / (1024 * 1024);    // blocks for 1MB test
-    let count_4m = capped_test_bytes / (4 * 1024 * 1024);    // blocks for 4MB test
-    let count_16m = capped_test_bytes / (16 * 1024 * 1024);  // blocks for 16MB test
-    
-    let block_sizes: [(u64, &str, u64); 3] = [
-        (1024 * 1024, "1m", count_1m.max(10)),     // At least 10 blocks
-        (4 * 1024 * 1024, "4m", count_4m.max(5)),      // At least 5 blocks
-        (16 * 1024 * 1024, "16m", count_16m.max(3)),   // At least 3 blocks
-    ];
-    let total_tests = block_sizes.len() as u32;
-    
-    // Calculate and log total test size for transparency
-    let total_test_size_mb = block_sizes.iter()
-        .map(|(bs, _, cnt)| (bs * cnt) / (1024 * 1024))
-        .sum::<u64>();
-    
-    // Format test size for display
-    let test_size_display = if total_test_size_mb >= 1024 {
-        format!("{:.1} GB", total_test_size_mb as f64 / 1024.0)
-    } else {
-        format!("{} MB", total_test_size_mb)
-    };
-    
-    emit_diagnose_progress(&app, 0, &format!("Starte Geschwindigkeitstest ({})...", test_size_display), "starting", 0, 0, 0.0, 0.0);
-    
-    // V6: password wird direkt in die Closure gemoved — kein clone nötig.
-    let app_clone = app.clone();
-    
-    // Run in blocking thread
-    let result = tokio::task::spawn_blocking(move || {
-        let mut all_results: Vec<(String, f64, f64)> = Vec::new();
-        let mut best_write = 0.0f64;
-        let mut best_read = 0.0f64;
-        
-        // Maximum blocks per chunk to show progress frequently
-        // With typical USB speeds (20-100 MB/s), 256MB chunks take 2-12 seconds
-        let max_mb_per_chunk: u64 = 256; // 256 MB max per chunk for visible progress
-        
-        for (test_idx, (block_size, bs_str, count)) in block_sizes.iter().enumerate() {
-            if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                return DiagnoseResult {
-                    success: false,
-                    total_sectors: total_bytes / 512,
-                    sectors_checked: 0,
-                    errors_found: 0,
-                    bad_sectors: Vec::new(),
-                    read_speed_mbps: best_read,
-                    write_speed_mbps: best_write,
-                    message: "Test abgebrochen".to_string(),
-                };
-            }
-            
-            let test_bytes = block_size * count;
-            let test_mb = test_bytes / 1024 / 1024;
-            let block_mb = block_size / 1024 / 1024;
-            let test_name = format!("{}MB Blöcke", block_mb);
-            
-            // Format test size for display (MB or GB)
-            let test_size_str = if test_mb >= 1024 {
-                format!("{:.1} GB", test_mb as f64 / 1024.0)
-            } else {
-                format!("{} MB", test_mb)
-            };
-            
-            // Calculate how many blocks per chunk (to show progress every ~256MB)
-            let blocks_per_chunk = (max_mb_per_chunk / block_mb).max(1);
-            let total_chunks = (*count as f64 / blocks_per_chunk as f64).ceil() as u64;
-            
-            // Calculate progress percentages for this test
-            let test_progress_start = ((test_idx as u32) * 100) / total_tests;
-            let test_progress_range = 100 / total_tests;
-            
-            // === WRITE TEST ===
-            emit_diagnose_progress(&app_clone, test_progress_start, 
-                &format!("Test {}/{}: {} - Schreibe {}...", test_idx + 1, total_tests, test_name, test_size_str), 
-                "writing", 0, 0, best_read, best_write);
-            
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            
-            // Write in chunks for visible progress
-            let mut total_write_bytes: u64 = 0;
-            let mut total_write_time: f64 = 0.0;
-            let mut blocks_written: u64 = 0;
-            let mut chunk_num: u64 = 0;
-            
-            while blocks_written < *count {
-                if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                    return DiagnoseResult {
-                        success: false,
-                        total_sectors: total_bytes / 512,
-                        sectors_checked: 0,
-                        errors_found: 0,
-                        bad_sectors: Vec::new(),
-                        read_speed_mbps: best_read,
-                        write_speed_mbps: best_write,
-                        message: "Test abgebrochen".to_string(),
-                    };
-                }
-                
-                let remaining = *count - blocks_written;
-                let chunk_blocks = remaining.min(blocks_per_chunk);
-                let offset_blocks = blocks_written;
-                
-                // Update progress before each chunk
-                let chunk_progress = test_progress_start + 
-                    ((chunk_num as u32 * test_progress_range / 2) / total_chunks.max(1) as u32);
-                let written_so_far_mb = (blocks_written * block_size) / (1024 * 1024);
-                let written_display = if written_so_far_mb >= 1024 {
-                    format!("{:.1} GB", written_so_far_mb as f64 / 1024.0)
-                } else {
-                    format!("{} MB", written_so_far_mb)
-                };
-                
-                emit_diagnose_progress(&app_clone, chunk_progress, 
-                    &format!("Test {}/{}: {} - Schreibe {} von {}...", 
-                        test_idx + 1, total_tests, test_name, written_display, test_size_str), 
-                    "writing", 0, 0, best_read, best_write);
-                
-                // Write chunk with seek to correct position
-                let dd_write = format!(
-                    "dd if=/dev/zero of={} bs={} count={} seek={} 2>&1",
-                    device_path,
-                    bs_str,
-                    chunk_blocks,
-                    offset_blocks
-                );
-                
-                let write_result = sudo_sh(&password, &dd_write);
-                
-                // Parse result and accumulate
-                if let Ok(output) = &write_result {
-                    let stdout_str = String::from_utf8_lossy(&output.stdout);
-                    let stderr_str = String::from_utf8_lossy(&output.stderr);
-                    let combined = format!("{}{}", stdout_str, stderr_str);
-                    
-                    // Parse bytes and time from dd output
-                    if let Some((bytes, secs)) = parse_dd_bytes_and_time(&combined) {
-                        total_write_bytes += bytes;
-                        total_write_time += secs;
-                    }
-                }
-                
-                blocks_written += chunk_blocks;
-                chunk_num += 1;
-            }
-            
-            // Calculate average write speed
-            let write_speed = if total_write_time > 0.0 {
-                (total_write_bytes as f64 / total_write_time) / (1024.0 * 1024.0)
-            } else {
-                0.0
-            };
-            
-            if write_speed > 0.0 {
-                best_write = best_write.max(write_speed);
-            }
-            
-            let mid_progress = test_progress_start + (test_progress_range / 2);
-            emit_diagnose_progress(&app_clone, mid_progress, 
-                &format!("Test {}/{}: {} - Schreiben: {:.1} MB/s", test_idx + 1, total_tests, test_name, write_speed), 
-                "writing", 0, 0, best_read, best_write);
-            
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            
-            // === READ TEST ===
-            emit_diagnose_progress(&app_clone, mid_progress, 
-                &format!("Test {}/{}: {} - Lese {}...", test_idx + 1, total_tests, test_name, test_size_str), 
-                "reading", 0, 0, best_read, best_write);
-            
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            
-            // Read in chunks for visible progress
-            let mut total_read_bytes: u64 = 0;
-            let mut total_read_time: f64 = 0.0;
-            let mut blocks_read: u64 = 0;
-            chunk_num = 0;
-            
-            while blocks_read < *count {
-                if CANCEL_DIAGNOSE.load(Ordering::SeqCst) {
-                    return DiagnoseResult {
-                        success: false,
-                        total_sectors: total_bytes / 512,
-                        sectors_checked: 0,
-                        errors_found: 0,
-                        bad_sectors: Vec::new(),
-                        read_speed_mbps: best_read,
-                        write_speed_mbps: best_write,
-                        message: "Test abgebrochen".to_string(),
-                    };
-                }
-                
-                let remaining = *count - blocks_read;
-                let chunk_blocks = remaining.min(blocks_per_chunk);
-                let offset_blocks = blocks_read;
-                
-                // Update progress before each chunk
-                let chunk_progress = mid_progress + 
-                    ((chunk_num as u32 * test_progress_range / 2) / total_chunks.max(1) as u32);
-                let read_so_far_mb = (blocks_read * block_size) / (1024 * 1024);
-                let read_display = if read_so_far_mb >= 1024 {
-                    format!("{:.1} GB", read_so_far_mb as f64 / 1024.0)
-                } else {
-                    format!("{} MB", read_so_far_mb)
-                };
-                
-                emit_diagnose_progress(&app_clone, chunk_progress, 
-                    &format!("Test {}/{}: {} - Lese {} von {}...", 
-                        test_idx + 1, total_tests, test_name, read_display, test_size_str), 
-                    "reading", 0, 0, best_read, best_write);
-                
-                // Read chunk with skip to correct position
-                let dd_read = format!(
-                    "dd if={} of=/dev/null bs={} count={} skip={} 2>&1",
-                    device_path,
-                    bs_str,
-                    chunk_blocks,
-                    offset_blocks
-                );
-                
-                let read_result = sudo_sh(&password, &dd_read);
-                
-                // Parse result and accumulate
-                if let Ok(output) = &read_result {
-                    let stdout_str = String::from_utf8_lossy(&output.stdout);
-                    let stderr_str = String::from_utf8_lossy(&output.stderr);
-                    let combined = format!("{}{}", stdout_str, stderr_str);
-                    
-                    if let Some((bytes, secs)) = parse_dd_bytes_and_time(&combined) {
-                        total_read_bytes += bytes;
-                        total_read_time += secs;
-                    }
-                }
-                
-                blocks_read += chunk_blocks;
-                chunk_num += 1;
-            }
-            
-            // Calculate average read speed
-            let read_speed = if total_read_time > 0.0 {
-                (total_read_bytes as f64 / total_read_time) / (1024.0 * 1024.0)
-            } else {
-                0.0
-            };
-            
-            if read_speed > 0.0 {
-                best_read = best_read.max(read_speed);
-            }
-            
-            // Store results
-            all_results.push((test_name.clone(), write_speed, read_speed));
-            
-            let end_progress = ((test_idx as u32 + 1) * 100) / total_tests;
-            emit_diagnose_progress(&app_clone, end_progress, 
-                &format!("Test {}/{}: {} - W: {:.1} / R: {:.1} MB/s", 
-                    test_idx + 1, total_tests, test_name, write_speed, read_speed), 
-                "testing", 0, 0, best_read, best_write);
-            
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        
-        // Final summary
-        let message = if all_results.iter().all(|(_, w, r)| *w == 0.0 && *r == 0.0) {
-            "Keine gültigen Testergebnisse. Möglicherweise fehlen Berechtigungen.".to_string()
-        } else {
-            let mut msg = String::from("Geschwindigkeitstest Ergebnisse:\n");
-            for (name, w, r) in &all_results {
-                msg.push_str(&format!("  {}: W {:.1}, R {:.1} MB/s\n", name, w, r));
-            }
-            msg.push_str(&format!("\nBeste Werte: W {:.1}, R {:.1} MB/s", best_write, best_read));
-            msg
-        };
-        
-        let success = best_write > 0.0 || best_read > 0.0;
-        
-        emit_diagnose_progress(&app_clone, 100, 
-            if success { "Test abgeschlossen!" } else { "Test fehlgeschlagen" }, 
-            "complete", 0, 0, best_read, best_write);
-        
-        DiagnoseResult {
-            success,
-            total_sectors: total_bytes / 512,
-            sectors_checked: 0,
-            errors_found: 0,
-            bad_sectors: Vec::new(),
-            read_speed_mbps: best_read,
-            write_speed_mbps: best_write,
-            message,
-        }
-    }).await.map_err(|e| e.to_string())?;
-    
-    Ok(result)
+async fn diagnose_speed_test(app: AppHandle, disk_id: String, password: String, profile: Option<String>) -> Result<DiagnoseResult, String> {
+    diagnostics::run(app, disk_id, password, "speed", profile.as_deref().unwrap_or("quick")).await
 }
 
 #[tauri::command]
 fn list_disks() -> Result<Vec<DiskInfo>, String> {
     // Strategy: Get external physical disks + internal removable media (like built-in SD card readers)
     // The built-in SD card reader is classified as "internal" but has "Removable Media: Removable"
-    
+
     let mut disks: Vec<DiskInfo> = Vec::new();
     let mut seen_disk_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    
+
     // First: Get external physical disks (USB drives, external SSDs, etc.)
     let external_output = Command::new("diskutil").args(["list", "external", "physical"]).output()
         .map_err(|e| format!("diskutil Fehler: {}", e))?;
     let external_stdout = String::from_utf8_lossy(&external_output.stdout);
-    
+
     for line in external_stdout.lines() {
         if line.starts_with("/dev/disk") {
             if let Some(caps) = regex_lite::Regex::new(r"/dev/(disk\d+)")
@@ -2116,12 +1486,12 @@ fn list_disks() -> Result<Vec<DiskInfo>, String> {
             }
         }
     }
-    
+
     // Second: Get internal physical disks and filter for removable media (SD cards)
     let internal_output = Command::new("diskutil").args(["list", "internal", "physical"]).output()
         .map_err(|e| format!("diskutil Fehler: {}", e))?;
     let internal_stdout = String::from_utf8_lossy(&internal_output.stdout);
-    
+
     for line in internal_stdout.lines() {
         if line.starts_with("/dev/disk") {
             if let Some(caps) = regex_lite::Regex::new(r"/dev/(disk\d+)")
@@ -2141,7 +1511,7 @@ fn list_disks() -> Result<Vec<DiskInfo>, String> {
             }
         }
     }
-    
+
     Ok(disks)
 }
 
@@ -2460,9 +1830,10 @@ fn get_disk_info(disk_id: String) -> Result<String, String> {
 
 #[tauri::command]
 fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
+    let _operation = start_operation(&disk_id)?;
     let supported_fs = ["APFS", "Apple_APFS", "HFS+", "Mac OS Extended", "FAT32", "ExFAT", "Apple_HFS", "MS-DOS", "msdos", "FAT16", "FAT12"];
     let iso_fs = ["ISO 9660", "cd9660", "ISO9660", "ISO", "UDF"];
-    
+
     // Hilfsfunktion um Partition/Disk zu prüfen (macOS-native Erkennung)
     let check_disk = |part_id: &str| -> Option<VolumeInfo> {
         let o = Command::new("diskutil").args(["info", "-plist", part_id]).output().ok()?;
@@ -2471,7 +1842,7 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
         let fs = extract_plist_string(&plist, "FilesystemName")
             .or_else(|| extract_plist_string(&plist, "FilesystemUserVisibleName"))
             .or_else(|| extract_plist_string(&plist, "Content")).unwrap_or_default();
-        
+
         if let Some(ref mp) = mount {
             if !mp.is_empty() && std::path::Path::new(mp).exists() {
                 let is_iso = iso_fs.iter().any(|s| fs.contains(s));
@@ -2496,7 +1867,7 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
         }
         None
     };
-    
+
     // Hilfsfunktion für raw filesystem detection (für nicht-gemountete Partitionen)
     let check_disk_raw = |part_id: &str| -> Option<VolumeInfo> {
         if let Some(detected) = detect_filesystem_from_device(part_id) {
@@ -2504,7 +1875,7 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
             let o = Command::new("diskutil").args(["info", "-plist", part_id]).output().ok()?;
             let plist = String::from_utf8_lossy(&o.stdout);
             let bytes = detected.total_bytes.or_else(|| extract_plist_value(&plist, "TotalSize"));
-            
+
             // Build filesystem display string with usage info
             let fs_display = if let (Some(used), Some(total)) = (detected.used_bytes, detected.total_bytes) {
                 format!("{} ({} / {} belegt)", detected.name, format_bytes(used), format_bytes(total))
@@ -2513,12 +1884,12 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
             } else {
                 detected.name.clone()
             };
-            
+
             let name = detected.label.unwrap_or_else(|| {
                 extract_plist_string(&plist, "VolumeName")
                     .unwrap_or_else(|| format!("{} Volume", detected.name))
             });
-            
+
             return Some(VolumeInfo {
                 identifier: part_id.to_string(),
                 mount_point: String::new(), // Not mounted
@@ -2529,16 +1900,16 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
         }
         None
     };
-    
+
     // Versuche zuerst, die Disk zu mounten (für ISO-Volumes, die nicht automatisch gemountet sind)
     // Das Mounten von ISO-Volumes braucht keine Root-Rechte
     let _ = Command::new("diskutil")
         .args(["mount", &disk_id])
         .output();
-    
+
     // Kurz warten, damit das Mount abgeschlossen ist
     std::thread::sleep(std::time::Duration::from_millis(300));
-    
+
     // Zuerst Partitionen prüfen (diskXsY)
     let output = Command::new("diskutil").args(["list", &disk_id]).output()
         .map_err(|e| format!("diskutil Fehler: {}", e))?;
@@ -2558,17 +1929,17 @@ fn get_volume_info(disk_id: String) -> Result<Option<VolumeInfo>, String> {
             }
         }
     }
-    
+
     // Falls keine Partition gefunden, die Hauptdisk selbst prüfen
     if let Some(info) = check_disk(&disk_id) {
         return Ok(Some(info));
     }
-    
+
     // Try raw detection on main disk (requires root - may not work without password)
     if let Some(info) = check_disk_raw(&disk_id) {
         return Ok(Some(info));
     }
-    
+
     Ok(None)
 }
 
@@ -2597,23 +1968,35 @@ async fn repair_disk(
     disk_id: String,
     password: String,
 ) -> Result<String, String> {
+    let guard = start_operation(&disk_id)?;
+    app.emit("operation_start", guard.id).ok();
     CANCEL_TOOLS.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        repair_disk_blocking(app, disk_id, password)
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn repair_disk_blocking(
+    app: AppHandle,
+    disk_id: String,
+    password: String,
+) -> Result<String, String> {
+
+
     // Veraendernde Operation: Kennung und Zieleignung pruefen.
     ensure_writable_target(&disk_id)?;
     let disk_path = format!("/dev/{}", disk_id);
-    
+
     emit_progress(&app, 5, "Starting disk repair...", "tools");
-    
+
     // Get list of partitions on this disk
     let diskutil_list = Command::new("diskutil")
         .args(["list", &disk_path])
         .output();
-    
+
     let mut partitions: Vec<String> = Vec::new();
-    
+
     if let Ok(output) = diskutil_list {
         let list_str = String::from_utf8_lossy(&output.stdout);
         for line in list_str.lines() {
@@ -2625,27 +2008,27 @@ async fn repair_disk(
             }
         }
     }
-    
+
     emit_progress(&app, 10, &format!("Found {} partition(s)", partitions.len()), "tools");
-    
+
     // If no partitions found, try repairing the whole disk
     if partitions.is_empty() {
         partitions.push(disk_id.clone());
     }
-    
+
     let mut all_results = Vec::new();
     let mut any_success = false;
     let partition_count = partitions.len();
-    
+
     for (idx, partition) in partitions.iter().enumerate() {
         let partition_path = format!("/dev/{}", partition);
         let progress_base = 15 + (idx as u32 * 70 / partition_count as u32);
-        
+
         // Check filesystem type for this partition
         let diskutil_info = Command::new("diskutil")
             .args(["info", &partition_path])
             .output();
-        
+
         let mut filesystem = String::new();
         if let Ok(output) = diskutil_info {
             let info_str = String::from_utf8_lossy(&output.stdout);
@@ -2656,70 +2039,29 @@ async fn repair_disk(
                 }
             }
         }
-        
+
         emit_progress(&app, progress_base, &format!("Repairing {} ({})...", partition, if filesystem.is_empty() { "Unknown" } else { &filesystem }), "tools");
-        
-        // Unmount first
-        let _ = Command::new("diskutil")
-            .args(["unmount", &partition_path])
-            .output();
-        
-        // V1: tokio::time::sleep im async-Kontext, blockiert keinen Tokio-Worker
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        
-        // Use repairVolume for partitions, repairDisk for whole disk
-        let repair_cmd = if partition.contains('s') {
-            format!("diskutil repairVolume {}", shell_quote(&partition_path))
-        } else {
-            format!("diskutil repairDisk {}", shell_quote(&partition_path))
-        };
-        
-        let mut child = Command::new("sudo")
-            .args(["-S", "sh", "-c", &repair_cmd])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Repair error: {}", e))?;
-        
-        // Send password
-        if let Some(ref mut stdin) = child.stdin {
-            writeln!(stdin, "{}", password).ok();
+
+        if CANCEL_TOOLS.load(Ordering::SeqCst) { return Err("Reparatur abgebrochen".into()); }
+        ensure_disk_unmounted(&app, &disk_id)?;
+        let repair_cmd = if partition == &disk_id { "repairDisk" } else { "repairVolume" };
+        let cfg = serde_json::json!({"mode":"command","script":
+            format!("/usr/sbin/diskutil {repair_cmd} {}", shell_quote(&partition_path))});
+        match process_runner::run(&cfg, Some(&password), &CANCEL_TOOLS, |_| {}) {
+            Ok(()) => { any_success = true; all_results.push(format!("✓ {partition}: OK")); }
+            Err(e) => { all_results.push(format!("✗ {partition}: {e}")); any_success = false; break; }
         }
-        drop(child.stdin.take());
-        
-        // Wait for completion
-        let output = child.wait_with_output().map_err(|e| format!("Wait error: {}", e))?;
-        
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}{}", stdout_str, stderr_str);
-        
-        // Check result
-        if output.status.success() || combined.contains("appears to be OK") || combined.contains("exit code is 0") {
-            any_success = true;
-            all_results.push(format!("✓ {}: OK", partition));
-        } else if combined.contains("repaired") {
-            any_success = true;
-            all_results.push(format!("✓ {}: Repaired", partition));
-        } else {
-            // Extract meaningful error
-            let error_line = combined.lines()
-                .find(|l| l.contains("Error") || l.contains("error") || l.contains("failed"))
-                .unwrap_or("Unknown error");
-            all_results.push(format!("✗ {}: {}", partition, error_line.trim()));
-        }
-        
+
         // Try to remount
         let _ = Command::new("diskutil")
             .args(["mount", &partition_path])
             .output();
     }
-    
+
     emit_progress(&app, 100, "Repair complete!", "tools");
-    
+
     let result_text = all_results.join("\n");
-    
+
     if any_success {
         Ok(format!("Repair completed:\n{}", result_text))
     } else {
@@ -2740,17 +2082,35 @@ async fn format_disk(
     encrypted: Option<bool>,
     encryption_password: Option<String>,
 ) -> Result<String, String> {
+    let guard = start_operation(&disk_id)?;
+    app.emit("operation_start", guard.id).ok();
+    CANCEL_TOOLS.store(false, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        format_disk_blocking(app, disk_id, filesystem, name, scheme, password, encrypted, encryption_password)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_disk_blocking(
+    app: AppHandle,
+    disk_id: String,
+    filesystem: String,
+    name: String,
+    scheme: String,
+    password: String,
+    encrypted: Option<bool>,
+    encryption_password: Option<String>,
+) -> Result<String, String> {
     // Loeschende Operation: Kennung und Zieleignung pruefen.
     ensure_writable_target(&disk_id)?;
-    CANCEL_TOOLS.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    
+
+
     let disk_path = format!("/dev/{}", disk_id);
     let is_encrypted = encrypted.unwrap_or(false);
     let is_ntfs = filesystem == "NTFS";
     let is_ext = filesystem == "ext2" || filesystem == "ext3" || filesystem == "ext4";
-    
+
     // Validate filesystem
     let fs_type = match (filesystem.as_str(), is_encrypted) {
         ("FAT32", _) => "MS-DOS FAT32",
@@ -2784,37 +2144,31 @@ async fn format_disk(
             filesystem
         ));
     }
-    
+
     // Validate scheme
     let scheme_type = match scheme.as_str() {
         "GPT" => "GPT",
         "MBR" => "MBR",
         _ => "GPT",
     };
-    
+
     // Sanitize volume name (FAT32 max 11 chars, no special chars)
     let safe_name: String = name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .take(11)
         .collect();
     let volume_name = if safe_name.is_empty() { "USB_STICK".to_string() } else { safe_name };
-    
+
     emit_progress(&app, 5, "Formatting USB drive...", "tools");
-    
-    // Force unmount first to release any locks (especially after secure erase)
-    let _ = Command::new("diskutil")
-        .args(["unmountDisk", "force", &disk_path])
-        .output();
-    
-    // Small delay to allow system to release device (V1: tokio::time::sleep)
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    
+
+    ensure_disk_unmounted(&app, &disk_id)?;
+
     // Build the format command
     // NTFS requires Paragon NTFS driver and uses eraseVolume with UFSD_NTFS
     // ext2/3/4 requires Paragon extFS driver and uses eraseVolume with UFSD_EXTFS
     // Other filesystems use eraseDisk
     let script = if is_ntfs {
-        // For NTFS with Paragon: 
+        // For NTFS with Paragon:
         // 1. Create a single partition disk with FAT32 first (simpler than ExFAT)
         // 2. Reformat the first partition (s1 or s2 depending on scheme) as NTFS
         // GPT creates disk#s2 as main partition, MBR creates disk#s1
@@ -2857,375 +2211,46 @@ async fn format_disk(
             fs_type, volume_name, scheme_type, disk_path
         )
     };
-    
-    // Start the format process
-    let mut child = Command::new("sudo")
-        .args(["-S", "sh", "-c", &script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Format error: {}", e))?;
-    
-    // Send password
-    if let Some(ref mut stdin) = child.stdin {
-        writeln!(stdin, "{}", password).ok();
-    }
-    drop(child.stdin.take());
-    
-    // Animate progress while waiting for completion
-    let mut progress = 10;
-    loop {
-        if CANCEL_TOOLS.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Format cancelled".to_string());
-        }
-        
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    emit_progress(&app, 95, "Mounting volume...", "tools");
-                    
-                    // Wait a moment for the system to recognize the new filesystem
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    
-                    // Mount the newly formatted disk
-                    let _ = Command::new("diskutil")
-                        .args(["mountDisk", &disk_path])
-                        .output();
 
-                    // Zweite Stufe der Verschluesselung. Erst jetzt existiert das
-                    // APFS-Volume, das verschluesselt werden kann.
-                    if is_encrypted {
-                        emit_progress(&app, 97, "Verschlüsselung wird gestartet...", "tools");
-                        let enc_pass = encryption_password.clone().unwrap_or_default();
-                        let volume = find_apfs_volume(&disk_id)?;
-                        encrypt_apfs_volume(&volume, &enc_pass)?;
-                        emit_progress(&app, 100, "Format complete!", "tools");
-                        return Ok(format!(
-                            "USB verschlüsselt als APFS formatiert ({}). \
-                             Die Verschlüsselung läuft im Hintergrund weiter.",
-                            volume_name
-                        ));
-                    }
-                    
-                    // Additional wait and retry mount for FAT32/exFAT/NTFS/ext which sometimes need it
-                    if filesystem == "FAT32" || filesystem == "ExFAT" || filesystem == "NTFS" 
-                        || filesystem == "ext2" || filesystem == "ext3" || filesystem == "ext4" {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        // Try mounting specific partitions
-                        let partition_suffix = if scheme_type == "GPT" { "s2" } else { "s1" };
-                        let partition_path = format!("{}{}", disk_path, partition_suffix);
-                        let _ = Command::new("diskutil")
-                            .args(["mount", &partition_path])
-                            .output();
-                    }
-                    
-                    emit_progress(&app, 100, "Format complete!", "tools");
-                    return Ok(format!("USB formatted as {} ({})", filesystem, volume_name));
-                } else {
-                    if let Some(mut stderr) = child.stderr.take() {
-                        let mut error_msg = String::new();
-                        let _ = stderr.read_to_string(&mut error_msg);
-                        if !error_msg.is_empty() {
-                            return Err(format!("Format failed: {}", error_msg));
-                        }
-                    }
-                    return Err("Format failed".to_string());
-                }
-            }
-            Ok(None) => {
-                // Still running - animate progress
-                progress = (progress + 5).min(90);
-                emit_progress(&app, progress, &format!("Formatting as {}...", filesystem), "tools");
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => {
-                return Err(format!("Wait error: {}", e));
-            }
-        }
+    let cfg = serde_json::json!({"mode":"command","script":script});
+    process_runner::run(&cfg, Some(&password), &CANCEL_TOOLS, |line| {
+        emit_progress(&app, 50, line, "tools");
+    })?;
+    emit_progress(&app, 95, "Mounting volume...", "tools");
+    let _ = Command::new("diskutil").args(["mountDisk", &disk_path]).output();
+    if is_encrypted {
+        let enc_pass = encryption_password.as_deref().unwrap_or_default();
+        let volume = find_apfs_volume(&disk_id)?;
+        encrypt_apfs_volume(&volume, enc_pass)?;
+        emit_progress(&app, 100, "Format complete!", "tools");
+        return Ok(format!("USB verschlüsselt als APFS formatiert ({volume_name}). Die Verschlüsselung läuft im Hintergrund weiter."));
     }
+    emit_progress(&app, 100, "Format complete!", "tools");
+    Ok(format!("USB formatted as {filesystem} ({volume_name})"))
 }
 
 /// Write a pass using dd with progress tracking
 #[allow(clippy::too_many_arguments)]
-fn write_pass(
-    app: &AppHandle,
-    disk_path: &str,
-    disk_size: u64,
-    source: &str,
-    pass_num: u32,
-    total_passes: u32,
-    pass_desc: &str,
-    password: &str,
-    python3_path: &str,
-) -> Result<(), String> {
-    // Calculate base progress for this pass
-    let pass_start_f = (pass_num - 1) as f64 / total_passes as f64 * 90.0 + 5.0;
-    let pass_range_f = 90.0 / total_passes as f64;
-    let pass_start = pass_start_f as u32;
-    let pass_end = (pass_start_f + pass_range_f) as u32;
-    
-    emit_progress(app, pass_start, &format!("Pass {}/{}: {}...", pass_num, total_passes, pass_desc), "tools");
-    
-    // Use a single sudo Python invocation that streams REAL progress per MiB.
-    // This avoids the per-chunk fork/exec overhead of repeatedly starting
-    // sudo+dd, and gives the UI accurate, monotonic progress instead of an
-    // estimate based on an assumed write speed (which used to cap at 94 % and
-    // make the UI look frozen on slow USB sticks).
-    //
-    // Block size: 16 MiB. macOS raw USB devices are usually fastest at
-    // 8–32 MiB writes — anything smaller is dominated by per-syscall and
-    // device-controller overhead. Progress is emitted every 64 MiB so the
-    // pipe stays responsive without flooding the UI.
-    //
-    // For random data we pre-fill a 16 MiB buffer once from /dev/urandom and
-    // refresh ~1 MiB of it before each chunk. This avoids forcing the kernel
-    // CSPRNG to produce the entire disk's worth of bytes (which can become
-    // the bottleneck before the USB) while still giving every block a unique
-    // pattern that is indistinguishable from random data for forensic
-    // purposes.
-    let is_random = source.contains("urandom") || source.contains("random");
-    let py = format!(
-        r#"import os, sys, time
-src_path = "{src}"
-dst_path = "{dst}"
-total = {total}
-is_random = {rand}
-buf_size = 16 * 1024 * 1024
-report_every = 64 * 1024 * 1024
-refresh_size = 1024 * 1024  # 1 MiB freshly randomized per chunk
-
-try:
-    dfd = os.open(dst_path, os.O_WRONLY)
-    dst = os.fdopen(dfd, 'wb', buffering=0)
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-
-if is_random:
-    # Seed buffer once with high-quality randomness, then keep a small slice
-    # fresh for each write so consecutive chunks differ.
-    buf = bytearray(os.urandom(buf_size))
-    src = None
-else:
-    src = open(src_path, 'rb', buffering=0)
-    buf = None
-
-written = 0
-last_report = 0
-start_t = time.time()
-last_t = start_t
-last_bytes = 0
-try:
-    while written < total:
-        remaining = total - written
-        cur = min(buf_size, remaining)
-        if is_random:
-            # Refresh a small random slice for this chunk
-            off = (written // buf_size) % (buf_size - refresh_size + 1)
-            buf[off:off + refresh_size] = os.urandom(refresh_size)
-            data = bytes(buf[:cur]) if cur != buf_size else bytes(buf)
-        else:
-            data = src.read(cur)
-            if not data:
-                break
-        # A single FileIO.write() may write only part of the buffer. Continue
-        # until the complete chunk reached the raw device before advancing
-        # written/progress; otherwise a partial overwrite could be reported
-        # as a successful pass.
-        view = memoryview(data)
-        while view:
-            count = dst.write(view)
-            if count is None or count <= 0:
-                raise OSError("short write to destination device")
-            view = view[count:]
-        written += len(data)
-        if written - last_report >= report_every or written == total:
-            now = time.time()
-            dt_recent = now - last_t
-            speed = (written - last_bytes) / dt_recent / (1024 * 1024) if dt_recent > 0 else 0.0
-            elapsed = now - start_t
-            avg = written / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
-            # ETA based on overall average speed (smoothed, not the bursty
-            # short-term rate which jumps wildly with NAND cache flushes).
-            eta = (total - written) / (avg * 1024 * 1024) if avg > 0.5 else 0
-            print(f"BYTES:{{written}}:{{speed:.1f}}:{{avg:.1f}}:{{int(eta)}}", flush=True)
-            last_report = written
-            last_t = now
-            last_bytes = written
-    dst.flush()
-    os.fsync(dst.fileno())
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-finally:
-    try: dst.close()
-    except Exception: pass
-    if src is not None:
-        try: src.close()
-        except Exception: pass
-print("DONE", flush=True)
-"#,
-        src = source,
-        dst = disk_path,
-        total = disk_size,
-        rand = if is_random { "True" } else { "False" }
-    );
-    
-    let mut command = Command::new("sudo");
-    command
-        .args(["-S", python3_path, "-c", &py])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setpgid is async-signal-safe and is the only operation in
-        // the child between fork and exec. It isolates sudo and its writer so
-        // cancellation can terminate both.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+fn write_pass(app: &AppHandle, disk_path: &str, disk_size: u64, source: &str,
+    pass_num: u32, total_passes: u32, pass_desc: &str, password: &str, _python3_path: &str) -> Result<(), String> {
+    let cfg = serde_json::json!({"mode":"erase", "device":disk_path, "size":disk_size,
+        "random":source.contains("random")});
+    process_runner::run(&cfg, Some(password), &CANCEL_TOOLS, |line| {
+        if let Some(bytes) = line.strip_prefix("BYTES:").and_then(|s| s.parse::<u64>().ok()) {
+            let frac = bytes as f64 / disk_size as f64;
+            let percent = (((pass_num - 1) as f64 + frac) / total_passes as f64 * 90.0 + 5.0) as u32;
+            emit_progress(app, percent, &format!("Pass {pass_num}/{total_passes}: {pass_desc} ({bytes}/{disk_size})"), "tools");
         }
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("write start error: {}", e))?;
-    
-    if let Some(ref mut stdin) = child.stdin {
-        writeln!(stdin, "{}", password).ok();
-    }
-    drop(child.stdin.take());
-    
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let stderr = child.stderr.take().ok_or("no stderr")?;
-    let (line_tx, line_rx) = mpsc::channel();
-    let stdout_reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    // Drain stderr concurrently. Otherwise a verbose sudo/Python error could
-    // fill its pipe and deadlock the writer before the parent can read it.
-    let stderr_reader = std::thread::spawn(move || {
-        let mut error_msg = String::new();
-        let mut reader = BufReader::new(stderr);
-        let _ = reader.read_to_string(&mut error_msg);
-        error_msg
-    });
-    let total_mib = disk_size as f64 / (1024.0 * 1024.0);
-    let mut done = false;
-    let mut exit_status: Option<ExitStatus> = None;
-
-    while exit_status.is_none() {
-        if CANCEL_TOOLS.load(Ordering::SeqCst) {
-            kill_process_group(&mut child);
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err("Cancelled".to_string());
-        }
-        let stdout_closed = match line_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(Ok(line)) => {
-                if let Some(stripped) = line.strip_prefix("BYTES:") {
-            let mut parts = stripped.splitn(4, ':');
-            let bytes_str = parts.next().unwrap_or("0");
-            let speed_str = parts.next().unwrap_or("0");
-            let avg_str = parts.next().unwrap_or("0");
-            let eta_str = parts.next().unwrap_or("0");
-            if let Ok(bytes) = bytes_str.parse::<u64>() {
-                let frac = (bytes as f64 / disk_size as f64).min(1.0);
-                let progress = pass_start + (frac * pass_range_f).min(pass_range_f) as u32;
-                let written_mib = bytes as f64 / (1024.0 * 1024.0);
-                let eta_secs: u64 = eta_str.parse().unwrap_or(0);
-                let eta_str = if eta_secs > 0 {
-                    let h = eta_secs / 3600;
-                    let m = (eta_secs % 3600) / 60;
-                    let s = eta_secs % 60;
-                    if h > 0 {
-                        format!(", ETA {}:{:02}:{:02}", h, m, s)
-                    } else {
-                        format!(", ETA {}:{:02}", m, s)
-                    }
-                } else {
-                    String::new()
-                };
-                emit_progress(
-                    app,
-                    progress,
-                    &format!(
-                        "Pass {}/{}: {}... {:.0} / {:.0} MiB ({} MB/s, Ø {} MB/s{})",
-                        pass_num, total_passes, pass_desc, written_mib, total_mib, speed_str, avg_str, eta_str
-                    ),
-                    "tools",
-                );
-            }
-                } else if line == "DONE" {
-                    done = true;
-                }
-                false
-            }
-            Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => false,
-            Err(RecvTimeoutError::Disconnected) => true,
-        };
-
-        exit_status = child
-            .try_wait()
-            .map_err(|e| format!("wait error: {}", e))?;
-        if exit_status.is_none() && stdout_closed {
-            // Avoid a busy loop after stdout closes while the child is still
-            // flushing the raw device.
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-
-    let status = exit_status.expect("exit status is set by loop condition");
-    let _ = stdout_reader.join();
-    let err_msg = stderr_reader.join().unwrap_or_default();
-
-    if !status.success() || !done {
-        if !err_msg.is_empty() {
-            return Err(format!("write error: {}", err_msg.trim()));
-        }
-        return Err("write failed".to_string());
-    }
-    emit_progress(app, pass_end, &format!("Pass {}/{}: Complete", pass_num, total_passes), "tools");
-    Ok(())
+    })
 }
 
 /// Get disk size in bytes
 fn get_disk_size(disk_id: &str) -> Result<u64, String> {
-    let output = Command::new("diskutil")
-        .args(["info", disk_id])
-        .output()
-        .map_err(|e| format!("diskutil error: {}", e))?;
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains("Disk Size:") {
-            // Extract bytes from format like "Disk Size: 32.0 GB (32000000000 Bytes)"
-            if let Some(start) = line.find('(') {
-                if let Some(end) = line.find(" Bytes") {
-                    let bytes_str = &line[start+1..end];
-                    if let Ok(bytes) = bytes_str.trim().parse::<u64>() {
-                        return Ok(bytes);
-                    }
-                }
-            }
-        }
-    }
-    Err("Could not determine disk size".to_string())
+    let output = Command::new("diskutil").args(["info", "-plist", disk_id]).output()
+        .map_err(|e| format!("diskutil: {e}"))?;
+    if !output.status.success() { return Err("Datenträgergröße konnte nicht gelesen werden".into()); }
+    extract_plist_value(&String::from_utf8_lossy(&output.stdout), "TotalSize")
+        .filter(|size| *size > 0).ok_or("Ungültige Datenträgergröße".into())
 }
 
 /// Securely erase a USB disk using dd with real progress
@@ -3236,9 +2261,22 @@ async fn secure_erase(
     level: u32,
     password: String,
 ) -> Result<String, String> {
+    let guard = start_operation(&disk_id)?;
+    app.emit("operation_start", guard.id).ok();
     CANCEL_TOOLS.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        secure_erase_blocking(app, disk_id, level, password)
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn secure_erase_blocking(
+    app: AppHandle,
+    disk_id: String,
+    level: u32,
+    password: String,
+) -> Result<String, String> {
+
 
     // Commands can be invoked independently of the UI. Restrict the device
     // identifier before embedding the derived path in the privileged script,
@@ -3249,7 +2287,7 @@ async fn secure_erase(
     let python3_path = get_python3_path().ok_or(
         "Secure erase requires Python 3. Install it with Homebrew: brew install python",
     )?;
-    
+
     // Level descriptions
     let level_desc = match level {
         0 => "1x Zeros",
@@ -3259,19 +2297,19 @@ async fn secure_erase(
         4 => "DoE 3-Pass",
         _ => "Unknown",
     };
-    
+
     emit_progress(&app, 2, &format!("Preparing secure erase ({})...", level_desc), "tools");
-    
+
     // Get disk size
     let disk_size = get_disk_size(&disk_id)?;
-    
+
     // Force unmount and verify (K5) — critical before destructive write
     ensure_disk_unmounted(&app, &disk_id)?;
-    
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     emit_progress(&app, 5, &format!("Starting {} erase...", level_desc), "tools");
-    
+
     match level {
         0 => {
             // Single pass zeros
@@ -3324,11 +2362,11 @@ async fn secure_erase(
             return Err(format!("Unknown erase level: {}", level));
         }
     }
-    
+
     if CANCEL_TOOLS.load(Ordering::SeqCst) {
         return Err("Secure erase cancelled".to_string());
     }
-    
+
     emit_progress(&app, 100, "Secure erase complete!", "tools");
     Ok(format!("USB securely erased ({})", level_desc))
 }
@@ -3336,6 +2374,14 @@ async fn secure_erase(
 /// Forensic analysis - gather all available information about a USB device
 #[tauri::command]
 async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_json::Value, String> {
+    let guard = start_operation(&disk_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        collect_forensic(disk_id, password)
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Value, String> {
     if !is_valid_disk_id(&disk_id) {
         return Err("Invalid disk identifier".to_string());
     }
@@ -3347,39 +2393,40 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if !password_check.status.success() {
         return Err("Falsches Passwort. Bitte geben Sie Ihr Admin-Passwort korrekt ein.".to_string());
     }
-    
+
     let mut result = serde_json::json!({
         "disk_id": disk_id,
         "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     });
-    
+
+    let mut scan_cache = std::collections::HashMap::<String, serde_json::Value>::new();
     // 0. Check for Paragon drivers availability (for filesystem support info)
     let paragon_ntfs = Command::new("diskutil")
         .args(["listFilesystems"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("UFSD_NTFS"))
         .unwrap_or(false);
-    
+
     let paragon_extfs = Command::new("diskutil")
         .args(["listFilesystems"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("UFSD_EXTFS"))
         .unwrap_or(false);
-    
+
     result["paragon_drivers"] = serde_json::json!({
         "ntfs": paragon_ntfs,
         "extfs": paragon_extfs,
         "ntfs_description": if paragon_ntfs { "Paragon NTFS installiert - voller NTFS Lese-/Schreibzugriff" } else { "Paragon NTFS nicht installiert - nur Lesezugriff auf NTFS" },
         "extfs_description": if paragon_extfs { "Paragon extFS installiert - voller ext2/3/4 Lese-/Schreibzugriff" } else { "Paragon extFS nicht installiert - kein ext2/3/4 Zugriff" }
     });
-    
+
     // 1. Get basic disk info from diskutil
     let diskutil_cmd = format!("diskutil info {} 2>/dev/null", shell_quote(&disk_id));
-    
+
     if let Ok(output) = sudo_sh(&password, &diskutil_cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut disk_info = serde_json::Map::new();
-        
+
         for line in stdout.lines() {
             if let Some((key, value)) = line.split_once(':') {
                 let key = key.trim();
@@ -3424,30 +2471,30 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                 }
             }
         }
-        
+
         // Collect information from ALL partitions (s1, s2, s3, etc.)
         let mut partitions_info: Vec<serde_json::Value> = Vec::new();
         let mut main_partition_idx: Option<usize> = None;
         let mut main_partition_size: u64 = 0;
-        
+
         for suffix in 1..=10 {  // Check up to 10 partitions
             let partition_id = format!("{}s{}", disk_id, suffix);
             let partition_cmd = format!("diskutil info {} 2>/dev/null", partition_id);
-            
+
             if let Ok(part_output) = sudo_sh(&password, &partition_cmd) {
                 let part_stdout = String::from_utf8_lossy(&part_output.stdout);
-                
+
                 // Check if partition exists (output should contain device identifier)
                 if !part_stdout.contains("Device Identifier") {
                     continue;
                 }
-                
+
                 let mut part_info = serde_json::Map::new();
                 part_info.insert("partition_id".to_string(), serde_json::json!(partition_id));
-                
+
                 let mut part_size_bytes: u64 = 0;
                 let mut is_efi = false;
-                
+
                 for line in part_stdout.lines() {
                     if let Some((key, value)) = line.split_once(':') {
                         let key = key.trim();
@@ -3559,21 +2606,21 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                         }
                     }
                 }
-                
+
                 // If this is an APFS Physical Store, get container and volume info
                 if let Some(container) = part_info.get("apfs_container").and_then(|c| c.as_str()) {
                     // Get APFS container info
                     let apfs_cmd = format!("diskutil apfs list {} 2>/dev/null", shell_quote(container));
                     if let Ok(apfs_output) = Command::new("sh").args(["-c", &apfs_cmd]).output() {
                         let apfs_stdout = String::from_utf8_lossy(&apfs_output.stdout);
-                        
+
                         // Parse volumes from APFS container output
                         let mut apfs_volumes: Vec<serde_json::Value> = Vec::new();
                         let mut current_volume: Option<serde_json::Map<String, serde_json::Value>> = None;
-                        
+
                         for line in apfs_stdout.lines() {
                             let trimmed = line.trim();
-                            
+
                             if trimmed.starts_with("+-> Volume ") {
                                 // Save previous volume if exists
                                 if let Some(vol) = current_volume.take() {
@@ -3612,10 +2659,10 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                         if let Some(vol) = current_volume {
                             apfs_volumes.push(serde_json::json!(vol));
                         }
-                        
+
                         if !apfs_volumes.is_empty() {
                             part_info.insert("apfs_volumes".to_string(), serde_json::json!(apfs_volumes));
-                            
+
                             // Use first volume's mount point for display
                             if let Some(first_vol) = apfs_volumes.first() {
                                 if let Some(mp) = first_vol.get("mount_point").and_then(|m| m.as_str()) {
@@ -3628,7 +2675,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                                 }
                             }
                         }
-                        
+
                         // Parse container capacity info
                         for line in apfs_stdout.lines() {
                             let trimmed = line.trim();
@@ -3644,7 +2691,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                         }
                     }
                 }
-                
+
                 // For Linux filesystems (ext2/3/4), try to read volume label using e2label or tune2fs
                 // This requires e2fsprogs to be installed (brew install e2fsprogs)
                 // Also detect Paragon UFSD_EXTFS driver which mounts ext2/3/4
@@ -3660,7 +2707,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                         .and_then(|f| f.as_str())
                         .map(|f| f.contains("ext") || f.contains("Linux") || f.contains("EXTFS") || f.contains("UFSD"))
                         .unwrap_or(false);
-                
+
                 // Debug: Log what we detected for Linux FS
                 #[cfg(debug_assertions)] {
                     let content_type_str = part_info.get("content_type").and_then(|c| c.as_str()).unwrap_or("none");
@@ -3669,31 +2716,31 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     eprintln!("[ext4 Debug] Partition {}: is_linux_fs={}, content_type={}, partition_type={}, filesystem={}",
                         partition_id, is_linux_fs, content_type_str, partition_type_str, filesystem_str);
                 }
-                
+
                 if is_linux_fs && !part_info.contains_key("volume_name") {
                     #[cfg(debug_assertions)] eprintln!("[ext4 Debug] Trying to read ext4 label for {}", partition_id);
-                    
+
                     // Try e2label first (simpler output) - needs sudo for raw disk access
                     let e2label_cmd = format!(
                         "/opt/homebrew/opt/e2fsprogs/sbin/e2label /dev/{} 2>/dev/null || /usr/local/opt/e2fsprogs/sbin/e2label /dev/{} 2>/dev/null",
                         partition_id, partition_id
                     );
                     #[cfg(debug_assertions)] eprintln!("[ext4 Debug] Running e2label with sudo for {}", partition_id);
-                    
+
                     if let Ok(label_output) = sudo_sh(&password, &e2label_cmd) {
                         let stdout = String::from_utf8_lossy(&label_output.stdout).trim().to_string();
                         #[cfg(debug_assertions)] {
                             let stderr = String::from_utf8_lossy(&label_output.stderr).trim().to_string();
                             eprintln!("[ext4 Debug] e2label stdout: '{}', stderr: '{}'", stdout, stderr);
                         }
-                        
+
                         // Check if it's a valid label (not an error message)
                         if !stdout.is_empty() && !stdout.contains("Permission denied") && !stdout.contains("Bad magic") && !stdout.contains("No such file") && !stdout.contains("Password:") {
                             part_info.insert("volume_name".to_string(), serde_json::json!(stdout));
                             #[cfg(debug_assertions)] eprintln!("[ext4 Debug] Set volume_name to: {}", stdout);
                         }
                     }
-                    
+
                     // If e2label didn't work, try tune2fs
                     if !part_info.contains_key("volume_name") {
                         #[cfg(debug_assertions)] eprintln!("[ext4 Debug] e2label didn't work, trying tune2fs");
@@ -3702,14 +2749,14 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                             partition_id, partition_id
                         );
                         #[cfg(debug_assertions)] eprintln!("[ext4 Debug] Running tune2fs with sudo for {}", partition_id);
-                        
+
                         if let Ok(tune_output) = sudo_sh(&password, &tune2fs_cmd) {
                             let tune_stdout = String::from_utf8_lossy(&tune_output.stdout);
                             #[cfg(debug_assertions)] {
                                 let tune_stderr = String::from_utf8_lossy(&tune_output.stderr);
                                 eprintln!("[ext4 Debug] tune2fs stdout: '{}', stderr: '{}'", tune_stdout.trim(), tune_stderr.trim());
                             }
-                            
+
                             // Parse "Filesystem volume name:   <volume_label>"
                             if let Some(line) = tune_stdout.lines().find(|l| l.contains("Filesystem volume name")) {
                                 if let Some(label) = line.split(':').nth(1) {
@@ -3722,7 +2769,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                             }
                         }
                     }
-                    
+
                     // If still no volume name and partition is mounted, use mount point name
                     if !part_info.contains_key("volume_name") {
                         #[cfg(debug_assertions)] eprintln!("[ext4 Debug] No volume_name found, checking mount point");
@@ -3731,33 +2778,33 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                             .and_then(|mp| mp.rsplit('/').next())
                             .filter(|name| !name.is_empty())
                             .map(|s| s.to_string());
-                        
+
                         if let Some(name) = mount_point_name {
                             #[cfg(debug_assertions)] eprintln!("[ext4 Debug] Using mount point name: {}", name);
                             part_info.insert("volume_name".to_string(), serde_json::json!(name));
                         }
                     }
                 }
-                
+
                 // Track the main (largest non-EFI) partition
                 if !is_efi && part_size_bytes > main_partition_size {
                     main_partition_size = part_size_bytes;
                     main_partition_idx = Some(partitions_info.len());
                 }
-                
+
                 partitions_info.push(serde_json::json!(part_info));
             }
         }
-        
+
         // Add partitions array to result
         if !partitions_info.is_empty() {
             result["partitions"] = serde_json::json!(partitions_info);
-            
+
             // Use main partition info for disk_info if volume_name is not set
             let volume_name = disk_info.get("volume_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            
+
             if (volume_name.contains("Not applicable") || volume_name.is_empty()) && main_partition_idx.is_some() {
                 if let Some(idx) = main_partition_idx {
                     if let Some(main_part) = partitions_info.get(idx) {
@@ -3787,18 +2834,18 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                 }
             }
         }
-        
+
         result["disk_info"] = serde_json::json!(disk_info);
     }
-    
+
     // 2. Get partition layout
     let partitions_cmd = format!("diskutil list {} 2>/dev/null", shell_quote(&disk_id));
-    
+
     if let Ok(output) = sudo_sh(&password, &partitions_cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         result["partition_layout"] = serde_json::json!(stdout.trim());
     }
-    
+
     // 3. Get device info - check SD Card Reader FIRST (more specific match by bsd_name)
     // then fall back to USB device tree
     let media_name = result.get("disk_info")
@@ -3806,9 +2853,9 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    
+
     let mut found_device_info = false;
-    
+
     // 3a. Check for SD Card Reader first (built-in card readers have exact bsd_name match)
     let sd_cmd = "system_profiler SPCardReaderDataType -json 2>/dev/null";
     if let Ok(output) = Command::new("sh").args(["-c", sd_cmd]).output() {
@@ -3816,7 +2863,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             if let Some(sd_info) = find_sd_card_info(&json_data, &disk_id) {
                 // Found SD card - use this info
                 found_device_info = true;
-                
+
                 // Extract SMART status for SD cards and create smart_info section
                 if let Some(smart_status) = sd_info.get("smart_status").and_then(|s| s.as_str()) {
                     let mut smart_info = serde_json::Map::new();
@@ -3829,7 +2876,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     };
                     smart_info.insert("health_status".to_string(), serde_json::json!(status_formatted));
                     smart_info.insert("smart_supported".to_string(), serde_json::json!(true));
-                    
+
                     // Add device info to smart_info
                     if let Some(product) = sd_info.get("product_name").and_then(|p| p.as_str()) {
                         smart_info.insert("device_model".to_string(), serde_json::json!(product));
@@ -3852,11 +2899,11 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     if let Some(date) = sd_info.get("manufacturing_date").and_then(|d| d.as_str()) {
                         smart_info.insert("manufacturing_date".to_string(), serde_json::json!(date));
                     }
-                    
+
                     result["smart_info"] = serde_json::json!(smart_info);
                 }
                 result["usb_info"] = sd_info;
-                
+
                 // Remove misleading smart_status from disk_info for SD cards
                 // (diskutil says "Not Supported" but Card Reader has its own health check)
                 if let Some(disk_info) = result.get_mut("disk_info") {
@@ -3867,7 +2914,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
         }
     }
-    
+
     // 3b. If not an SD card, check USB device tree
     if !found_device_info {
         let usb_cmd = "system_profiler SPUSBHostDataType -json 2>/dev/null";
@@ -3880,11 +2927,11 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
         }
     }
-    
+
     // 4. Analyze boot capability
     let boot_info = analyze_boot_structure(&disk_id, &password);
     result["boot_info"] = boot_info;
-    
+
     // 5. Detect filesystem signatures from raw device
     if let Some(fs_info) = detect_filesystem_signatures(&disk_id, &password) {
         result["filesystem_signatures"] = fs_info;
@@ -3901,24 +2948,24 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     // zeigt die Oberflaeche Paragons Sammelangabe "UFSD_EXTFS4" auch fuer
     // ext2- und ext3-Datentraeger.
     correct_ext_filesystem_labels(&mut result);
-    
+
     // 6. Get file count and directory structure (if mounted)
     if let Some(mount_point) = result.get("disk_info")
         .and_then(|d| d.get("mount_point"))
-        .and_then(|m| m.as_str()) 
+        .and_then(|m| m.as_str())
     {
         if !mount_point.is_empty() {
-            if let Some(content_info) = analyze_mounted_content(mount_point) {
+            if let Some(content_info) = analyze_mounted_content(mount_point, &mut scan_cache) {
                 result["content_analysis"] = content_info;
             }
         }
     }
-    
+
     // 7. Check for hidden files and special structures
     if let Some(special_info) = detect_special_structures(&disk_id, &password) {
         result["special_structures"] = special_info;
     }
-    
+
     // 8. Get detailed hardware info via ioreg
     // K-1: Muster maskieren. Zudem muss der BSD-Name exakt passen -- 'disk10' ist
     // Praefix von 'disk10s1', sonst liefert der Treffer die Groesse einer Partition
@@ -3932,7 +2979,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if let Ok(output) = Command::new("sh").args(["-c", &ioreg_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut hw_info = serde_json::Map::new();
-        
+
         // Jede Eigenschaft steht im ioreg-Objekt genau einmal; -A50 kann aber in das
         // naechste Objekt hineinreichen. Daher nur den ersten Treffer uebernehmen.
         for line in stdout.lines() {
@@ -3963,12 +3010,12 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     .or_insert_with(|| serde_json::json!(line.contains("Yes")));
             }
         }
-        
+
         if !hw_info.is_empty() {
             result["hardware_info"] = serde_json::json!(hw_info);
         }
     }
-    
+
     // 9. Get USB controller path info
     let usb_path_cmd = format!(
         "system_profiler SPUSBDataType 2>/dev/null | grep -B30 {} | head -35",
@@ -3977,7 +3024,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
     if let Ok(output) = Command::new("sh").args(["-c", &usb_path_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut controller_info = serde_json::Map::new();
-        
+
         for line in stdout.lines() {
             let line = line.trim();
             if line.starts_with("USB") && line.contains("Bus") {
@@ -4000,12 +3047,12 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                 }
             }
         }
-        
+
         if !controller_info.is_empty() {
             result["controller_info"] = serde_json::json!(controller_info);
         }
     }
-    
+
     // 10. Get storage type info
     let storage_cmd = "system_profiler SPStorageDataType -json 2>/dev/null";
     if let Ok(output) = Command::new("sh").args(["-c", storage_cmd]).output() {
@@ -4040,13 +3087,13 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
         }
     }
-    
+
     // 11. Entfernt: iostat-Statistik. "iostat -d <disk>" ohne Intervall liefert den
     // Durchschnitt seit Systemstart, nicht die aktuelle Aktivitaet. Transfers/s und
     // MB/s wurden dadurch ueber die Laufzeit geteilt und waren praktisch immer 0 --
     // auch waehrend der Datentraeger nachweislich vollstaendig gelesen wurde.
     // KB/Transfer beschreibt das Zugriffsmuster von macOS, nicht den Datentraeger.
-    
+
     // 12. Get raw hex dump of first sectors (MBR/GPT header preview)
     let hexdump_cmd = format!(
         "dd if=/dev/r{} bs=512 count=2 2>/dev/null | xxd -l 128 -c 16",
@@ -4058,7 +3105,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             result["raw_header_hex"] = serde_json::json!(stdout.trim());
         }
     }
-    
+
     // 13. Parse MBR partition table entries
     let mbr_cmd = format!(
         "dd if=/dev/r{} bs=512 count=1 2>/dev/null | xxd -p -l 512",
@@ -4068,12 +3115,12 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         let hex_str = String::from_utf8_lossy(&output.stdout).replace("\n", "");
         if hex_str.len() >= 1024 {
             let mut mbr_info = serde_json::Map::new();
-            
+
             // Check MBR signature (bytes 510-511 = 55AA)
             let sig = &hex_str[1020..1024];
             mbr_info.insert("mbr_signature".to_string(), serde_json::json!(sig.to_uppercase()));
             mbr_info.insert("valid_mbr".to_string(), serde_json::json!(sig == "55aa"));
-            
+
             // Parse 4 partition entries (bytes 446-509)
             let mut partitions = Vec::new();
             for i in 0..4 {
@@ -4083,14 +3130,14 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     let entry = &hex_str[start..end];
                     let boot_flag = &entry[0..2];
                     let part_type = &entry[8..10];
-                    
+
                     // Only add non-empty partitions
                     if part_type != "00" {
                         let mut part = serde_json::Map::new();
                         part.insert("number".to_string(), serde_json::json!(i + 1));
                         part.insert("bootable".to_string(), serde_json::json!(boot_flag == "80"));
                         part.insert("type_hex".to_string(), serde_json::json!(part_type.to_uppercase()));
-                        
+
                         // Common partition type names
                         let type_name = match part_type {
                             "00" => "Empty",
@@ -4118,7 +3165,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             result["mbr_analysis"] = serde_json::json!(mbr_info);
         }
     }
-    
+
     // 14. Get GPT header details
     let gpt_cmd = format!(
         "dd if=/dev/r{} bs=512 skip=1 count=1 2>/dev/null | xxd -p -l 512",
@@ -4131,167 +3178,40 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             let mut gpt_info = serde_json::Map::new();
             gpt_info.insert("gpt_signature".to_string(), serde_json::json!("EFI PART"));
             gpt_info.insert("valid_gpt".to_string(), serde_json::json!(true));
-            
+
             // GPT revision (bytes 8-11)
             if hex_str.len() >= 24 {
                 let rev = &hex_str[16..24];
                 gpt_info.insert("gpt_revision".to_string(), serde_json::json!(rev));
             }
-            
+
             // Header size (bytes 12-15)
             if hex_str.len() >= 32 {
                 let size_hex = &hex_str[24..32];
                 gpt_info.insert("header_size_hex".to_string(), serde_json::json!(size_hex));
             }
-            
+
             result["gpt_analysis"] = serde_json::json!(gpt_info);
         }
     }
-    
+
     // 15. Analyze mounted filesystem details
     if let Some(mount_point) = result.get("disk_info")
         .and_then(|d| d.get("mount_point"))
-        .and_then(|m| m.as_str()) 
+        .and_then(|m| m.as_str())
     {
         if !mount_point.is_empty() {
-            // K-1: Der Einhaengepunkt stammt aus dem Datentraegernamen und ist
-            // damit fremdbestimmt. Vor jeder Shell-Verwendung maskieren.
-            let mp = shell_quote(mount_point);
-            let mut fs_details = serde_json::Map::new();
-            
-            // Get filesystem stats via df
-            let df_cmd = format!("df -i {} 2>/dev/null | tail -1", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &df_cmd]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parts: Vec<&str> = stdout.split_whitespace().collect();
-                if parts.len() >= 9 {
-                    fs_details.insert("total_blocks".to_string(), serde_json::json!(parts.get(1).unwrap_or(&"")));
-                    fs_details.insert("used_blocks".to_string(), serde_json::json!(parts.get(2).unwrap_or(&"")));
-                    fs_details.insert("free_blocks".to_string(), serde_json::json!(parts.get(3).unwrap_or(&"")));
-                    fs_details.insert("capacity_percent".to_string(), serde_json::json!(parts.get(4).unwrap_or(&"")));
-                    // `df -i` liefert: 5=iused, 6=ifree, 7=%iused, 8=Mounted on.
-                    // FAT/exFAT kennen keine Inodes; df meldet dort 0/0/"-".
-                    // Solche Platzhalter nicht als Messwerte ausgeben.
-                    let used_inodes = parts.get(5).copied().unwrap_or("");
-                    let free_inodes = parts.get(6).copied().unwrap_or("");
-                    let inode_percent = parts.get(7).copied().unwrap_or("");
-                    let inode_total = match (used_inodes.parse::<u64>(), free_inodes.parse::<u64>()) {
-                        (Ok(u), Ok(f)) => Some(u + f),
-                        _ => None,
-                    };
-                    if inode_total.is_none_or(|t| t > 0) {
-                        fs_details.insert("used_inodes".to_string(), serde_json::json!(used_inodes));
-                        fs_details.insert("free_inodes".to_string(), serde_json::json!(free_inodes));
-                        if let Some(total) = inode_total {
-                            fs_details.insert("total_inodes".to_string(), serde_json::json!(total.to_string()));
-                        }
-                        if !inode_percent.is_empty() && inode_percent != "-" {
-                            fs_details.insert("inode_usage_percent".to_string(), serde_json::json!(inode_percent));
-                        }
-                    }
-                }
-            }
-            
-            // Count hidden files
-            let hidden_cmd = format!("find {} -name '.*' -maxdepth 2 2>/dev/null | wc -l", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &hidden_cmd]).output() {
-                let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                fs_details.insert("hidden_files_count".to_string(), serde_json::json!(count));
-            }
-            
-            // Get top 5 largest files
-            let large_cmd = format!("find {} -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -5", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &large_cmd]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let files: Vec<serde_json::Value> = stdout.lines()
-                    .filter_map(|line| {
-                        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                        if parts.len() == 2 {
-                            Some(serde_json::json!({
-                                "size_bytes": parts[0],
-                                "path": parts[1].replace(mount_point, "")
-                            }))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !files.is_empty() {
-                    fs_details.insert("largest_files".to_string(), serde_json::json!(files));
-                }
-            }
-            
-            // Get file type distribution
-            let types_cmd = format!(
-                "find {} -type f -maxdepth 3 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -10",
-                mp
-            );
-            if let Ok(output) = Command::new("sh").args(["-c", &types_cmd]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let types: Vec<serde_json::Value> = stdout.lines()
-                    .filter_map(|line| {
-                        let line = line.trim();
-                        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                        if parts.len() == 2 {
-                            Some(serde_json::json!({
-                                "count": parts[0].trim(),
-                                "extension": parts[1].trim()
-                            }))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !types.is_empty() {
-                    fs_details.insert("file_type_distribution".to_string(), serde_json::json!(types));
-                }
-            }
-            
-            // Get recent files (last modified)
-            let recent_cmd = format!(
-                "find {} -type f -maxdepth 3 -mtime -7 2>/dev/null | head -10",
-                mp
-            );
-            if let Ok(output) = Command::new("sh").args(["-c", &recent_cmd]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let files: Vec<String> = stdout.lines()
-                    .map(|l| l.replace(mount_point, "").to_string())
-                    .collect();
-                if !files.is_empty() {
-                    fs_details.insert("recently_modified".to_string(), serde_json::json!(files));
-                }
-            }
-            
-            // Systemordner (Spotlight-Index, fseventsd, Papierkorb, Windows-Metadaten)
-            // werden im Hintergrund laufend neu geschrieben und lassen die Gesamtzahl
-            // zwischen zwei Scans schwanken. Daher zusaetzlich ohne sie zaehlen.
-            // -mindepth 1 schliesst den Einhaengepunkt selbst aus, der kein Inhalt ist.
-            let count_cmds = [
-                ("directory_count", format!("find {} -mindepth 1 -type d -print 2>/dev/null | wc -l", mp)),
-                ("user_directory_count", format!("find {} -mindepth 1 {} -type d -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
-                ("total_file_count", format!("find {} -type f -print 2>/dev/null | wc -l", mp)),
-                ("user_file_count", format!("find {} {} -type f -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
-            ];
-            for (key, cmd) in count_cmds {
-                if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
-                    let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    fs_details.insert(key.to_string(), serde_json::json!(count));
-                }
-            }
-            
-            // Get symlink count
-            let link_cmd = format!("find {} -type l 2>/dev/null | wc -l", mp);
-            if let Ok(output) = Command::new("sh").args(["-c", &link_cmd]).output() {
-                let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                fs_details.insert("symlink_count".to_string(), serde_json::json!(count));
-            }
-            
+            let mut fs_details = forensic_scan::filesystem_stats(std::path::Path::new(mount_point));
+            let summary = scan_cache.entry(mount_point.to_string())
+                .or_insert_with(|| forensic_scan::scan(std::path::Path::new(mount_point)));
+            if let Some(summary) = summary.as_object() { fs_details.extend(summary.clone()); }
+
             if !fs_details.is_empty() {
                 result["filesystem_details"] = serde_json::json!(fs_details);
             }
         }
     }
-    
+
     // 16. Check for SMART support and collect comprehensive SMART data using try_smartctl
     // Get parent disk for SMART (e.g., "disk6" instead of "disk6s2")
     let smart_disk_id = result.get("disk_info")
@@ -4308,93 +3228,93 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }
             disk_id.to_string()
         });
-    
+
     #[cfg(debug_assertions)] eprintln!("[SMART Debug] forensic_analysis: disk_id={}, smart_disk_id={}", disk_id, smart_disk_id);
-    
+
     // Use try_smartctl for comprehensive SMART data (includes -x extended info)
     if let Some(smart_data) = try_smartctl(&smart_disk_id) {
         #[cfg(debug_assertions)] eprintln!("[SMART Debug] try_smartctl returned data, available={}", smart_data.available);
-        
+
         let mut smart_info = serde_json::Map::new();
-        
+
         // Device identification
         if let Some(v) = &smart_data.model_family { smart_info.insert("model_family".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.device_model { smart_info.insert("device_model".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.serial_number { smart_info.insert("serial_number".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.firmware_version { smart_info.insert("firmware_version".to_string(), serde_json::json!(v)); }
-        
+
         // Capacity and physical info
-        if let Some(v) = smart_data.user_capacity_bytes { 
+        if let Some(v) = smart_data.user_capacity_bytes {
             let gb = v as f64 / 1_000_000_000.0;
-            smart_info.insert("capacity".to_string(), serde_json::json!(format!("{:.2} GB ({} bytes)", gb, v))); 
+            smart_info.insert("capacity".to_string(), serde_json::json!(format!("{:.2} GB ({} bytes)", gb, v)));
         }
         if let Some(v) = smart_data.logical_block_size { smart_info.insert("logical_block_size".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.physical_block_size { smart_info.insert("physical_block_size".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.rotation_rate { smart_info.insert("rotation_rate".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.form_factor { smart_info.insert("form_factor".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.device_type { smart_info.insert("device_type".to_string(), serde_json::json!(v)); }
-        
+
         // Interface info
         if let Some(v) = &smart_data.protocol { smart_info.insert("protocol".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.ata_version { smart_info.insert("ata_version".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.sata_version { smart_info.insert("sata_version".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.interface_speed_max { smart_info.insert("interface_speed_max".to_string(), serde_json::json!(v)); }
         if let Some(v) = &smart_data.interface_speed_current { smart_info.insert("interface_speed_current".to_string(), serde_json::json!(v)); }
-        
+
         // Health status
         smart_info.insert("health_status".to_string(), serde_json::json!(&smart_data.health_status));
         if let Some(v) = smart_data.smart_enabled { smart_info.insert("smart_enabled".to_string(), serde_json::json!(v)); }
-        
+
         // Capabilities
         if let Some(v) = smart_data.trim_supported { smart_info.insert("trim_supported".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.write_cache_enabled { smart_info.insert("write_cache_enabled".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.read_lookahead_enabled { smart_info.insert("read_lookahead_enabled".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.ata_security_enabled { smart_info.insert("ata_security_enabled".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.ata_security_frozen { smart_info.insert("ata_security_frozen".to_string(), serde_json::json!(v)); }
-        
+
         // Temperature info (SCT)
         if let Some(v) = smart_data.sct_temperature_current { smart_info.insert("sct_temperature_current".to_string(), serde_json::json!(format!("{}°C", v))); }
         if let Some(v) = smart_data.sct_temperature_lifetime_min { smart_info.insert("sct_temperature_lifetime_min".to_string(), serde_json::json!(format!("{}°C", v))); }
         if let Some(v) = smart_data.sct_temperature_lifetime_max { smart_info.insert("sct_temperature_lifetime_max".to_string(), serde_json::json!(format!("{}°C", v))); }
         if let Some(v) = smart_data.sct_temperature_op_limit { smart_info.insert("sct_temperature_op_limit".to_string(), serde_json::json!(format!("{}°C", v))); }
-        
+
         // Usage stats (from temperature if available, or direct)
         if let Some(v) = &smart_data.temperature { smart_info.insert("temperature".to_string(), serde_json::json!(v)); }
-        if let Some(v) = smart_data.power_on_hours { 
+        if let Some(v) = smart_data.power_on_hours {
             let days = v / 24;
             let hours = v % 24;
-            smart_info.insert("power_on_hours".to_string(), serde_json::json!(format!("{} ({} Tage, {} Std.)", v, days, hours))); 
+            smart_info.insert("power_on_hours".to_string(), serde_json::json!(format!("{} ({} Tage, {} Std.)", v, days, hours)));
         }
         if let Some(v) = smart_data.power_cycle_count { smart_info.insert("power_cycle_count".to_string(), serde_json::json!(v)); }
-        
+
         // Self-test info
         if let Some(v) = &smart_data.self_test_status { smart_info.insert("self_test_status".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.self_test_short_minutes { smart_info.insert("self_test_short_minutes".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.self_test_extended_minutes { smart_info.insert("self_test_extended_minutes".to_string(), serde_json::json!(v)); }
-        
+
         // Error logs
         if let Some(v) = smart_data.error_log_count { smart_info.insert("error_log_count".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.self_test_log_count { smart_info.insert("self_test_log_count".to_string(), serde_json::json!(v)); }
-        
+
         // SSD-specific
         if let Some(v) = smart_data.endurance_used_percent { smart_info.insert("endurance_used_percent".to_string(), serde_json::json!(format!("{}%", v))); }
         if let Some(v) = smart_data.spare_available_percent { smart_info.insert("spare_available_percent".to_string(), serde_json::json!(format!("{}%", v))); }
-        
+
         // Data transfer stats
-        if let Some(v) = smart_data.total_lbas_written { 
+        if let Some(v) = smart_data.total_lbas_written {
             let tb = (v as f64 * 512.0) / 1_000_000_000_000.0;
-            smart_info.insert("total_data_written".to_string(), serde_json::json!(format!("{:.2} TB", tb))); 
+            smart_info.insert("total_data_written".to_string(), serde_json::json!(format!("{:.2} TB", tb)));
         }
-        if let Some(v) = smart_data.total_lbas_read { 
+        if let Some(v) = smart_data.total_lbas_read {
             let tb = (v as f64 * 512.0) / 1_000_000_000_000.0;
-            smart_info.insert("total_data_read".to_string(), serde_json::json!(format!("{:.2} TB", tb))); 
+            smart_info.insert("total_data_read".to_string(), serde_json::json!(format!("{:.2} TB", tb)));
         }
-        
+
         // Sector health
         if let Some(v) = smart_data.reallocated_sectors { smart_info.insert("reallocated_sectors".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.pending_sectors { smart_info.insert("pending_sectors".to_string(), serde_json::json!(v)); }
         if let Some(v) = smart_data.uncorrectable_sectors { smart_info.insert("uncorrectable_sectors".to_string(), serde_json::json!(v)); }
-        
+
         // Full SMART attributes table
         if !smart_data.attributes.is_empty() {
             let attrs: Vec<serde_json::Value> = smart_data.attributes.iter().map(|a| {
@@ -4411,15 +3331,15 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
             }).collect();
             smart_info.insert("attributes_table".to_string(), serde_json::json!(attrs));
         }
-        
+
         smart_info.insert("source".to_string(), serde_json::json!(&smart_data.source));
         smart_info.insert("smart_supported".to_string(), serde_json::json!(smart_data.available));
-        
+
         result["smart_info"] = serde_json::json!(smart_info);
     } else {
         #[cfg(debug_assertions)] eprintln!("[SMART Debug] try_smartctl returned None - SMART not available for {}", smart_disk_id);
     }
-    
+
     // 17. Calculate checksums of first sector
     let checksum_cmd = format!(
         "dd if=/dev/r{} bs=512 count=1 2>/dev/null | md5",
@@ -4430,7 +3350,7 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         if !md5.is_empty() {
             let mut checksums = serde_json::Map::new();
             checksums.insert("mbr_md5".to_string(), serde_json::json!(md5));
-            
+
             // Also get SHA256
             let sha_cmd = format!(
                 "dd if=/dev/r{} bs=512 count=1 2>/dev/null | shasum -a 256",
@@ -4442,11 +3362,11 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
                     checksums.insert("mbr_sha256".to_string(), serde_json::json!(hash));
                 }
             }
-            
+
             result["sector_checksums"] = serde_json::json!(checksums);
         }
     }
-    
+
     let mut sources = vec!["diskutil".to_string(), "raw disk header".to_string()];
     if result.get("usb_info").is_some() { sources.push("system_profiler".to_string()); }
     if result.get("smart_info").is_some() { sources.push("SMART / smartctl".to_string()); }
@@ -4462,6 +3382,9 @@ async fn forensic_analysis(disk_id: String, password: String) -> Result<serde_js
         limitations.push("filesystem_metadata_unavailable".to_string());
     }
 
+    if scan_cache.values().any(|v| v["scan_quality"]["complete"] == false) {
+        limitations.push("filesystem_scan_incomplete".to_string());
+    }
     result["analysis_quality"] = serde_json::json!({
         "mode": "read_only",
         "sources": sources,
@@ -4511,7 +3434,7 @@ fn usb_vendor_lookup(vendor_id: &str) -> Option<&'static str> {
         "0x14cd" => Some("Super Top"),
         "0x1bcf" => Some("Sunplus Innovation"),
         "0x0080" => Some("Assmann Electronic"),
-        // External HDD/SSD vendors  
+        // External HDD/SSD vendors
         "0x0480" => Some("Toshiba America Inc."),
         "0x07ab" => Some("Freecom Technologies"),
         "0x059b" => Some("Iomega Corporation"),
@@ -4567,27 +3490,27 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
                     .and_then(|v| v.as_str()).unwrap_or("");
                 let link_speed = reader.get("spcardreader_link-speed")
                     .and_then(|v| v.as_str()).unwrap_or("");
-                
+
                 // Search in _items for cards
                 if let Some(items) = reader.get("_items") {
                     if let Some(cards) = items.as_array() {
                         for card in cards {
                             let bsd_name = card.get("bsd_name").and_then(|b| b.as_str()).unwrap_or("");
-                            
+
                             // Match by disk ID
                             if bsd_name == disk_id || disk_id.starts_with(bsd_name) || bsd_name.starts_with(&disk_id.replace("s1", "").replace("s2", "")) {
                                 let mut info = serde_json::Map::new();
-                                
+
                                 // Card type and name
                                 if let Some(name) = card.get("_name").and_then(|n| n.as_str()) {
                                     info.insert("product_name".to_string(), serde_json::json!(name));
                                 }
-                                
+
                                 // Product name from card
                                 if let Some(product) = card.get("spcardreader_card_productname").and_then(|p| p.as_str()) {
                                     info.insert("card_model".to_string(), serde_json::json!(product));
                                 }
-                                
+
                                 // Manufacturer from ID lookup
                                 if let Some(mfr_id) = card.get("spcardreader_card_manufacturer-id").and_then(|m| m.as_str()) {
                                     info.insert("manufacturer_id".to_string(), serde_json::json!(mfr_id));
@@ -4595,37 +3518,37 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
                                         info.insert("manufacturer".to_string(), serde_json::json!(mfr_name));
                                     }
                                 }
-                                
+
                                 // Serial number
                                 if let Some(serial) = card.get("spcardreader_card_serialnumber").and_then(|s| s.as_str()) {
                                     info.insert("serial_number".to_string(), serde_json::json!(serial));
                                 }
-                                
+
                                 // Manufacturing date
                                 if let Some(date) = card.get("spcardreader_card_manufacturing_date").and_then(|d| d.as_str()) {
                                     info.insert("manufacturing_date".to_string(), serde_json::json!(date));
                                 }
-                                
+
                                 // Product revision
                                 if let Some(rev) = card.get("spcardreader_card_productrevision").and_then(|r| r.as_str()) {
                                     info.insert("device_version".to_string(), serde_json::json!(rev));
                                 }
-                                
+
                                 // SD spec version
                                 if let Some(spec) = card.get("spcardreader_card_specversion").and_then(|s| s.as_str()) {
                                     info.insert("sd_spec_version".to_string(), serde_json::json!(spec));
                                 }
-                                
+
                                 // Size
                                 if let Some(size) = card.get("size").and_then(|s| s.as_str()) {
                                     info.insert("capacity".to_string(), serde_json::json!(size));
                                 }
-                                
+
                                 // SMART status
                                 if let Some(smart) = card.get("smart_status").and_then(|s| s.as_str()) {
                                     info.insert("smart_status".to_string(), serde_json::json!(smart));
                                 }
-                                
+
                                 // Card reader info
                                 if !link_speed.is_empty() {
                                     info.insert("reader_link_speed".to_string(), serde_json::json!(link_speed));
@@ -4633,9 +3556,9 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
                                 if !reader_vendor_id.is_empty() {
                                     info.insert("reader_vendor_id".to_string(), serde_json::json!(reader_vendor_id));
                                 }
-                                
+
                                 info.insert("hardware_type".to_string(), serde_json::json!("SD Card"));
-                                
+
                                 return Some(serde_json::json!(info));
                             }
                         }
@@ -4650,21 +3573,21 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
 fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_name: &str) -> Option<serde_json::Value> {
     // SPUSBHostDataType uses different field names than SPUSBDataType
     // We search recursively and match by media_name (e.g., "SanDisk 3.2Gen1")
-    
+
     // Helper function to extract USB device info from an item
     fn extract_device_info(item: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         let mut info = serde_json::Map::new();
-        
+
         let device_name = item.get("_name").and_then(|n| n.as_str()).unwrap_or("").trim();
-        
+
         // Product name
         info.insert("product_name".to_string(), serde_json::json!(device_name));
-        
+
         // Vendor ID and real manufacturer name from lookup
         let vendor_id = item.get("USBDeviceKeyVendorID").and_then(|v| v.as_str()).unwrap_or("");
         if !vendor_id.is_empty() {
             info.insert("vendor_id".to_string(), serde_json::json!(vendor_id));
-            
+
             // Look up the real manufacturer name from USB-IF registry
             if let Some(real_manufacturer) = usb_vendor_lookup(vendor_id) {
                 info.insert("manufacturer".to_string(), serde_json::json!(real_manufacturer));
@@ -4674,12 +3597,12 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
         } else if let Some(vendor) = item.get("USBDeviceKeyVendorName").and_then(|v| v.as_str()) {
             info.insert("manufacturer".to_string(), serde_json::json!(vendor.trim()));
         }
-        
+
         // Product ID
         if let Some(product_id) = item.get("USBDeviceKeyProductID").and_then(|p| p.as_str()) {
             info.insert("product_id".to_string(), serde_json::json!(product_id));
         }
-        
+
         // Serial number
         if let Some(serial) = item.get("USBDeviceKeySerialNumber").and_then(|s| s.as_str()) {
             let serial_val = if serial == "Not Provided" { "" } else { serial };
@@ -4687,33 +3610,33 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
                 info.insert("serial_number".to_string(), serde_json::json!(serial_val));
             }
         }
-        
+
         // Link speed (e.g., "5 Gb/s", "480 Mb/s")
         if let Some(speed) = item.get("USBDeviceKeyLinkSpeed").and_then(|s| s.as_str()) {
             info.insert("usb_speed".to_string(), serde_json::json!(speed));
         }
-        
+
         // Product version
         if let Some(version) = item.get("USBDeviceKeyProductVersion").and_then(|v| v.as_str()) {
             info.insert("device_version".to_string(), serde_json::json!(version));
         }
-        
+
         // Power allocation (e.g., "4.48 W (896 mA)")
         if let Some(power) = item.get("USBDeviceKeyPowerAllocation").and_then(|p| p.as_str()) {
             info.insert("power_allocation".to_string(), serde_json::json!(power));
         }
-        
+
         // Location ID
         if let Some(location) = item.get("USBKeyLocationID").and_then(|l| l.as_str()) {
             info.insert("location_id".to_string(), serde_json::json!(location));
         }
-        
+
         // Hardware type
         info.insert("hardware_type".to_string(), serde_json::json!("USB Storage Device"));
-        
+
         info
     }
-    
+
     // Known USB-SATA bridge controller names
     fn is_usb_sata_bridge(name: &str) -> bool {
         let bridge_patterns = [
@@ -4727,7 +3650,7 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
         let name_upper = name.to_uppercase();
         bridge_patterns.iter().any(|p| name_upper.contains(&p.to_uppercase()))
     }
-    
+
     fn search_devices(items: &serde_json::Value, media_name: &str, matched_device: &mut Option<serde_json::Value>, all_bridges: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
         if let Some(array) = items.as_array() {
             for item in array {
@@ -4736,10 +3659,10 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
                     .and_then(|h| h.as_str())
                     .map(|s| s == "Removable")
                     .unwrap_or(false);
-                
+
                 if is_removable {
                     let device_name = item.get("_name").and_then(|n| n.as_str()).unwrap_or("").trim();
-                    
+
                     // Check if this device matches our media_name
                     let name_matches = !media_name.is_empty() && (
                         device_name.contains(media_name) ||
@@ -4747,19 +3670,19 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
                         device_name.trim().eq_ignore_ascii_case(media_name.trim()) ||
                         (media_name.len() > 3 && device_name.to_lowercase().contains(&media_name[..media_name.len().min(8)].to_lowercase()))
                     );
-                    
+
                     if name_matches && matched_device.is_none() {
                         let info = extract_device_info(item);
                         *matched_device = Some(serde_json::json!(info));
                         return;
                     }
-                    
+
                     // Collect USB-SATA bridges as potential candidates
                     if is_usb_sata_bridge(device_name) {
                         all_bridges.push(extract_device_info(item));
                     }
                 }
-                
+
                 // Recursively search in _items
                 if let Some(sub_items) = item.get("_items") {
                     search_devices(sub_items, media_name, matched_device, all_bridges);
@@ -4770,14 +3693,14 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
             }
         }
     }
-    
+
     let mut matched_device: Option<serde_json::Value> = None;
     let mut all_bridges: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-    
+
     if let Some(usb_data) = json_data.get("SPUSBHostDataType") {
         search_devices(usb_data, media_name, &mut matched_device, &mut all_bridges);
     }
-    
+
     // If no exact match found but we have USB-SATA bridges, return the first one
     // This handles cases like Samsung SSD 870 EVO connected via ASM105X bridge
     if matched_device.is_none() && !all_bridges.is_empty() {
@@ -4786,7 +3709,7 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
         bridge_info.insert("note".to_string(), serde_json::json!("USB-SATA Bridge Controller"));
         return Some(serde_json::json!(bridge_info));
     }
-    
+
     matched_device
 }
 
@@ -4794,7 +3717,7 @@ fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_nam
 fn analyze_boot_structure(disk_id: &str, password: &str) -> serde_json::Value {
     let device_path = format!("/dev/r{}", disk_id);
     let mut boot_info = serde_json::Map::new();
-    
+
     // Read raw bytes using Python for reliable access
     let python_script = format!(
         r#"
@@ -4806,13 +3729,13 @@ try:
     with os.fdopen(fd, 'rb') as f:
         # Read first 64KB
         data = f.read(65536)
-        
+
         # MBR analysis
         if len(data) >= 512:
             mbr = data[:512]
             has_mbr_sig = mbr[510] == 0x55 and mbr[511] == 0xAA
             print(f"MBR_SIG:{{has_mbr_sig}}")
-            
+
             # Partition table entries
             partitions = []
             for i in range(4):
@@ -4822,7 +3745,7 @@ try:
                 if part_type != 0:
                     partitions.append(f"{{i+1}}:type={{hex(part_type)}},boot={{'Y' if boot_flag == 0x80 else 'N'}}")
             print(f"PARTITIONS:{{';'.join(partitions) if partitions else 'none'}}")
-        
+
         # GPT check
         if len(data) >= 1024:
             gpt = data[512:1024]
@@ -4862,20 +3785,20 @@ try:
                         parts.append(f"{{i+1}}:{{name if name else '-'}}:{{str(type_guid).upper()}}")
                 print(f"GPT_EFI:{{has_efi}}")
                 print(f"GPT_PARTS:{{';'.join(parts) if parts else 'none'}}")
-        
+
         # ISO 9660 check (at 32KB offset)
         if len(data) >= 0x8006:
             f.seek(0x8001)
             iso_marker = f.read(5)
             is_iso = iso_marker == b'CD001'
             print(f"ISO9660:{{is_iso}}")
-            
+
             if is_iso:
                 # Read volume label
                 f.seek(0x8028)
                 vol_label = f.read(32).decode('ascii', errors='ignore').strip()
                 print(f"ISO_LABEL:{{vol_label}}")
-                
+
                 # El Torito boot catalog
                 f.seek(0x8801)
                 boot_marker = f.read(5)
@@ -4883,7 +3806,7 @@ try:
                 f.seek(0x8800)
                 boot_type = f.read(1)[0]
                 print(f"EL_TORITO:{{boot_type == 0 and has_boot}}")
-        
+
         print("SUCCESS")
 except Exception as e:
     print(f"ERROR:{{e}}")
@@ -4895,10 +3818,10 @@ except Exception as e:
     let tmp_script = std::env::temp_dir().join(format!("burniso_boot_{}.py", std::process::id()));
     let _ = std::fs::write(&tmp_script, &python_script);
     let cmd = format!("python3 {} ; rm -f {}", tmp_script.display(), tmp_script.display());
-    
+
     if let Ok(output) = sudo_sh(password, &cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        
+
         for line in stdout.lines() {
             if let Some((key, value)) = line.split_once(':') {
                 match key {
@@ -4916,14 +3839,14 @@ except Exception as e:
             }
         }
     }
-    
+
     serde_json::json!(boot_info)
 }
 
 /// Detect filesystem signatures from raw device and its partitions
 fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_json::Value> {
     let mut all_detected = Vec::new();
-    
+
     // FIRST: Check the WHOLE DISK for ISO 9660 filesystem (hybrid ISO images write directly to disk)
     // ISO 9660 "CD001" signature is at offset 0x8001 (32769 bytes)
     // Note: Use /dev/diskX (not /dev/rdiskX) because raw device doesn't support seek properly
@@ -4937,7 +3860,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             // Found ISO 9660! Now extract volume label and size
             let mut iso_info = serde_json::Map::new();
             iso_info.insert("type".to_string(), serde_json::json!("ISO 9660"));
-            
+
             // Extract volume label (at offset 32808 = 0x8028, 32 bytes)
             let label_cmd = format!(
                 "dd if=/dev/{} bs=1 skip=32808 count=32 2>/dev/null | tr -d '\\0' | xargs",
@@ -4949,7 +3872,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
                     iso_info.insert("label".to_string(), serde_json::json!(label));
                 }
             }
-            
+
             // Extract volume size using Python to read the 4-byte little-endian value at offset 32848
             let size_cmd = format!(
                 "python3 -c 'import os; f=os.open(\"/dev/{}\", os.O_RDONLY); os.lseek(f, 32848, 0); d=os.read(f, 4); os.close(f); print(int.from_bytes(d, \"little\") * 2048)' 2>/dev/null",
@@ -4964,7 +3887,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
                     }
                 }
             }
-            
+
             // Add the ISO detection with details
             let iso_entry = if let Some(label) = iso_info.get("label").and_then(|v| v.as_str()) {
                 if let Some(size) = iso_info.get("size_human").and_then(|v| v.as_str()) {
@@ -4978,16 +3901,16 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
                 "ISO 9660".to_string()
             };
             all_detected.push(iso_entry);
-            
+
             // Also store the full ISO info for later use
             // Note: This will be returned as part of the filesystem_signatures
         }
     }
-    
+
     // Get list of partitions for this disk
     let list_cmd = format!("diskutil list {} 2>/dev/null", shell_quote(disk_id));
     let mut partitions = vec![disk_id.to_string()];
-    
+
     if let Ok(output) = Command::new("sh").args(["-c", &list_cmd]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
@@ -4999,7 +3922,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             }
         }
     }
-    
+
     // Erste Quelle: diskutil. Liefert Dateisystemfamilie und Namen auch fuer
     // Volumes, die macOS nicht selbst einhaengen kann. Achtung: Bei
     // ext-Volumes traegt die Paragon-Personality keine Versionsangabe (siehe
@@ -5008,12 +3931,12 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
         if part_id == disk_id {
             continue; // Skip whole disk, only check partitions
         }
-        
+
         let info_cmd = format!("diskutil info {} 2>/dev/null", shell_quote(part_id));
         if let Ok(output) = Command::new("sh").args(["-c", &info_cmd]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut personality = String::new();
-            
+
             for line in stdout.lines() {
                 if line.contains("File System Personality:") {
                     if let Some(value) = line.split(':').nth(1) {
@@ -5021,7 +3944,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
                     }
                 }
             }
-            
+
             // Map Paragon UFSD personalities to filesystem names
             let fs_name = if personality.starts_with("UFSD_EXTFS") {
                 // Die Ziffer der Personality ist wertlos: Der Paragon-Treiber
@@ -5046,7 +3969,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             } else {
                 None
             };
-            
+
             if let Some(fs) = fs_name {
                 let entry = format!("{} ({})", fs, part_id);
                 if !all_detected.contains(&entry) {
@@ -5055,7 +3978,7 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
             }
         }
     }
-    
+
     // Scan each partition for filesystem signatures (fallback for unmounted/unknown filesystems)
     // Skip partitions already detected via diskutil
     for part_id in &partitions {
@@ -5064,9 +3987,9 @@ fn detect_filesystem_signatures(disk_id: &str, password: &str) -> Option<serde_j
         if already_detected {
             continue;
         }
-        
+
         let device_path = format!("/dev/r{}", part_id);
-        
+
         let python_script = format!(
             r#"
 import os
@@ -5079,11 +4002,11 @@ try:
         # Read enough data for all signatures
         data = f.read(131072)  # 128KB
         print(f"READ_BYTES:{{len(data)}}", file=sys.stderr)
-        
+
         # NTFS (offset 3)
         if len(data) >= 11 and data[3:7] == b'NTFS':
             print("FS_NTFS:True")
-        
+
         # FAT32 (offset 82 or 54)
         if len(data) >= 90:
             if data[82:90] == b'FAT32   ' or data[54:62] == b'FAT32   ':
@@ -5092,11 +4015,11 @@ try:
                 print("FS_FAT16:True")
             elif data[54:59] == b'FAT12':
                 print("FS_FAT12:True")
-        
+
         # exFAT (offset 3)
         if len(data) >= 11 and data[3:8] == b'EXFAT':
             print("FS_EXFAT:True")
-        
+
         # ext2/3/4 (superblock at offset 1024, magic at offset 0x38 within superblock = 1024+56 = 1080)
         if len(data) >= 1082:
             ext_magic = data[1080:1082]  # Magic at superblock offset 0x38 (56 bytes into superblock)
@@ -5105,22 +4028,22 @@ try:
                 # Check ext version using incompat features at offset 0x60 (96) within superblock
                 # and compat features at offset 0x5C (92)
                 ext_version = 2  # Default to ext2
-                
+
                 if len(data) >= 1124:
                     # Read feature flags
                     compat = int.from_bytes(data[1116:1120], 'little')      # 1024 + 92
                     incompat = int.from_bytes(data[1120:1124], 'little')    # 1024 + 96
                     ro_compat = int.from_bytes(data[1124:1128], 'little')   # 1024 + 100
-                    
+
                     print(f"EXT_COMPAT:{{compat:08x}} INCOMPAT:{{incompat:08x}} RO_COMPAT:{{ro_compat:08x}}", file=sys.stderr)
-                    
+
                     # ext4 detection: check for ext4-specific features
                     # INCOMPAT_EXTENTS (0x40), INCOMPAT_64BIT (0x80), INCOMPAT_FLEX_BG (0x200)
                     # INCOMPAT_MMP (0x100), INCOMPAT_INLINE_DATA (0x8000)
                     ext4_incompat_flags = 0x40 | 0x80 | 0x200 | 0x100 | 0x8000
                     # RO_COMPAT: HUGE_FILE (0x08), GDT_CSUM (0x10), DIR_NLINK (0x20), EXTRA_ISIZE (0x40)
                     ext4_ro_compat_flags = 0x08 | 0x10 | 0x20 | 0x40
-                    
+
                     if (incompat & ext4_incompat_flags) or (ro_compat & ext4_ro_compat_flags):
                         ext_version = 4
                     elif incompat & 0x04:  # INCOMPAT_RECOVER (has journal, so ext3+)
@@ -5131,34 +4054,34 @@ try:
                             ext_version = 3
                     elif compat & 0x04:  # COMPAT_HAS_JOURNAL
                         ext_version = 3
-                
+
                 if ext_version == 4:
                     print("FS_EXT4:True")
                 elif ext_version == 3:
                     print("FS_EXT3:True")
                 else:
                     print("FS_EXT2:True")
-        
+
         # HFS+ (offset 1024)
         if len(data) >= 1026:
             hfs_magic = data[1024:1026]
             if hfs_magic == b'H+' or hfs_magic == b'HX':
                 print("FS_HFSPLUS:True")
-        
+
         # APFS (look for NXSB magic at offset 32)
         if len(data) >= 36 and data[32:36] == b'NXSB':
             print("FS_APFS:True")
-        
+
         # Btrfs (superblock at 64KB + 64 bytes)
         f.seek(65536 + 64)
         btrfs_magic = f.read(8)
         if btrfs_magic == b'_BHRfS_M':
             print("FS_BTRFS:True")
-        
+
         # XFS (offset 0)
         if len(data) >= 4 and data[0:4] == b'XFSB':
             print("FS_XFS:True")
-        
+
         print("SUCCESS")
 except Exception as e:
     print(f"ERROR:{{e}}", file=sys.stderr)
@@ -5168,13 +4091,13 @@ except Exception as e:
         let tmp_script = std::env::temp_dir().join(format!("burniso_fs_{}_{}.py", std::process::id(), part_id));
         let _ = std::fs::write(&tmp_script, &python_script);
         let cmd = format!("python3 {} ; rm -f {}", tmp_script.display(), tmp_script.display());
-        
+
         if let Ok(output) = sudo_sh(password, &cmd) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let _stderr = String::from_utf8_lossy(&output.stderr);
-            
+
             // Note: stderr output is ignored - some devices don't support raw reads
-            
+
             for line in stdout.lines() {
                 if let Some((key, value)) = line.split_once(':') {
                     if value == "True" {
@@ -5193,7 +4116,7 @@ except Exception as e:
                             "FS_XFS" => "XFS",
                             _ => continue,
                         };
-                        
+
                         // Check if this is an EFI partition (0xEF) - if so, label as EFI
                         let mut final_fs_name = fs_name.to_string();
                         if part_id != disk_id {
@@ -5207,7 +4130,7 @@ except Exception as e:
                                 }
                             }
                         }
-                        
+
                         let entry = if part_id == disk_id {
                             final_fs_name
                         } else {
@@ -5221,13 +4144,13 @@ except Exception as e:
             }
         }
     }
-    
+
     if !all_detected.is_empty() {
         let mut signatures = serde_json::Map::new();
         signatures.insert("detected_filesystems".to_string(), serde_json::json!(all_detected));
         return Some(serde_json::json!(signatures));
     }
-    
+
     None
 }
 
@@ -5514,72 +4437,12 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Analyze mounted content (files, folders, OS detection)
-/// Ordner, die macOS und Windows selbst anlegen und laufend neu schreiben. Sie
-/// gehoeren nicht zum Nutzerinhalt und machen jede Zaehlung unreproduzierbar:
-/// derselbe Stick lieferte dadurch mal 128, mal 110 Eintraege.
-/// Wird von beiden Zaehlstellen genutzt, damit sie nicht auseinanderlaufen.
-const SYSTEM_PRUNE: &str = concat!(
-    "\\( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.TemporaryItems'",
-    " -o -name '.Trashes' -o -name '.DocumentRevisions-V100'",
-    " -o -name 'System Volume Information' -o -name '$RECYCLE.BIN' \\) -prune -o"
-);
-
-fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
-    // K-1: Einmal maskieren, danach ausschliesslich den maskierten Wert in
-    // Shell-Befehle einsetzen. `mount_point` bleibt fuer Pfadaufbau und
-    // Textersetzung unveraendert nutzbar.
-    let mp = shell_quote(mount_point);
-    let mut content = serde_json::Map::new();
-    
-    // Konsistent zur Zaehlung in filesystem_details: ohne den Einhaengepunkt selbst
-    // und mit getrennt ausgewiesenen Systemordnern. Die frueheren Grenzen -maxdepth 5
-    // und head -10000 haben tiefe bzw. grosse Baeume still unterzaehlt.
-    let count_cmds = [
-        ("total_items", format!("find {} -mindepth 1 -print 2>/dev/null | wc -l", mp)),
-        ("user_items", format!("find {} -mindepth 1 {} -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
-    ];
-
-    for (key, cmd) in count_cmds {
-        if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
-            if let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
-                content.insert(key.to_string(), serde_json::json!(count));
-            }
-        }
-    }
-    
-    // Get disk usage
-    let du_cmd = format!("du -sh {} 2>/dev/null", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &du_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(size) = stdout.split_whitespace().next() {
-            content.insert("used_space".to_string(), serde_json::json!(size));
-        }
-    }
-    
-    // Dateien und Ordner getrennt zaehlen, jeweils gesamt und ohne Systemordner.
-    // Drei Fehler waren hier zuvor eingebaut: ohne -mindepth 1 zaehlte -type d den
-    // Einhaengepunkt selbst mit (+1), ohne SYSTEM_PRUNE flossen genau die Ordner ein,
-    // die total_items/user_items darueber bereits herausrechnen, und die Zahl wurde
-    // als String abgelegt, waehrend total_items eine Zahl liefert.
-    let detail_cmds = [
-        ("file_count", format!("find {} -mindepth 1 -type f -print 2>/dev/null | wc -l", mp)),
-        ("user_file_count", format!("find {} -mindepth 1 {} -type f -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
-        ("directory_count", format!("find {} -mindepth 1 -type d -print 2>/dev/null | wc -l", mp)),
-        ("user_directory_count", format!("find {} -mindepth 1 {} -type d -print 2>/dev/null | wc -l", mp, SYSTEM_PRUNE)),
-    ];
-
-    for (key, cmd) in detail_cmds {
-        if let Ok(output) = Command::new("sh").args(["-c", &cmd]).output() {
-            if let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
-                content.insert(key.to_string(), serde_json::json!(count));
-            }
-        }
-    }
-    
+fn analyze_mounted_content(mount_point: &str, cache: &mut std::collections::HashMap<String, serde_json::Value>) -> Option<serde_json::Value> {
+    let summary = cache.entry(mount_point.to_string()).or_insert_with(|| forensic_scan::scan(std::path::Path::new(mount_point)));
+    let mut content = summary.as_object()?.clone();
     // Detect OS installations
     let mut detected_os = Vec::new();
-    
+
     // Check for Windows
     let windows_paths = [
         "Windows/System32",
@@ -5596,7 +4459,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
             break;
         }
     }
-    
+
     // Check for Linux
     let linux_paths = [
         "boot/vmlinuz",
@@ -5613,7 +4476,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
             break;
         }
     }
-    
+
     // Check for macOS installer
     let macos_paths = [
         "Install macOS",
@@ -5632,7 +4495,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
             }
         }
     }
-    
+
     // Check for Linux distributions and get detailed info
     let os_release_path = format!("{}/etc/os-release", mount_point);
     if let Ok(contents) = std::fs::read_to_string(&os_release_path) {
@@ -5653,7 +4516,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
         if !linux_info.is_empty() {
             content.insert("linux_system_info".to_string(), serde_json::json!(linux_info));
         }
-        
+
         // Get home users for Linux
         let home_path = format!("{}/home", mount_point);
         if std::path::Path::new(&home_path).exists() {
@@ -5669,7 +4532,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
                 }
             }
         }
-        
+
         // Check for installed package count
         let dpkg_path = format!("{}/var/lib/dpkg/status", mount_point);
         if std::path::Path::new(&dpkg_path).exists() {
@@ -5679,7 +4542,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
                 content.insert("installed_packages_dpkg".to_string(), serde_json::json!(count));
             }
         }
-        
+
         // Check for kernel versions
         let boot_path = format!("{}/boot", mount_point);
         if std::path::Path::new(&boot_path).exists() {
@@ -5696,19 +4559,19 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
             }
         }
     }
-    
+
     // Check for Windows system info
     let win_path = format!("{}/Windows", mount_point);
     if std::path::Path::new(&win_path).exists() {
         let mut windows_info = serde_json::Map::new();
         windows_info.insert("is_windows_system".to_string(), serde_json::json!(true));
-        
+
         // Check Windows version hints
         let sys_apps = format!("{}/Windows/SystemApps", mount_point);
         if std::path::Path::new(&sys_apps).exists() {
             windows_info.insert("version_hint".to_string(), serde_json::json!("Windows 10/11"));
         }
-        
+
         // Get Windows user profiles
         let users_path = format!("{}/Users", mount_point);
         if std::path::Path::new(&users_path).exists() {
@@ -5724,7 +4587,7 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
                 }
             }
         }
-        
+
         // Get installed programs
         let prog_path = format!("{}/Program Files", mount_point);
         if std::path::Path::new(&prog_path).exists() {
@@ -5740,127 +4603,15 @@ fn analyze_mounted_content(mount_point: &str) -> Option<serde_json::Value> {
                 }
             }
         }
-        
+
         content.insert("windows_system_info".to_string(), serde_json::json!(windows_info));
     }
-    
+
     if !detected_os.is_empty() {
         content.insert("detected_os".to_string(), serde_json::json!(detected_os));
     }
-    
-    // List top-level directories with details
-    let ls_cmd = format!("ls -la {} 2>/dev/null | head -35", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &ls_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        content.insert("root_listing".to_string(), serde_json::json!(stdout.trim()));
-    }
-    
-    // Also get simple list for backwards compatibility
-    let ls_simple_cmd = format!("ls -1 {} 2>/dev/null | head -30", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &ls_simple_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let dirs: Vec<&str> = stdout.lines().collect();
-        if !dirs.is_empty() {
-            content.insert("top_level_items".to_string(), serde_json::json!(dirs));
-        }
-    }
-    
-    // Get largest files with human-readable sizes
-    let large_cmd = format!(
-        "find {} -type f -exec stat -f '%z %N' {{}} \\; 2>/dev/null | sort -rn | head -10",
-        mp
-    );
-    if let Ok(output) = Command::new("sh").args(["-c", &large_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let files: Vec<serde_json::Value> = stdout.lines()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                if parts.len() == 2 {
-                    let size_bytes: u64 = parts[0].parse().unwrap_or(0);
-                    let size_human = if size_bytes >= 1073741824 {
-                        format!("{:.2} GB", size_bytes as f64 / 1073741824.0)
-                    } else if size_bytes >= 1048576 {
-                        format!("{:.2} MB", size_bytes as f64 / 1048576.0)
-                    } else if size_bytes >= 1024 {
-                        format!("{:.2} KB", size_bytes as f64 / 1024.0)
-                    } else {
-                        format!("{} B", size_bytes)
-                    };
-                    Some(serde_json::json!({
-                        "size_bytes": size_bytes,
-                        "size_human": size_human,
-                        "path": parts[1].replace(mount_point, "")
-                    }))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !files.is_empty() {
-            content.insert("largest_files".to_string(), serde_json::json!(files));
-        }
-    }
-    
-    // Get hidden files
-    let hidden_cmd = format!("find {} -maxdepth 2 -name '.*' -type f 2>/dev/null | head -20", mp);
-    if let Ok(output) = Command::new("sh").args(["-c", &hidden_cmd]).output() {
-        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(|l| l.replace(mount_point, "").to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !files.is_empty() {
-            content.insert("hidden_files".to_string(), serde_json::json!(files));
-        }
-    }
-    
-    // Get file type distribution
-    let types_cmd = format!(
-        "find {} -type f -name '*.*' 2>/dev/null | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -15",
-        mp
-    );
-    if let Ok(output) = Command::new("sh").args(["-c", &types_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let types: Vec<serde_json::Value> = stdout.lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                if parts.len() == 2 {
-                    Some(serde_json::json!({
-                        "count": parts[0].trim(),
-                        "extension": parts[1].trim()
-                    }))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !types.is_empty() {
-            content.insert("file_type_distribution".to_string(), serde_json::json!(types));
-        }
-    }
-    
-    // Get recently modified files (last 7 days)
-    let recent_cmd = format!(
-        "find {} -type f -mtime -7 2>/dev/null | head -15",
-        mp
-    );
-    if let Ok(output) = Command::new("sh").args(["-c", &recent_cmd]).output() {
-        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(|l| l.replace(mount_point, "").to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !files.is_empty() {
-            content.insert("recently_modified".to_string(), serde_json::json!(files));
-        }
-    }
 
-    if content.is_empty() {
-        None
-    } else {
-        Some(serde_json::json!(content))
-    }
+    Some(serde_json::Value::Object(content))
 }
 
 /// Reduziert eine Partitionskennung auf ihren Datentraeger: "disk11s2" -> "disk11".
@@ -5952,13 +4703,13 @@ fn contains_dir_named(mount_point: &str, name: &str) -> bool {
 /// Detect special structures (hidden partitions, recovery, etc.)
 fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json::Value> {
     let mut special = serde_json::Map::new();
-    
+
     // Check for hidden partitions using diskutil
     let hidden_cmd = format!(
         "diskutil list {} 2>/dev/null | grep -i 'EFI\\|Recovery\\|hidden\\|Microsoft Reserved'",
         disk_id
     );
-    
+
     if let Ok(output) = sudo_sh(password, &hidden_cmd) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.trim().is_empty() {
@@ -5966,7 +4717,7 @@ fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json
             special.insert("special_partitions".to_string(), serde_json::json!(partitions));
         }
     }
-    
+
     // Ein Recovery-Ordner zaehlt nur, wenn er auf *diesem* Datentraeger liegt.
     // Die Pruefung lief zuvor ueber "ls /Volumes/*/Recovery" und meldete damit
     // auch Funde auf fremden, gleichzeitig eingehaengten Datentraegern.
@@ -5976,7 +4727,7 @@ fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json
     if has_recovery {
         special.insert("has_windows_recovery".to_string(), serde_json::json!(true));
     }
-    
+
     if special.is_empty() {
         None
     } else {
@@ -5987,13 +4738,14 @@ fn detect_special_structures(disk_id: &str, password: &str) -> Option<serde_json
 /// Check if a USB disk is bootable (EFI/MBR/Hybrid)
 #[tauri::command]
 async fn check_bootable(disk_id: String, password: String) -> Result<serde_json::Value, String> {
+    let _operation = start_operation(&disk_id)?;
     // Nur-lesend, aber die Kennung landet in einem Python-Stringliteral, das als
     // root ausgefuehrt wird — ein Anfuehrungszeichen wuerde daraus ausbrechen.
     if !is_valid_disk_id(&disk_id) {
         return Err("Invalid disk identifier".to_string());
     }
     let disk_path = format!("/dev/r{}", disk_id);
-    
+
     // Use Python with sudo to read raw disk bytes
     let python_script = format!(
         r#"
@@ -6008,15 +4760,15 @@ try:
         if len(mbr) < 512:
             print("ERROR:MBR zu klein")
             sys.exit(1)
-        
+
         # Check MBR signature
         has_mbr = mbr[510] == 0x55 and mbr[511] == 0xAA
-        
+
         # Read GPT header (sector 1)
         f.seek(512)
         gpt_header = f.read(512)
         has_gpt = len(gpt_header) >= 8 and gpt_header[0:8] == b'EFI PART'
-        
+
         # Check partition entries in MBR
         has_efi = False
         has_bootable = False
@@ -6028,7 +4780,7 @@ try:
                 has_bootable = True
             if part_type == 0xEF:
                 has_efi = True
-        
+
         # Bei GPT steht die EFI System Partition in der GPT-Tabelle. Im MBR
         # findet sich dort nur der Schutzeintrag 0xEE - der ist keine EFI-Partition.
         if has_gpt:
@@ -6048,19 +4800,19 @@ try:
                     if uuid.UUID(bytes_le=table[off:off + 16]) == ESP_TYPE:
                         has_efi = True
                         break
-        
+
         # Check for ISO 9660
         f.seek(0x8000)
         iso_pvd = f.read(2048)
         is_iso = len(iso_pvd) >= 6 and iso_pvd[1:6] == b'CD001'
-        
+
         # Check El Torito
         has_el_torito = False
         if is_iso:
             f.seek(0x8800)
             boot_record = f.read(2048)
             has_el_torito = len(boot_record) >= 6 and boot_record[1:6] == b'CD001' and boot_record[0] == 0
-        
+
         # Output results
         print(f"MBR:{{'1' if has_mbr else '0'}}")
         print(f"GPT:{{'1' if has_gpt else '0'}}")
@@ -6079,13 +4831,13 @@ except Exception as e:
     std::fs::write(&tmp_script, &python_script)
         .map_err(|e| format!("Fehler beim Schreiben des Skripts: {}", e))?;
     let cmd = format!("python3 {} ; rm -f {}", tmp_script.display(), tmp_script.display());
-    
+
     let output = sudo_sh(&password, &cmd)
         .map_err(|e| format!("Fehler beim Ausführen: {}", e))?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    
+
     if !output.status.success() || stdout.contains("ERROR:") {
         let error_msg = if stdout.contains("ERROR:") {
             stdout.lines().find(|l| l.starts_with("ERROR:"))
@@ -6096,7 +4848,7 @@ except Exception as e:
         };
         return Err(format!("Bootcheck failed: {}", error_msg));
     }
-    
+
     // Parse results
     let has_mbr = stdout.contains("MBR:1");
     let has_gpt = stdout.contains("GPT:1");
@@ -6104,7 +4856,7 @@ except Exception as e:
     let has_bootable = stdout.contains("BOOTABLE:1");
     let is_iso = stdout.contains("ISO:1");
     let has_el_torito = stdout.contains("ELTORITO:1");
-    
+
     // Determine boot type
     let boot_type = if has_gpt && has_efi {
         "UEFI (GPT)"
@@ -6121,9 +4873,9 @@ except Exception as e:
     } else {
         "Nicht bootfähig"
     };
-    
+
     let is_bootable = has_gpt || has_bootable || has_el_torito || has_efi;
-    
+
     Ok(serde_json::json!({
         "bootable": is_bootable,
         "boot_type": boot_type,
@@ -6170,14 +4922,14 @@ sys.exit(0)"#, device_path);
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    
+
     if let Some(ref mut stdin) = child.stdin {
         writeln!(stdin, "{}", password).ok();
     }
-    
+
     let output = child.wait_with_output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     for line in stdout.lines() {
         if let Some(size_str) = line.strip_prefix("ISO_SIZE:") {
             if let Ok(size) = size_str.parse::<u64>() {
@@ -6185,7 +4937,7 @@ sys.exit(0)"#, device_path);
             }
         }
     }
-    
+
     None
 }
 
@@ -6194,439 +4946,106 @@ fn emit_progress(app: &AppHandle, percent: u32, status: &str, operation: &str) {
         percent,
         status: status.to_string(),
         operation: operation.to_string(),
-        operation_id: CURRENT_OPERATION_ID.load(Ordering::SeqCst),
+        operation_id: operations::current_id(),
     });
 }
 
 #[tauri::command]
-async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: String, verify: bool, eject: bool) -> Result<String, String> {
+async fn burn_iso(app: AppHandle, iso_path: String, disk_id: String, password: String, verify: bool, eject: bool) -> Result<burn_completion::BurnResult, String> {
+    let guard = start_operation(&disk_id)?;
     CANCEL_BURN.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    let compressed_size = std::fs::metadata(&iso_path)
-        .map_err(|e| format!("Image nicht gefunden: {}", e))?
-        .len();
-    // Schreibende Operation: Kennung und Zieleignung pruefen (K-2/W-2).
-    ensure_writable_target(&disk_id)?;
-    let python3_path = get_python3_path().ok_or(
-        "Das Schreiben von Images benötigt Python 3. Installieren Sie es mit: brew install python",
-    )?;
-    let is_xz = is_xz_compressed(&iso_path)?;
-    let xz_path = if is_xz {
-        Some(get_xz_path().ok_or(
-            "Für XZ-komprimierte Images wird xz benötigt. Installieren Sie es mit: brew install xz",
-        )?)
-    } else {
-        None
-    };
-    let image_size = if let Some(ref xz_path) = xz_path {
-        xz_uncompressed_size(xz_path, &iso_path)?
-    } else {
-        compressed_size
-    };
-    let disk_size = get_disk_size(&disk_id)?;
-    if image_size > disk_size {
-        return Err(format!(
-            "Image ist zu groß: {} benötigt, Datenträger bietet nur {}",
-            format_bytes(image_size),
-            format_bytes(disk_size)
-        ));
-    }
-    let iso_path_literal = serde_json::to_string(&iso_path)
-        .map_err(|e| format!("Image-Pfad konnte nicht verarbeitet werden: {}", e))?;
-    let xz_path_literal = serde_json::to_string(xz_path.as_deref().unwrap_or(""))
-        .map_err(|e| format!("XZ-Pfad konnte nicht verarbeitet werden: {}", e))?;
-    
-    let _ = app.emit("burn_phase", "writing");
-    emit_progress(&app, 0, "Vorbereitung...", "burn");
-    
-    let disk_path = format!("/dev/{}", disk_id);
-    let rdisk_path = format!("/dev/r{}", disk_id);
-    
-    emit_progress(&app, 0, "Unmount Disk...", "burn");
-    ensure_disk_unmounted(&app, &disk_id)?;
-    
-    let source_label = if is_xz { "Entpacke und schreibe XZ-Image auf USB..." } else { "Schreibe Image auf USB..." };
-    emit_progress(&app, 0, source_label, "burn");
-    
-    // Brennen und Pruefen laufen bewusst in EINEM Prozess mit EINER offenen
-    // Geraetekennung. macOS haengt einen Datentraeger erst dann ein, wenn der
-    // schreibende Prozess das Rohgeraet schliesst - und schreibt dabei
-    // Metadaten (FSInfo, Belegungstabellen, .fseventsd, .Spotlight-V100) auf
-    // jede FAT-Partition. Ein danach gestarteter zweiter Pruefprozess verglich
-    // also gegen einen bereits veraenderten Datentraeger und meldete
-    // Abweichungen, die der Brenner nie verursacht hat. Solange die Kennung
-    // offen bleibt, kommt niemand dazwischen.
-    let python_script = format!(
-        r#"import os, sys, subprocess, time
-iso_path = {}
-xz_path = {}
-disk_path = "{}"
-buffer_size = 8 * 1024 * 1024
-progress_interval = 32 * 1024 * 1024
-total_size = {}
-is_xz = {}
-do_verify = {}
-copied = 0
-next_progress = progress_interval
-xz_process = None
-
-def quelle_oeffnen():
-    # Liefert (Datenstrom, Prozess). Bei XZ entpackt ein eigener Prozess in eine Roehre.
-    if is_xz:
-        # Two decoder threads keep decompression ahead of USB write speed
-        # without competing with the writer for all CPU cores and memory.
-        prozess = subprocess.Popen(
-            [xz_path, '--threads=2', '--decompress', '--stdout', '--', iso_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if prozess.stdout is None:
-            raise OSError('could not open XZ output stream')
-        return prozess.stdout, prozess
-    return open(iso_path, 'rb'), None
-
-def quelle_schliessen(strom, prozess):
-    strom.close()
-    if prozess is not None:
-        meldung = prozess.stderr.read().decode('utf-8', errors='replace').strip()
-        if prozess.wait() != 0:
-            raise OSError(meldung or 'XZ-Dekomprimierung fehlgeschlagen')
-
-def geraet_oeffnen():
-    # Virenscanner und Indexdienste greifen einen frisch erkannten Datentraeger
-    # sofort. Ein paar Anlaeufe kosten nichts und ersparen einen Fehlschlag.
-    letzter = None
-    for _ in range(8):
-        try:
-            return os.open(disk_path, os.O_RDWR)
-        except OSError as exc:
-            letzter = exc
-            time.sleep(1)
-    raise OSError("Rohgeraet %s liess sich nicht oeffnen: errno=%s %s"
-                  % (disk_path, getattr(letzter, 'errno', '?'), letzter))
-
-def lies_genau(leser, anzahl):
-    # Das Rohgeraet wird ungepuffert gelesen: dort fuehrt ein Lesevorgang genau
-    # einen Systemaufruf aus und darf weniger als die angeforderte Menge liefern.
-    # Ohne Nachfassen verschoebe sich der Lesezeiger gegenueber dem Abbild - und
-    # ab da meldete jeder weitere Block eine Abweichung, die es gar nicht gibt.
-    teile = []
-    rest = anzahl
-    while rest > 0:
-        stueck = leser(rest)
-        if not stueck:
-            break
-        teile.append(stueck)
-        rest -= len(stueck)
-    return b"".join(teile)
-
-fd = None
-try:
-    fd = geraet_oeffnen()
-    src, xz_process = quelle_oeffnen()
-    while True:
-        chunk = src.read(buffer_size)
-        if not chunk: break
-        view = memoryview(chunk)
-        while view:
-            count = os.write(fd, view)
-            if count is None or count <= 0:
-                raise OSError("short write to destination device")
-            view = view[count:]
-        copied += len(chunk)
-        if copied >= next_progress or copied == total_size:
-            print(f"BYTES:{{copied}}", flush=True)
-            next_progress = copied + progress_interval
-    os.fsync(fd)
-    quelle_schliessen(src, xz_process)
-    xz_process = None
-    print("WRITE_SUCCESS", flush=True)
-
-    if do_verify:
-        # Zurueck auf Byte 0 - ohne die Kennung zwischendurch zu schliessen.
-        os.lseek(fd, 0, os.SEEK_SET)
-        src, xz_process = quelle_oeffnen()
-        geprueft = 0
-        fehler = 0
-        next_progress = progress_interval
-        while geprueft < total_size:
-            soll = lies_genau(src.read, min(buffer_size, total_size - geprueft))
-            if not soll: break
-            ist = lies_genau(lambda anzahl: os.read(fd, anzahl), len(soll))
-            if soll != ist:
-                fehler += 1
-            geprueft += len(soll)
-            if geprueft >= next_progress or geprueft == total_size:
-                print(f"VERIFY:{{geprueft}}:{{fehler}}", flush=True)
-                next_progress = geprueft + progress_interval
-        quelle_schliessen(src, xz_process)
-        xz_process = None
-        if fehler == 0:
-            print("VERIFY_SUCCESS", flush=True)
-        else:
-            print(f"VERIFY_FAILED:{{fehler}}", flush=True)
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-finally:
-    if xz_process is not None and xz_process.poll() is None:
-        xz_process.kill()
-    if fd is not None:
-        os.close(fd)"#, iso_path_literal, xz_path_literal, rdisk_path, image_size,
-        if is_xz { "True" } else { "False" }, if verify { "True" } else { "False" });
-
-    let mut child = Command::new("sudo").args(["-S", &python3_path, "-c", &python_script])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-        .map_err(|e| format!("Fehler beim Starten: {}", e))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        writeln!(stdin, "{}", password).ok();
-    }
-
-    // stderr muss nebenlaeufig geleert werden. Bliebe die Roehre ungelesen,
-    // liefe ihr Puffer voll und das Skript haenge beim naechsten Schreiben fest
-    // - und der einzige Hinweis auf die wahre Ursache ginge verloren.
-    let stderr_job = child.stderr.take().map(|mut err| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = err.read_to_string(&mut text);
-            text
-        })
-    });
-
-    let stdout = child.stdout.take().ok_or("Kein stdout")?;
-    let reader = BufReader::new(stdout);
-    let mut write_success = false;
-    let mut verify_success = false;
-    let mut verify_errors: u32 = 0;
-    let mut verify_done_bytes: u64 = 0;
-
-    for line in reader.lines().map_while(Result::ok) {
-        if CANCEL_BURN.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            return Err("Brennvorgang abgebrochen".to_string());
-        }
-        if let Some(stripped) = line.strip_prefix("BYTES:") {
-            if let Ok(bytes) = stripped.parse::<u64>() {
-                let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
-                emit_progress(&app, percent.min(100), &format!("SCHREIBEN: {}%", percent.min(100)), "burn");
-            }
-        } else if line.contains("WRITE_SUCCESS") {
-            write_success = true;
-            if verify {
-                let _ = app.emit("burn_phase", "verifying");
-                emit_progress(&app, 0, "VERIFIZIEREN: 0%", "burn");
-            }
-        } else if let Some(stripped) = line.strip_prefix("VERIFY:") {
-            let mut teile = stripped.split(':');
-            if let (Some(bytes_str), Some(err_str)) = (teile.next(), teile.next()) {
-                if let (Ok(bytes), Ok(errs)) = (bytes_str.parse::<u64>(), err_str.parse::<u32>()) {
-                    verify_done_bytes = bytes;
-                    let percent = ((bytes as f64 / image_size as f64) * 100.0) as u32;
-                    let status_msg = if errs > 0 {
-                        format!("VERIFIZIEREN: {}% ({} Fehler)", percent.min(100), errs)
-                    } else {
-                        format!("VERIFIZIEREN: {}%", percent.min(100))
-                    };
-                    emit_progress(&app, percent.min(100), &status_msg, "burn");
+    app.emit("operation_start", guard.id).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        ensure_writable_target(&disk_id)?;
+        let size = fs::metadata(&iso_path).map_err(|e| e.to_string())?.len();
+        let xz = if is_xz_compressed(&iso_path)? {
+            Some(get_xz_path().ok_or("XZ fehlt (brew install xz)")?)
+        } else { None };
+        let size = if let Some(ref xz) = xz { xz_uncompressed_size(xz, &iso_path)? } else { size };
+        if size == 0 || size > get_disk_size(&disk_id)? { return Err("Leeres oder zu großes Image".into()); }
+        ensure_disk_unmounted(&app, &disk_id)?;
+        app.emit("burn_phase", "writing").ok();
+        let cfg = serde_json::json!({"mode":"burn", "device":format!("/dev/r{disk_id}"),
+            "source":iso_path, "size":size, "xz":xz, "verify":verify});
+        let mut evidence = burn_completion::Evidence::default();
+        let result = process_runner::run(&cfg, Some(&password), &CANCEL_BURN, |line| {
+            evidence.observe(line);
+            if line == "WRITE_SUCCESS" && verify { app.emit("burn_phase", "verifying").ok(); }
+            for (prefix, label) in [("BYTES:", "SCHREIBEN"), ("VERIFY:", "VERIFIZIEREN")] {
+                if let Some(bytes) = line.strip_prefix(prefix).and_then(|s| s.split(':').next()).and_then(|s| s.parse::<u64>().ok()) {
+                    let percent = (bytes.saturating_mul(100) / size).min(100) as u32;
+                    emit_progress(&app, percent, &format!("{label}: {percent}%"), "burn");
                 }
             }
-        } else if line.contains("VERIFY_SUCCESS") {
-            verify_success = true;
-        } else if let Some(stripped) = line.strip_prefix("VERIFY_FAILED:") {
-            verify_errors = stripped.parse().unwrap_or(1);
-        }
-    }
-
-    let status = child.wait().map_err(|e| format!("Prozess Fehler: {}", e))?;
-    let fehlertext = stderr_job.and_then(|job| job.join().ok()).unwrap_or_default();
-
-    if !status.success() || !write_success {
-        let _ = app.emit("burn_phase", "error");
-        return if fehlertext.trim().is_empty() {
-            Err("Brennvorgang fehlgeschlagen".to_string())
-        } else {
-            Err(format!("Brennvorgang fehlgeschlagen: {}", fehlertext.trim()))
-        };
-    }
-
-    if verify {
-        if verify_errors > 0 {
-            // Echte Abweichungen zwischen Abbild und Datentraeger.
-            let _ = app.emit("burn_phase", "error");
-            emit_progress(&app, 100, &format!("FEHLER: {} Blöcke stimmen nicht überein!", verify_errors), "burn");
-            if eject {
-                let _ = Command::new("diskutil").args(["eject", &disk_path]).output();
-            }
-            return Err(format!("Verifizierung fehlgeschlagen: {} fehlerhafte Blöcke", verify_errors));
-        }
-
-        if !verify_success {
-            // Die Pruefung ist gar nicht erst durchgelaufen. Von "0 fehlerhaften
-            // Bloecken" zu sprechen waere hier irrefuehrend: verglichen wurde nichts.
-            let _ = app.emit("burn_phase", "error");
-            let status_text = format!("Brennprozess endete mit {}", status);
-            let grund = verify_failure_reason(&fehlertext, &status_text);
-            let wie_weit = if verify_done_bytes > 0 {
-                format!(" (abgebrochen nach {} von {} MB)", verify_done_bytes / 1_048_576, image_size / 1_048_576)
-            } else {
-                String::new()
-            };
-            emit_progress(&app, 100, "FEHLER: Verifizierung konnte nicht durchgeführt werden", "burn");
-            if eject {
-                let _ = Command::new("diskutil").args(["eject", &disk_path]).output();
-            }
-            return Err(format!(
-                "Verifizierung konnte nicht durchgeführt werden{}: {}",
-                wie_weit, grund
-            ));
-        }
-    }
-    
-    let _ = app.emit("burn_phase", "success");
-    emit_progress(&app, 100, "Fertig!", "burn");
-    
-    if eject {
-        let _ = Command::new("diskutil").args(["eject", &disk_path]).output();
-    } else {
-        let _ = Command::new("diskutil").args(["mountDisk", &disk_path]).output();
-    }
-    
-    if verify {
-        Ok("ISO erfolgreich auf USB geschrieben und verifiziert".to_string())
-    } else {
-        Ok("ISO erfolgreich auf USB geschrieben".to_string())
-    }
+        });
+        let completed = evidence.finish(result, verify, eject, |action| {
+            app.emit("burn_phase", "finalizing").ok();
+            let out = Command::new("/usr/sbin/diskutil").args([action, &format!("/dev/{disk_id}")])
+                .output().map_err(|e| e.to_string())?;
+            if out.status.success() { return Ok(()); }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = if !stderr.trim().is_empty() { stderr.trim().to_string() }
+                else if !stdout.trim().is_empty() { stdout.trim().to_string() }
+                else { format!("{action}: {}", out.status) };
+            Err(detail)
+        });
+        if completed.is_err() { app.emit("burn_phase", "error").ok(); }
+        // The returned structured result is the sole final UI status, so a late
+        // phase/progress event cannot overwrite its mount/eject warning.
+        completed
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn backup_usb_raw(app: AppHandle, disk_id: String, destination: String, disk_size: u64, password: String) -> Result<String, String> {
+async fn backup_usb_raw(app: AppHandle, disk_id: String, destination: String, disk_size: u64, password: String, extract_iso: Option<bool>) -> Result<String, String> {
+    let guard = start_operation(&disk_id)?;
     CANCEL_BACKUP.store(false, Ordering::SeqCst);
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
-    // Liest den Datentraeger roh aus; die Kennung landet in einem als root
-    // ausgefuehrten Python-Stringliteral und muss daher geprueft sein.
-    if !is_valid_disk_id(&disk_id) {
-        return Err("Invalid disk identifier".to_string());
-    }
-    let disk_path = format!("/dev/{}", disk_id);
-    let rdisk_path = format!("/dev/r{}", disk_id);
-    emit_progress(&app, 0, "Unmount Disk...", "backup");
-    ensure_disk_unmounted(&app, &disk_id)?;
-    
-    // Try to detect actual ISO size using root privileges
-    emit_progress(&app, 0, "Prüfe ISO-Größe...", "backup");
-    let actual_size = detect_iso_size_with_sudo(&rdisk_path, &password).unwrap_or(disk_size);
-    
-    if actual_size != disk_size {
-        let _ = app.emit("log", format!("ISO erkannt: {} statt {} wird gesichert", 
-            format_bytes(actual_size), format_bytes(disk_size)));
-    }
-    
-    emit_progress(&app, 0, "Lese USB-Daten...", "backup");
-    
-    let python_script = format!(
-        r#"import os, sys
-raw_path = "{}"
-out_path = "{}"
-total_size = {}
-buffer_size = 1024 * 1024
-copied = 0
-try:
-    fd = os.open(raw_path, os.O_RDONLY)
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-try:
-    with os.fdopen(fd, 'rb', buffering=0) as src, open(out_path, 'wb') as dst:
-        remaining = total_size
-        while remaining > 0:
-            to_read = min(buffer_size, remaining)
-            chunk = src.read(to_read)
-            if not chunk: break
-            dst.write(chunk)
-            copied += len(chunk)
-            remaining -= len(chunk)
-            print(f"BYTES:{{copied}}", flush=True)
-        dst.flush()
-        os.fsync(dst.fileno())
-except OSError as exc:
-    print(f"ERROR: {{exc}}", file=sys.stderr)
-    sys.exit(1)
-print("SUCCESS", flush=True)"#, rdisk_path, destination.replace('"', r#"\""#), actual_size);
-
-    let mut child = Command::new("sudo").args(["-S", "python3", "-c", &python_script])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-        .map_err(|e| format!("Fehler beim Starten: {}", e))?;
-    
-    if let Some(ref mut stdin) = child.stdin {
-        writeln!(stdin, "{}", password).ok();
-    }
-    
-    let stdout = child.stdout.take().ok_or("Kein stdout")?;
-    let reader = BufReader::new(stdout);
-    
-    for line in reader.lines().map_while(Result::ok) {
-        if CANCEL_BACKUP.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            return Err("Sicherung abgebrochen".to_string());
-        }
-        if let Some(stripped) = line.strip_prefix("BYTES:") {
-            if let Ok(bytes) = stripped.parse::<u64>() {
-                let percent = ((bytes as f64 / actual_size as f64) * 100.0) as u32;
-                emit_progress(&app, percent.min(100), &format!("{}% gesichert", percent), "backup");
+    app.emit("operation_start", guard.id).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        if !is_valid_disk_id(&disk_id) { return Err("Invalid disk identifier".into()); }
+        let _ = disk_size; // Never trust a stale frontend capacity for a complete backup.
+        let capacity = get_disk_size(&disk_id)?;
+        let device = format!("/dev/r{disk_id}");
+        let size = if extract_iso.unwrap_or(false) {
+            detect_iso_size_with_sudo(&device, &password).filter(|s| *s > 0 && *s <= capacity)
+                .ok_or("Kein gültiges ISO-9660-Dateisystem zur Extraktion gefunden")?
+        } else { capacity };
+        ensure_disk_unmounted(&app, &disk_id)?;
+        let cfg = serde_json::json!({"mode":"backup", "device":device, "destination":destination,
+            "size":size, "uid":unsafe { libc::getuid() }, "gid":unsafe { libc::getgid() }});
+        let result = process_runner::run(&cfg, Some(&password), &CANCEL_BACKUP, |line| {
+            if let Some(bytes) = line.strip_prefix("BYTES:").and_then(|s| s.parse::<u64>().ok()) {
+                let percent = (bytes.saturating_mul(100) / size).min(100) as u32;
+                emit_progress(&app, percent, &format!("{percent}% gesichert"), "backup");
             }
-        } else if line.contains("SUCCESS") {
-            emit_progress(&app, 100, "Sicherung fertig!", "backup");
-        }
-    }
-    
-    let status = child.wait().map_err(|e| format!("Prozess Fehler: {}", e))?;
-    let _ = Command::new("diskutil").args(["mountDisk", &disk_path]).output();
-    
-    if status.success() {
-        Ok("USB-Stick erfolgreich gesichert".to_string())
-    } else {
-        Err("Sicherung fehlgeschlagen".to_string())
-    }
+        });
+        // Mount only after the privileged reader has exited, including on cancellation.
+        let _ = Command::new("diskutil").args(["mountDisk", &format!("/dev/{disk_id}")]).output();
+        result?;
+        emit_progress(&app, 100, "Sicherung vollständig", "backup");
+        Ok("Sicherung vollständig abgeschlossen".into())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 async fn backup_usb_filesystem(app: AppHandle, mount_point: String, destination: String, volume_name: String) -> Result<String, String> {
-    let _op_id = start_operation();
-    let _ = app.emit("operation_start", _op_id);
+    let guard = start_operation(&mount_point)?;
     CANCEL_BACKUP.store(false, Ordering::SeqCst);
-    emit_progress(&app, 0, "Erstelle komprimiertes Image...", "backup");
-    
-    let mut child = Command::new("hdiutil")
-        .args(["create", "-puppetstrings", "-format", "UDZO", "-volname", &volume_name, "-srcfolder", &mount_point, &destination])
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-        .map_err(|e| format!("hdiutil Fehler: {}", e))?;
-    
-    let stdout = child.stdout.take().ok_or("Kein stdout")?;
-    let reader = BufReader::new(stdout);
-    
-    for line in reader.lines().map_while(Result::ok) {
-        if CANCEL_BACKUP.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            return Err("Sicherung abgebrochen".to_string());
-        }
-        if let Some(stripped) = line.strip_prefix("PERCENT:") {
-            if let Ok(percent) = stripped.trim().parse::<f64>() {
-                emit_progress(&app, percent as u32, &format!("{}% erstellt", percent as u32), "backup");
+    app.emit("operation_start", guard.id).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let cfg = serde_json::json!({"mode":"filesystem_backup", "mount":mount_point, "destination":destination, "name":volume_name});
+        process_runner::run(&cfg, None, &CANCEL_BACKUP, |line| {
+            if let Some(percent) = line.strip_prefix("PERCENT:").and_then(|s| s.trim().parse::<f64>().ok()) {
+                emit_progress(&app, percent as u32, &format!("{percent:.0}% erstellt"), "backup");
             }
-        }
-    }
-    
-    let status = child.wait().map_err(|e| format!("Prozess Fehler: {}", e))?;
-    
-    if status.success() {
-        emit_progress(&app, 100, "Sicherung fertig!", "backup");
-        Ok("Dateibasierte Sicherung abgeschlossen".to_string())
-    } else {
-        Err("hdiutil Sicherung fehlgeschlagen".to_string())
-    }
+        })?;
+        emit_progress(&app, 100, "Sicherung vollständig", "backup");
+        Ok("Dateibasierte Sicherung abgeschlossen".into())
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ========== Menu Building ==========
@@ -6655,27 +5074,27 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
          https://github.com/nojan01/burnISOtoUSB-tauri\n\n\
          Komponenten Dritter sind in THIRD_PARTY_NOTICES.md aufgeführt."
     };
-    
+
     let (file_menu_label, select_iso_label, select_destination_label, refresh_label, close_label) = if lang == "en" {
         ("File", "Open ISO File...", "Choose Destination...", "Refresh USB Devices", "Close Window")
     } else {
         ("Ablage", "ISO-Datei öffnen...", "Speicherort wählen...", "USB-Geräte aktualisieren", "Fenster schließen")
     };
-    
+
     let (action_menu_label, start_burn_label, start_backup_label, start_diagnose_label, cancel_label) = if lang == "en" {
         ("Action", "Burn ISO to USB", "Backup USB", "Start Diagnostic", "Cancel Operation")
     } else {
         ("Aktion", "ISO auf USB brennen", "USB sichern", "Diagnose starten", "Vorgang abbrechen")
     };
-    
+
     let (window_menu_label, minimize_label, fullscreen_label) = if lang == "en" {
         ("Window", "Minimize", "Fullscreen")
     } else {
         ("Fenster", "Im Dock ablegen", "Vollbild")
     };
-    
+
     let help_menu_label = if lang == "en" { "Help" } else { "Hilfe" };
-    
+
     let about_metadata = AboutMetadata {
         name: Some("BurnISO to USB".to_string()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -6686,7 +5105,7 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
         credits: Some(about_credits.to_string()),
         ..Default::default()
     };
-    
+
     // App-Menü
     let about = PredefinedMenuItem::about(app_handle, Some(about_label), Some(about_metadata))?;
     let separator = PredefinedMenuItem::separator(app_handle)?;
@@ -6694,27 +5113,27 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     let hide_others = PredefinedMenuItem::hide_others(app_handle, Some(hide_others_label))?;
     let show_all = PredefinedMenuItem::show_all(app_handle, Some(show_all_label))?;
     let quit = PredefinedMenuItem::quit(app_handle, Some(quit_label))?;
-    
+
     let app_menu = Submenu::with_items(
         app_handle,
         "BurnISO to USB",
         true,
         &[&about, &separator, &hide, &hide_others, &show_all, &PredefinedMenuItem::separator(app_handle)?, &quit],
     )?;
-    
+
     // Ablage-Menü
     let select_iso = MenuItem::with_id(app_handle, "select_iso", select_iso_label, true, Some("CmdOrCtrl+O"))?;
     let select_destination = MenuItem::with_id(app_handle, "select_destination", select_destination_label, true, Some("CmdOrCtrl+S"))?;
     let refresh = MenuItem::with_id(app_handle, "refresh", refresh_label, true, Some("CmdOrCtrl+R"))?;
     let close = PredefinedMenuItem::close_window(app_handle, Some(close_label))?;
-    
+
     let file_menu = Submenu::with_items(
         app_handle,
         file_menu_label,
         true,
         &[&select_iso, &select_destination, &PredefinedMenuItem::separator(app_handle)?, &refresh, &PredefinedMenuItem::separator(app_handle)?, &close],
     )?;
-    
+
     // Aktion-Menü
     let tab_burn = MenuItem::with_id(app_handle, "tab_burn", "ISO → USB", true, Some("CmdOrCtrl+1"))?;
     let tab_backup = MenuItem::with_id(app_handle, "tab_backup", "USB → ISO", true, Some("CmdOrCtrl+2"))?;
@@ -6728,30 +5147,30 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     let start_backup = MenuItem::with_id(app_handle, "start_backup", start_backup_label, true, Some("CmdOrCtrl+Shift+B"))?;
     let start_diagnose = MenuItem::with_id(app_handle, "start_diagnose", start_diagnose_label, true, Some("CmdOrCtrl+D"))?;
     let cancel_action = MenuItem::with_id(app_handle, "cancel_action", cancel_label, true, Some("CmdOrCtrl+."))?;
-    
+
     let action_menu = Submenu::with_items(
         app_handle,
         action_menu_label,
         true,
         &[&tab_burn, &tab_backup, &tab_diagnose, &tab_tools, &tab_forensic, &PredefinedMenuItem::separator(app_handle)?, &start_burn, &start_backup, &start_diagnose, &PredefinedMenuItem::separator(app_handle)?, &cancel_action],
     )?;
-    
+
     // Fenster-Menü
     let minimize = PredefinedMenuItem::minimize(app_handle, Some(minimize_label))?;
     let fullscreen = PredefinedMenuItem::fullscreen(app_handle, Some(fullscreen_label))?;
-    
+
     let theme_dark_label = if lang == "en" { "🌙 Dark Mode" } else { "🌙 Dunkles Design" };
     let theme_light_label = if lang == "en" { "☀️ Light Mode" } else { "☀️ Helles Design" };
     let theme_dark = MenuItem::with_id(app_handle, "theme_dark", theme_dark_label, true, Some("CmdOrCtrl+Shift+D"))?;
     let theme_light = MenuItem::with_id(app_handle, "theme_light", theme_light_label, true, Some("CmdOrCtrl+Shift+L"))?;
-    
+
     let window_menu = Submenu::with_items(
         app_handle,
         window_menu_label,
         true,
         &[&minimize, &fullscreen, &PredefinedMenuItem::separator(app_handle)?, &theme_dark, &theme_light],
     )?;
-    
+
     // Hilfe-Menü
     let help_label = if lang == "en" { "Help" } else { "Hilfe" };
     let github = MenuItem::with_id(app_handle, "github", "GitHub Repository", true, None::<&str>)?;
@@ -6760,21 +5179,21 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     let check_updates = MenuItem::with_id(app_handle, "check_updates", check_updates_label, true, None::<&str>)?;
     let lang_german = MenuItem::with_id(app_handle, "lang_de", "🇩🇪 Deutsch", true, None::<&str>)?;
     let lang_english = MenuItem::with_id(app_handle, "lang_en", "🇬🇧 English", true, None::<&str>)?;
-    
+
     let help_menu = Submenu::with_items(
         app_handle,
         help_menu_label,
         true,
         &[&help_item, &check_updates, &PredefinedMenuItem::separator(app_handle)?, &github, &PredefinedMenuItem::separator(app_handle)?, &lang_german, &lang_english],
     )?;
-    
+
     let menu = Menu::with_items(
         app_handle,
         &[&app_menu, &file_menu, &action_menu, &window_menu, &help_menu],
     )?;
-    
+
     app_handle.set_menu(menu)?;
-    
+
     Ok(())
 }
 
@@ -6787,7 +5206,8 @@ fn set_menu_language(app_handle: AppHandle, lang: String) -> Result<(), String> 
 /// Der Updater ersetzt auf macOS das App-Bundle, die neue Version wird erst
 /// nach dem Neustart ausgeführt.
 #[tauri::command]
-fn restart_application(app_handle: AppHandle) {
+fn restart_application(app_handle: AppHandle) -> Result<(), String> {
+    if !operations::can_restart() { return Err("Ein Datenträgervorgang läuft noch.".into()); }
     app_handle.restart();
 }
 
@@ -6825,11 +5245,13 @@ pub fn run() {
             get_window_state,
             save_window_state,
             set_menu_language,
-            restart_application
+            restart_application,
+            operations::reserve_update,
+            operations::release_update
         ])
         .setup(|app| {
             let app_handle = app.handle();
-            
+
             // Fensterposition wiederherstellen
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(state) = get_window_state() {
@@ -6841,10 +5263,10 @@ pub fn run() {
                     }
                 }
             }
-            
+
             // Menü erstellen (Deutsch als Standard)
             build_menu(app_handle, "de")?;
-            
+
             // Menü-Events
             let app_handle_clone = app_handle.clone();
             app.on_menu_event(move |app, event| {
@@ -6892,7 +5314,7 @@ pub fn run() {
                     }
                 }
             });
-            
+
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -6984,6 +5406,7 @@ mod tests {
     /// Der Test stellt dieses Layout nach: eine erste Partition, die *kein*
     /// APFS ist, und den Container dahinter.
     #[test]
+    #[ignore = "macOS integration: creates and partitions a temporary disk image"]
     fn find_apfs_volume_findet_container_auch_ausserhalb_von_s1() {
         let pfad = format!("/tmp/burniso-apfs-test-{}.dmg", std::process::id());
         let _ = std::fs::remove_file(&pfad);
@@ -7091,6 +5514,7 @@ mod tests {
     /// kniffligen Fall abbildet: "/" liegt auf einer synthetisierten APFS-Disk,
     /// der Ruecweg zum Geraet fuehrt nur ueber APFSPhysicalStore.
     #[test]
+    #[ignore = "macOS integration: requires DiskManagement access"]
     fn mount_points_for_disk_ordnet_nur_eigene_volumes_zu() {
         let root = diskutil(&["info", "-plist", "/"]).expect("diskutil kennt / nicht");
         let store = extract_plist_string(&root, "APFSPhysicalStore")
@@ -7136,20 +5560,16 @@ mod tests {
     /// Vergleich dagegen auch gleichnamige *Dateien* melden.
     #[test]
     fn contains_dir_named_achtet_auf_schreibweise_und_typ() {
-        assert!(contains_dir_named("/", "Applications"));
-        assert!(contains_dir_named("/", "APPLICATIONS"));
-        assert!(contains_dir_named("/", "applications"));
-
-        // "/.file" ist eine Datei, kein Ordner -- und damit kein Treffer.
-        assert!(
-            std::path::Path::new("/.file").is_file(),
-            "Gegenprobe traegt nicht: /.file ist keine Datei mehr"
-        );
-        assert!(!contains_dir_named("/", ".file"));
-
-        assert!(!contains_dir_named("/", "GibtEsHierNicht"));
-        // Ein unlesbarer Pfad darf nicht in Panik enden.
-        assert!(!contains_dir_named("/Volumes/NichtVorhanden", "Recovery"));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_str().unwrap();
+        fs::create_dir(temp.path().join("Applications")).unwrap();
+        fs::write(temp.path().join(".file"), b"not a directory").unwrap();
+        assert!(contains_dir_named(root, "Applications"));
+        assert!(contains_dir_named(root, "APPLICATIONS"));
+        assert!(contains_dir_named(root, "applications"));
+        assert!(!contains_dir_named(root, ".file"));
+        assert!(!contains_dir_named(root, "GibtEsHierNicht"));
+        assert!(!contains_dir_named(temp.path().join("missing").to_str().unwrap(), "Recovery"));
     }
 
     /// Die Versionsbestimmung muss allein den Feature-Flags folgen.
