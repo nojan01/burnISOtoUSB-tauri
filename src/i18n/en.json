@@ -574,7 +574,11 @@
     "fieldWindowsRecovery": "Windows Recovery",
     "scanComplete": "Directory scan complete",
     "scanIncomplete": "Directory scan incomplete; counts are lower bounds",
-    "scanErrors": "Read errors",
+    "scanErrors": "Scan errors",
+    "scanPermissionDenied": "Access denied",
+    "scanIoErrors": "I/O errors",
+    "scanOtherErrors": "Other scan errors",
+    "scanPermissionHint": "Some directories remain protected. Check Full Disk Access for BurnISO to USB in System Settings → Privacy & Security. Denied access is not evidence of a drive defect.",
     "scanSkippedMounts": "Skipped mount boundaries",
     "scanListLimit": "Lists are limited: largest files 10, file types and recent files 15, top level 30. Symlinks are not followed.",
     "scanTypeOverflow": "File type distribution was limited because too many distinct types were found."

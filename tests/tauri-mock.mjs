@@ -51,5 +51,5 @@ window.__TAURI__ = {
   event: {listen: async (name, callback) => {listeners.set(name,callback); return () => listeners.delete(name);}},
   dialog: {open: async () => '/test-fixture/no-native-access.img', save: async () => null, message: async () => {}, ask: async () => false},
   window: {getCurrentWindow: () => appWindow, ProgressBarStatus: {None:'none',Normal:'normal'}},
-  app: {getVersion: async () => '1.4.14'}, notification: {isPermissionGranted: async () => true,sendNotification: async () => {}}
+  app: {getVersion: async () => '1.4.15'}, notification: {isPermissionGranted: async () => true,sendNotification: async () => {}}
 };

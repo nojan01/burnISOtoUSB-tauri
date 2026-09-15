@@ -574,7 +574,11 @@
     "fieldWindowsRecovery": "Windows-Wiederherstellung",
     "scanComplete": "Verzeichnisprüfung vollständig",
     "scanIncomplete": "Verzeichnisprüfung unvollständig; Zahlen sind Mindestwerte",
-    "scanErrors": "Lesefehler",
+    "scanErrors": "Prüffehler",
+    "scanPermissionDenied": "Zugriff verweigert",
+    "scanIoErrors": "E/A-Fehler",
+    "scanOtherErrors": "Sonstige Prüffehler",
+    "scanPermissionHint": "Einige Verzeichnisse bleiben zugriffsgeschützt. Prüfe den Festplattenvollzugriff für BurnISO to USB unter Systemeinstellungen → Datenschutz & Sicherheit. Verweigerte Zugriffe sind kein Nachweis für einen Datenträgerdefekt.",
     "scanSkippedMounts": "Ausgelassene Mount-Grenzen",
     "scanListLimit": "Listen sind begrenzt: größte Dateien 10, Dateitypen und kürzlich geändert 15, oberste Ebene 30. Symlinks werden nicht verfolgt.",
     "scanTypeOverflow": "Die Dateitypen-Verteilung wurde wegen zu vieler unterschiedlicher Typen begrenzt."

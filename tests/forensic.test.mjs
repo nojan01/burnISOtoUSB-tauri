@@ -36,3 +36,36 @@ test('all report text has one shared size rule, including div and GPT sections',
 });
 
 test('minimal forensic payload is renderable', () => assert.ok(render({}).includes('forensic-report')));
+
+test('denied access is distinguished from I/O errors in UI and exports', () => {
+  const result = structuredClone(fixture);
+  result.filesystem_details.scan_quality = {
+    complete:false, elevated:true, error_count:3, permission_denied_count:3,
+    io_error_count:0, other_error_count:0, skipped_mounts:0,
+    errors:['/.Trashes: Permission denied <test>']
+  };
+  const html = render(result);
+  assert.ok(html.includes('tools.scanPermissionDenied: 3'));
+  assert.ok(html.includes('tools.scanIoErrors: 0'));
+  assert.ok(html.includes('tools.scanOtherErrors: 0'));
+  assert.ok(html.includes('tools.scanIncomplete'));
+  assert.ok(html.includes('tools.scanPermissionHint'));
+  assert.ok(html.includes('Permission denied &lt;test&gt;'));
+  assert.ok(!html.includes('tools.scanErrors: 3'));
+  assert.ok(standaloneReport({result,render,styles:'',title:'Test',language:'de'}).includes(html));
+  const exported = buildForensicJsonExport(result, 'de');
+  assert.deepEqual(exported.evidence.filesystem_details.scan_quality, result.filesystem_details.scan_quality);
+  result.filesystem_details.scan_quality.permission_denied_count = 0;
+  result.filesystem_details.scan_quality.io_error_count = 3;
+  assert.ok(!render(result).includes('tools.scanPermissionHint'));
+  assert.ok(render(result).includes('tools.scanIoErrors: 3'));
+});
+
+test('scan categories and access hint are available in both languages', () => {
+  for (const lang of ['de', 'en']) {
+    const {tools} = JSON.parse(readFileSync(new URL(`../src/i18n/${lang}.json`, import.meta.url)));
+    for (const key of ['scanErrors', 'scanPermissionDenied', 'scanIoErrors', 'scanOtherErrors', 'scanPermissionHint']) {
+      assert.ok(tools[key]?.length > 0, `${lang}: ${key}`);
+    }
+  }
+});

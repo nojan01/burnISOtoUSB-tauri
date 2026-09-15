@@ -875,10 +875,16 @@ export function createForensicRenderer(context) {
   const scan = result.filesystem_details?.scan_quality || result.filesystem_details?.quality;
   if (scan) {
     const warning = scan.complete ? t('tools.scanComplete') : t('tools.scanIncomplete');
+    const errors = scan.permission_denied_count == null
+      ? ' · ' + eh(t('tools.scanErrors')) + ': ' + eh(scan.error_count ?? 0)
+      : ' · ' + eh(t('tools.scanPermissionDenied')) + ': ' + eh(scan.permission_denied_count) +
+        ' · ' + eh(t('tools.scanIoErrors')) + ': ' + eh(scan.io_error_count ?? 0) +
+        ' · ' + eh(t('tools.scanOtherErrors')) + ': ' + eh(scan.other_error_count ?? 0);
     const details = '<aside class="forensic-acquisition">' + eh(warning) +
-      ' · ' + eh(t('tools.scanErrors')) + ': ' + eh(scan.error_count ?? 0) +
+      errors +
       ' · ' + eh(t('tools.scanSkippedMounts')) + ': ' + eh(scan.skipped_mounts ?? 0) +
       '<p>' + eh(t('tools.scanListLimit')) + '</p>' +
+      (scan.permission_denied_count > 0 ? '<p>' + eh(t('tools.scanPermissionHint')) + '</p>' : '') +
       (scan.errors || []).map(e => '<p>' + eh(e) + '</p>').join('') +
       (scan.type_overflow ? '<p>' + eh(t('tools.scanTypeOverflow')) + '</p>' : '') + '</aside>';
     html = html.replace('<div class="forensic-report">', '<div class="forensic-report">' + details);

@@ -340,9 +340,14 @@ jedem Lauf neu zu bestimmen; Beispiele niemals ungeprüft übernehmen.
   bestehende Ziel- und Teildateien werden nicht überschrieben.
 - Der Writer berechnet beim Schreiben SHA-256-Prüfsummen je Block. Die optionale
   Verifizierung liest den Datenträger zurück, ohne XZ erneut zu dekomprimieren.
-- Die Forensik verwendet einen begrenzten nativen Verzeichnisdurchlauf pro
-  Mountpunkt. Lesefehler, ausgelassene Mount-Grenzen und Listenlimits werden
-  im Tab und in beiden Exportformaten ausgewiesen. JSON-Schema: `1.1`.
+- Die Forensik prüft jeden Mountpunkt einmal mit einem nur lesenden nativen
+  Hilfsprozess, der das eingegebene Admin-Passwort für erhöhte Rechte verwendet.
+  Symlinks werden auch bei gleichzeitig veränderten Verzeichnissen nicht verfolgt.
+  Verweigerte Zugriffe, E/A-Fehler, sonstige Prüffehler, ausgelassene Mount-Grenzen
+  und Listenlimits werden im Tab und in beiden Exportformaten ausgewiesen.
+  Datenschutzbeschränkungen können trotz Admin-Rechten bestehen bleiben; bei
+  verweigertem Zugriff den Festplattenvollzugriff für die App prüfen. Die App
+  ändert keine Ordnerrechte. JSON-Schema: `1.1` (zusätzliche Fehlerkategorien).
 
 ## Lizenz
 

@@ -3,6 +3,8 @@ mod burn_completion;
 mod diagnostics;
 mod process_runner;
 mod forensic_scan;
+mod forensic_directory;
+pub use forensic_scan::helper_exit_code as forensic_helper_exit_code;
 // burnISOtoUSB - Tauri Backend
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -2955,7 +2957,10 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
         .and_then(|m| m.as_str())
     {
         if !mount_point.is_empty() {
-            if let Some(content_info) = analyze_mounted_content(mount_point, &mut scan_cache) {
+            let summary = forensic_scan::scan_privileged(std::path::Path::new(mount_point), &password)?;
+            let content_info = analyze_mounted_content(mount_point, &summary);
+            scan_cache.insert(mount_point.to_string(), summary);
+            if let Some(content_info) = content_info {
                 result["content_analysis"] = content_info;
             }
         }
@@ -3202,8 +3207,8 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
     {
         if !mount_point.is_empty() {
             let mut fs_details = forensic_scan::filesystem_stats(std::path::Path::new(mount_point));
-            let summary = scan_cache.entry(mount_point.to_string())
-                .or_insert_with(|| forensic_scan::scan(std::path::Path::new(mount_point)));
+            let summary = scan_cache.get(mount_point)
+                .ok_or("Ergebnis der Verzeichnisprüfung fehlt")?;
             if let Some(summary) = summary.as_object() { fs_details.extend(summary.clone()); }
 
             if !fs_details.is_empty() {
@@ -4437,8 +4442,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-fn analyze_mounted_content(mount_point: &str, cache: &mut std::collections::HashMap<String, serde_json::Value>) -> Option<serde_json::Value> {
-    let summary = cache.entry(mount_point.to_string()).or_insert_with(|| forensic_scan::scan(std::path::Path::new(mount_point)));
+fn analyze_mounted_content(mount_point: &str, summary: &serde_json::Value) -> Option<serde_json::Value> {
     let mut content = summary.as_object()?.clone();
     // Detect OS installations
     let mut detected_os = Vec::new();
