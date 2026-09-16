@@ -6,6 +6,7 @@ const speed = value => Number.isFinite(value) ? value.toFixed(1) + ' MiB/s' : '�
 export function diagnosticSummary(result, t) {
   const d = result.details;
   if (!d) return result.message;
+  if (d.kind === 'f3') return t(result.success ? 'diagnose.f3Complete' : 'diagnose.f3Failed');
   if (!result.success) return t('diagnose.scanFailed');
   if (d.kind === 'speed') return t('diagnose.measurementComplete');
   if (d.sampled) return t('diagnose.sampleComplete');
@@ -15,6 +16,13 @@ export function diagnosticSummary(result, t) {
 export function renderDiagnosticDetails(result, t) {
   const d = result.details;
   if (!d) return '';
+  if (d.kind === 'f3') {
+    return '<p>' + escape(t('diagnose.f3Scope')) + '</p><p>' + escape(d.volume) + ' · ' + escape(d.mount_point) + '</p>' +
+      '<p>' + escape(t('diagnose.f3Checked')) + ': ' + mib(d.bytes_checked) + ' MiB · ' +
+      escape(t('diagnose.f3Good')) + ': ' + mib(d.good_bytes) + ' MiB</p>' +
+      '<p>' + ['corrupted', 'changed', 'overwritten'].map(k => escape(t('diagnose.f3' + k[0].toUpperCase() + k.slice(1))) +
+        ': ' + Number(d[k + '_sectors'] || 0)).join(' · ') + '</p><p>' + escape(t('diagnose.f3Cleaned')) + '</p>';
+  }
   if (d.kind === 'speed') {
     return '<p>' + escape(t(d.profile === 'quick' ? 'diagnose.quickCaveat' : 'diagnose.detailedCaveat')) + '</p>' +
       '<p>' + escape(t('diagnose.weightedAverage')) + '</p>' +
@@ -38,11 +46,12 @@ export function renderDiagnosticDetails(result, t) {
 export function diagnosticProgress(payload, t) {
   const d = payload.details;
   if (!d) return {status:payload.phase + ': ' + payload.status, eta:null};
-  const phases = {reading:'readingPhase', read:'readingPhase', write:'writingPhase', retrying:'retryingPhase', synchronizing:'syncPhase'};
+  const phases = {reading:'readingPhase', read:'readingPhase', write:'writingPhase', retrying:'retryingPhase', synchronizing:'syncPhase', cleanup:'f3Cleanup'};
   let status = t('diagnose.' + (phases[payload.phase] || 'readingPhase'));
   if (d.block_bytes) status += ' · ' + mib(d.block_bytes) + ' MiB';
   if (d.target_bytes) status += ' · ' + mib(d.bytes_checked) + ' / ' + mib(d.target_bytes) + ' MiB';
   if (d.sampled) status = t('diagnose.sampleLabel') + ' · ' + status;
+  if (d.kind === 'f3') status = 'F3 · ' + status;
   const seconds = d.eta_seconds;
   const rounded = Math.ceil(seconds);
   const eta = Number.isFinite(seconds) && seconds >= 0

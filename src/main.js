@@ -610,6 +610,8 @@ function forensicDeviceName(result, fallback) {
   const diagnoseEta = document.getElementById('diagnose-eta');
   const diagnoseDetails = document.getElementById('diagnose-details');
   const speedProfile = document.getElementById('speed-profile');
+  const f3VolumeSelect = document.getElementById('f3-volume-select');
+  let f3VolumeRequest = 0;
   const diagnosePhase = document.getElementById('diagnose-phase');
   const statSectorsChecked = document.getElementById('stat-sectors-checked');
   const statErrorsFound = document.getElementById('stat-errors-found');
@@ -1011,6 +1013,13 @@ function forensicDeviceName(result, fallback) {
 
   // Load disks (with logging)
   async function loadDisks(selectElement, infoElement, logFn) {
+    if (selectElement === diagnoseDiskSelect) {
+      if (isDiagnosing) return;
+      selectedDiagnoseDisk = null;
+      ++f3VolumeRequest;
+      f3VolumeSelect.replaceChildren();
+      updateDiagnoseButton();
+    }
     selectElement.innerHTML = '<option value="">' + window.i18n.t('burn.selectUsbPlaceholder') + '</option>';
     
     try {
@@ -1038,6 +1047,13 @@ function forensicDeviceName(result, fallback) {
 
   // Load disks silently (no logging)
   async function loadDisksSilent(selectElement, infoElement) {
+    if (selectElement === diagnoseDiskSelect) {
+      if (isDiagnosing) return;
+      selectedDiagnoseDisk = null;
+      ++f3VolumeRequest;
+      f3VolumeSelect.replaceChildren();
+      updateDiagnoseButton();
+    }
     selectElement.innerHTML = '<option value="">' + window.i18n.t('burn.selectUsbPlaceholder') + '</option>';
     
     try {
@@ -1132,7 +1148,8 @@ function forensicDeviceName(result, fallback) {
   }
 
   function updateDiagnoseButton() {
-    diagnoseBtn.disabled = !selectedDiagnoseDisk || isDiagnosing;
+    const f3Mode = document.querySelector('input[name="diagnose-mode"]:checked')?.value === 'f3';
+    diagnoseBtn.disabled = !selectedDiagnoseDisk || isDiagnosing || (f3Mode && !f3VolumeSelect.value);
   }
 
   // Event listeners - Burn tab
@@ -1513,6 +1530,7 @@ function forensicDeviceName(result, fallback) {
       diagnoseDiskInfo.classList.remove('visible');
       resetSmartDisplay();
     }
+    await refreshF3Volumes();
     updateDiagnoseButton();
   });
   
@@ -1861,6 +1879,37 @@ function forensicDeviceName(result, fallback) {
     }
   }
 
+  function setF3ControlsBusy(busy) {
+    for (const control of [...diagnoseModeInputs, diagnoseDiskSelect, refreshDiagnoseDisks,
+      f3VolumeSelect, document.getElementById('refresh-f3-volumes'), speedProfile]) control.disabled = busy;
+  }
+
+  async function refreshF3Volumes() {
+    const request = ++f3VolumeRequest;
+    const diskId = selectedDiagnoseDisk?.id;
+    f3VolumeSelect.replaceChildren(new Option(t(diskId ? 'messages.loading' : 'diagnose.f3SelectVolume'), ''));
+    updateDiagnoseButton();
+    if (!diskId || document.querySelector('input[name="diagnose-mode"]:checked').value !== 'f3') return;
+    try {
+      const volumes = await invoke('list_f3_volumes', {diskId});
+      if (request !== f3VolumeRequest || selectedDiagnoseDisk?.id !== diskId) return;
+      f3VolumeSelect.replaceChildren(new Option(t('diagnose.f3SelectVolume'), ''));
+      for (const v of volumes) {
+        f3VolumeSelect.add(new Option(v.name + ' · ' + v.mount_point + ' · ' +
+          (v.free_bytes / 1073741824).toFixed(1) + ' GiB ' + t('diagnose.f3Free'), JSON.stringify(v)));
+      }
+      if (volumes.length === 1) f3VolumeSelect.selectedIndex = 1;
+      if (!volumes.length) f3VolumeSelect.options[0].text = t('diagnose.f3NoVolume');
+    } catch (err) {
+      if (request !== f3VolumeRequest) return;
+      f3VolumeSelect.replaceChildren(new Option(t('diagnose.f3NoVolume'), ''));
+      logDiagnose(String(err), 'error');
+    }
+    updateDiagnoseButton();
+  }
+  f3VolumeSelect.addEventListener('change', updateDiagnoseButton);
+  document.getElementById('refresh-f3-volumes').addEventListener('click', refreshF3Volumes);
+
   // Show/hide warning based on test mode
   speedProfile.addEventListener('change', function() {
     const note = document.getElementById('speed-profile-note');
@@ -1871,8 +1920,13 @@ function forensicDeviceName(result, fallback) {
   diagnoseModeInputs.forEach(function(input) {
     input.addEventListener('change', function() {
       const mode = document.querySelector('input[name="diagnose-mode"]:checked').value;
+      const checkedLabel = document.getElementById('stat-checked-label');
+      checkedLabel.dataset.i18n = mode === 'f3' ? 'diagnose.f3BlocksChecked' : 'diagnose.sectorsChecked';
+      checkedLabel.textContent = t(checkedLabel.dataset.i18n);
       document.getElementById('speed-profile-options').classList.toggle('hidden', mode !== 'speed');
-      if (mode === 'surface' || mode === 'sample') {
+      document.getElementById('f3-options').classList.toggle('hidden', mode !== 'f3');
+      refreshF3Volumes();
+      if (mode === 'surface' || mode === 'sample' || mode === 'f3') {
         diagnoseWarning.classList.add('hidden');
       } else {
         diagnoseWarning.classList.remove('hidden');
@@ -1885,6 +1939,15 @@ function forensicDeviceName(result, fallback) {
     
     const mode = document.querySelector('input[name="diagnose-mode"]:checked').value;
     const isDestructive = (mode === 'full' || mode === 'speed');
+    const disk = selectedDiagnoseDisk;
+    const f3Volume = mode === 'f3' && f3VolumeSelect.value ? JSON.parse(f3VolumeSelect.value) : null;
+    if (mode === 'f3') {
+      if (!f3Volume) return;
+      const confirmed = await requestConfirm(t('diagnose.f3Label'),
+        f3Volume.name + ' · ' + f3Volume.mount_point + '\n\n' + t('diagnose.f3Confirm'),
+        t('diagnose.startTest'), t('dialogs.cancel'));
+      if (!confirmed) return;
+    }
     
     // Confirmation for destructive tests
     if (isDestructive) {
@@ -1904,7 +1967,7 @@ function forensicDeviceName(result, fallback) {
     // Request password for raw device access
     let password;
     try {
-      password = await requestPassword(t('dialogs.adminPasswordPrompt') + '\n\n' + t('dialogs.enterPassword') + ':');
+      if (mode !== 'f3') password = await requestPassword(t('dialogs.adminPasswordPrompt') + '\n\n' + t('dialogs.enterPassword') + ':');
     } catch (err) {
       logDiagnose(t('diagnose.passwordCancelled'), 'warning');
       return;
@@ -1912,6 +1975,7 @@ function forensicDeviceName(result, fallback) {
     
     // Start diagnose
     isDiagnosing = true;
+    setF3ControlsBusy(true);
     diagnoseCancelled = false;
     diagnoseStartTime = Date.now();
     diagnoseBtn.disabled = true;
@@ -1927,7 +1991,7 @@ function forensicDeviceName(result, fallback) {
     diagnoseDetails.innerHTML = '';
     diagnoseDetails.classList.add('hidden');
     
-    const modeNames = { surface: 'Surface Scan', sample: t('diagnose.sampleLabel'), full: t('diagnose.fullTest'), speed: t('diagnose.speedTest') };
+    const modeNames = { surface: 'Surface Scan', sample: t('diagnose.sampleLabel'), full: t('diagnose.fullTest'), speed: t('diagnose.speedTest'), f3: t('diagnose.f3Label') };
     logDiagnose(t('diagnose.startingTest').replace('{mode}', modeNames[mode]), 'info');
     diagnosePhase.textContent = t('messages.loading');
     diagnosePhase.className = 'phase-text';
@@ -1936,22 +2000,24 @@ function forensicDeviceName(result, fallback) {
       let result;
       logDiagnose(t('diagnose.callingTest').replace('{mode}', mode), 'info');
       
-      if (mode === 'surface' || mode === 'sample') {
+      if (mode === 'f3') {
+        result = await invoke('diagnose_f3', {diskId: disk.id, volumeId: f3Volume.id, volumeUuid: f3Volume.uuid});
+      } else if (mode === 'surface' || mode === 'sample') {
         result = await invoke('diagnose_surface_scan', {
-          diskId: selectedDiagnoseDisk.id,
+          diskId: disk.id,
           sampled: mode === 'sample',
           password: password
         });
       } else if (mode === 'full') {
         logDiagnose(t('diagnose.invokingFullTest'), 'info');
         result = await invoke('diagnose_full_test', {
-          diskId: selectedDiagnoseDisk.id,
+          diskId: disk.id,
           password: password
         });
         logDiagnose(t('diagnose.fullTestReturned'), 'info');
       } else if (mode === 'speed') {
         result = await invoke('diagnose_speed_test', {
-          diskId: selectedDiagnoseDisk.id,
+          diskId: disk.id,
           profile: speedProfile.value,
           password: password
         });
@@ -1980,7 +2046,7 @@ function forensicDeviceName(result, fallback) {
         diagnosePhase.textContent = '✓ ' + t('diagnose.testComplete');
         diagnosePhase.className = 'phase-text success';
         diagnoseEta.textContent = '';
-        const scoped = result.details?.sampled || result.details?.kind === 'speed' || result.details?.retry_count > 0;
+        const scoped = result.details?.sampled || ['speed', 'f3'].includes(result.details?.kind) || result.details?.retry_count > 0;
         statsSummaryBadge.textContent = scoped ? summary : '✓ OK';
         statsSummaryBadge.className = scoped ? 'status-badge warning' : 'status-badge passed';
         diagnosePhase.textContent = summary;
@@ -2035,7 +2101,7 @@ function forensicDeviceName(result, fallback) {
       loadDisks(diagnoseDiskSelect, diagnoseDiskInfo, logDiagnose);
     } catch (err) {
       if (diagnoseCancelled) {
-        logDiagnose('✗ ' + t('diagnose.testCancelled'), 'warning');
+        logDiagnose('✗ ' + t('diagnose.testCancelled') + ': ' + String(err), 'warning');
         diagnosePhase.textContent = t('messages.cancelled');
         diagnosePhase.className = 'phase-text error';
       } else {
@@ -2044,6 +2110,9 @@ function forensicDeviceName(result, fallback) {
         diagnosePhase.className = 'phase-text error';
       }
       resetDiagnoseState(true);
+    } finally {
+      setF3ControlsBusy(false);
+      if (mode === 'f3') await refreshF3Volumes();
     }
   });
 

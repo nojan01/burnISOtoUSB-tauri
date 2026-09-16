@@ -35,6 +35,7 @@
 
 ### 🔍 USB prüfen (NEU!)
 - **Surface Scan** - Liest alle Sektoren und findet Lesefehler (nicht-destruktiv, Daten bleiben erhalten)
+- **F3-Dateitest** – Prüft freien Speicher auf einem gewählten Volume mit mitgeliefertem F3; eigene Testdateien werden anschließend entfernt.
 - **Volltest** - Schreibt Testmuster (0x00, 0xFF) und verifiziert (destruktiv, löscht alle Daten!)
 - **Geschwindigkeitstest** - Kurztest oder Einzelmessungen mit 1/4/16 MiB; Durchsatz in MiB/s
 - **Stichproben-Scan** - Schnelle, ausdrücklich begrenzte Leseprüfung verteilter Bereiche
@@ -157,6 +158,7 @@ cargo tauri build
 2. **Testmodus wählen**
    - **🔍 Surface Scan**: Liest alle Sektoren ohne Daten zu löschen
    - **🔎 Stichproben-Scan**: Liest bis zu 16 verteilte Bereiche (höchstens 128 MiB); zeigt den tatsächlich abgearbeiteten Anteil. Keine Aussage über ungeprüfte Bereiche.
+   - **Freien Speicher prüfen (F3)**: Volume auswählen, freien Platz mit Testdateien füllen und deren Inhalt prüfen; bestehende Dateien werden nicht verifiziert.
    - **⚠️ Volltest**: Schreibt Testmuster und verifiziert (LÖSCHT ALLE DATEN!)
    - **⚡ Geschwindigkeitstest**: Misst Lese-/Schreibgeschwindigkeit (LÖSCHT ALLE DATEN!)
      - **Kurz**: 8-MiB-Blöcke, je ca. 30 Sekunden Schreiben und Lesen; Vorbereitung und Synchronisieren zusätzlich. Kleine Medien können mehrfach durchlaufen werden.
@@ -165,7 +167,7 @@ cargo tauri build
 
 3. **Test starten**
    - Klicke auf "🔍 Test starten" oder `⌘D`
-   - Gib dein macOS-Passwort ein
+   - Für Sektor- und Geschwindigkeitstests: macOS-Passwort eingeben; F3 benötigt keines.
    - Fortschritt und Statistiken werden in Echtzeit angezeigt
 
 Surface- und Stichproben-Scans zeigen laufenden Lesedurchsatz und eine geschätzte
@@ -177,6 +179,31 @@ Geräteverlust, Zugriffsfehler oder ein vorzeitiges Dateiende brechen den Scan a
 Die Wiederholungen der App sind begrenzt; zusätzliche Wartezeiten im Gerät oder
 macOS-Treiber lassen sich dadurch nicht begrenzen. Ein erfolgreicher Lesescan
 belegt Lesbarkeit, nicht die inhaltliche Integrität vorhandener Dateien.
+
+### Hinweise zum F3-Dateitest
+
+Der Test benötigt ein eingehängtes, für den Benutzer beschreibbares Volume und
+Python 3 für die Ablaufsteuerung (wie weitere Diagnosefunktionen). Kein
+Administratorpasswort und keine separate F3-/Homebrew-Installation sind nötig.
+APFS, HFS+, exFAT und FAT32 wurden auf temporären Disk-Images geprüft.
+NTFS/ext2/ext3/ext4 benötigen einen passenden macOS-Schreibtreiber und wurden
+nicht praktisch getestet. Verschlüsselte Volumes müssen vorher entsperrt sein.
+Er füllt den freien Speicher vorübergehend; APFS-Volumes teilen Containerplatz.
+Währenddessen keine Backups oder andere Schreibvorgänge auf diesem Datenträger
+starten. Wichtige Daten vorher sichern: Ein defekter oder gefälschter Speicher
+kann trotz Dateitest vorhandene Daten beschädigen.
+
+Der Test prüft nur seine neuen Dateien, nicht vorhandene Backups, alle Sektoren
+oder jede physische SSD-Zelle. Bei Abbruch wird F3 zuerst beendet, anschließend
+werden die eigenen `.burniso-f3-…`-Testdateien entfernt. Bei Abziehen/Absturz
+können Reste bleiben; eine fehlgeschlagene Bereinigung meldet den Ordnerpfad.
+Nach Wiederanschließen und ohne laufenden Test lässt sich dieser Ordner löschen.
+
+F3-Build: `build.rs` baut die Helfer automatisch aus `vendor/`, ohne Netzwerk.
+Für separate Builds: `bash scripts/build-f3.sh aarch64-apple-darwin` oder
+`bash scripts/build-f3.sh x86_64-apple-darwin`. Die Tauri-Auslieferung signiert
+beide Helfer als externe Binärdateien mit der App.
+
 
 > 💡 **Tipp**: Für erweiterte S.M.A.R.T.-Daten bei USB-Festplatten: `brew install smartmontools`
 
@@ -363,11 +390,14 @@ auf eigene Verantwortung.
 Eine vollständige Aufstellung aller verwendeten Fremdkomponenten und ihrer
 Lizenzen findet sich in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Kurzfassung: Alle Abhängigkeiten stehen unter permissiven Lizenzen (überwiegend
-MIT bzw. Apache-2.0). Fünf Pakete aus dem WebView-Unterbau stehen unter der
-MPL-2.0 und werden unverändert eingebunden. Externe Systemwerkzeuge wie
-`smartctl` (GPL) werden **nicht mitgeliefert**, sondern nur aufgerufen, sofern
-sie auf dem System vorhanden sind.
+Die meisten Rust-/JavaScript-Abhängigkeiten verwenden MIT oder Apache-2.0;
+fünf WebView-Pakete verwenden MPL-2.0. **F3 10.0 (GPLv3)** wird als separates
+Programmpaar mitgeliefert, einschließlich **argp-standalone 1.5.0 (LGPL)**.
+Deren Lizenzbedingungen gelten zusätzlich; die MIT-Lizenz betrifft den eigenen
+Anwendungscode. Vollständige Quellen und Bauanleitung: [vendor/README.md](vendor/README.md).
+Jedes App-Paket enthält `Contents/Resources/f3-sources.tar.gz` und die
+Lizenztexte unter `Contents/Resources/licenses`. `smartctl` bleibt optional
+und wird nicht mitgeliefert.
 
 ---
 

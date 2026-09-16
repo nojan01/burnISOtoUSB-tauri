@@ -44,7 +44,15 @@ TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
   npm run tauri -- build --bundles app
 
 echo "==> Signiere die App"
-codesign --force --deep --options runtime --timestamp \
+for HELPER in f3write f3read; do
+  codesign --force --options runtime --timestamp \
+    --sign "$IDENTITY" "$APP_PATH/Contents/MacOS/$HELPER"
+  codesign --verify --strict "$APP_PATH/Contents/MacOS/$HELPER"
+done
+test -s "$APP_PATH/Contents/Resources/f3-sources.tar.gz"
+test -s "$APP_PATH/Contents/Resources/licenses/F3-GPL-3.0.txt"
+test -s "$APP_PATH/Contents/Resources/licenses/argp-LGPL-2.1.txt"
+codesign --force --options runtime --timestamp \
   --sign "$IDENTITY" "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 

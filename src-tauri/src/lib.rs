@@ -1,6 +1,7 @@
 mod operations;
 mod burn_completion;
 mod diagnostics;
+mod f3;
 mod process_runner;
 mod forensic_scan;
 mod forensic_directory;
@@ -1003,11 +1004,18 @@ fn try_smartctl(disk_id: &str) -> Option<SmartData> {
         return None;
     }
 
-    #[cfg(debug_assertions)] eprintln!("[SMART Debug] Running smartctl -x -j ...");
+    #[cfg(debug_assertions)] eprintln!("[SMART Debug] Running smartctl -j (extended logs) ...");
 
-    // Run smartctl -x -j (extended info with JSON output) for full data
+    // Explicit subset of `-x`. `-x` also requests the Device Statistics log
+    // (`-l devstat`, SMART READ LOG 0x04), which leaves some USB-SATA bridges
+    // (seen with a Samsung 870 EVO enclosure) in a state where the next
+    // sustained write stalls, macOS resets the device after ~60 s and the
+    // volume disappears ("Device not configured") — this broke the F3 test
+    // started right after selecting the disk. The remaining `-x` logs
+    // (directory, xerror, xselftest, defects, sataphy) need 48-bit commands,
+    // which smartctl does not implement on macOS; nothing below parses them.
     let output = Command::new(&smartctl_path)
-        .args(["-x", "-j", &device_path])
+        .args(["-j", "-H", "-i", "-c", "-A", "-l", "error", "-l", "selftest", "-l", "scttemp", &device_path])
         .output()
         .ok()?;
 
@@ -5066,17 +5074,17 @@ fn build_menu(app_handle: &AppHandle, lang: &str) -> Result<(), Box<dyn std::err
     // dieser Plattform nicht gerendert. Der Lizenzhinweis steht deshalb in
     // `credits`, damit er tatsächlich sichtbar ist.
     let about_credits = if lang == "en" {
-        "Free and open source software, licensed under the MIT License.\n\
+        "Application code: MIT License. Bundled F3: GPLv3; argp: LGPL.\n\
          Provided \"as is\", without warranty of any kind.\n\n\
          Source code and full license text:\n\
          https://github.com/nojan01/burnISOtoUSB-tauri\n\n\
-         Third-party components are listed in THIRD_PARTY_NOTICES.md."
+         Licenses: Contents/Resources/licenses. F3 sources: Contents/Resources/f3-sources.tar.gz."
     } else {
-        "Freie Open-Source-Software unter der MIT-Lizenz.\n\
+        "Anwendungscode: MIT-Lizenz. Mitgeliefertes F3: GPLv3; argp: LGPL.\n\
          Bereitstellung ohne jede Gewährleistung.\n\n\
          Quellcode und vollständiger Lizenztext:\n\
          https://github.com/nojan01/burnISOtoUSB-tauri\n\n\
-         Komponenten Dritter sind in THIRD_PARTY_NOTICES.md aufgeführt."
+         Lizenzen: Contents/Resources/licenses. F3-Quellen: Contents/Resources/f3-sources.tar.gz."
     };
 
     let (file_menu_label, select_iso_label, select_destination_label, refresh_label, close_label) = if lang == "en" {
@@ -5236,6 +5244,8 @@ pub fn run() {
             diagnose_surface_scan,
             diagnose_full_test,
             diagnose_speed_test,
+            f3::list_f3_volumes,
+            f3::diagnose_f3,
             get_smart_data,
             check_smartctl_installed,
             check_paragon_drivers,

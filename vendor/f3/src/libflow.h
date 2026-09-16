@@ -1,0 +1,164 @@
+#ifndef HEADER_LIBFLOW_H
+#define HEADER_LIBFLOW_H
+
+#include <assert.h>
+#include <stdalign.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
+
+#include "libutils.h"
+
+#define FW_MAX_PROCESS_RATE_NONE	(0)
+#define FW_MAX_BLOCKS_PER_DELAY_NONE	(0)
+
+struct flow;
+
+struct flow {
+	/* Total number of blocks to be processed. */
+	uint64_t	total_blocks;
+	/* Callback to show progress. */
+	progress_cb	cb;
+	/* Indentation level for callback. */
+	unsigned int	indent;
+	/* Block order. */
+	unsigned int	block_order;
+	/* Delay intended between measurements in nanoseconds. */
+	uint64_t	delay_ns;
+	/* Increment to apply to blocks_per_delay. */
+	uint64_t	step_blocks;
+	/* Blocks to process before measurement. */
+	uint64_t	blocks_per_delay;
+	/* Maximum value that blocks_per_delay can take. */
+	uint64_t	max_blocks_per_delay;
+	/* Maximum processing rate in bytes per second. */
+	double		max_process_rate;
+	/* Number of measured blocks. */
+	uint64_t	measured_blocks;
+	/* Measured time. */
+	uint64_t	measured_time_ns;
+	/* State. */
+	enum {FW_INC, FW_DEC, FW_SEARCH, FW_STEADY} state;
+	/* Number of characters to erase before printing out progress. */
+	unsigned int	erase;
+
+	/*
+	 * Initialized while measuring
+	 */
+
+	/* Has a recommended chunk size? */
+	bool		has_rem_chunk_blocks;
+	/* Recommended chunk size in blocks. */
+	uint64_t	rem_chunk_blocks;
+	/* Speed of the recommended chunk size in bytes per second. */
+	double		rem_chunk_speed;
+
+	/* Number of blocks processed since last measurement. */
+	uint64_t	processed_blocks;
+	/*
+	 * Accumulated delay before processed_blocks reaches blocks_per_delay
+	 * in nanoseconds.
+	 */
+	uint64_t	acc_delay_ns;
+	/* Range of blocks_per_delay while in FW_SEARCH state. */
+	uint64_t	bpd1, bpd2;
+	/* Time measurements. */
+	struct timespec	t1;
+};
+
+/*
+ * If max_process_rate == FW_MAX_PROCESS_RATE_NONE,
+ * the maximum processing rate is infinity.
+ * The unit of max_process_rate is KB per second.
+ *
+ * If max_blocks_per_delay == FW_MAX_BLOCKS_PER_DELAY_NONE,
+ * there is no limit to blocks_per_delay.
+ * max_blocks_per_delay is meant to act as a measurement boundary when
+ * end_measurement() is called at a given limit (e.g. f3write and f3read
+ * call it at the end of each 1GB file). Thanks to this limit, f3write and
+ * f3read can make per-file measurements and libflow can still detect when
+ * the drive slows down.
+ */
+void init_flow(struct flow *fw, unsigned int block_order, uint64_t total_blocks,
+	uint64_t max_process_rate, uint64_t max_blocks_per_delay,
+	progress_cb cb, unsigned int indent);
+
+/* Total number of blocks already processed. */
+static inline uint64_t fw_get_total_processed_blocks(const struct flow *fw)
+{
+	return fw->measured_blocks + fw->processed_blocks;
+}
+
+static inline unsigned int fw_get_block_size(const struct flow *fw)
+{
+	return 1U << fw->block_order;
+}
+
+static inline unsigned int fw_get_block_order(const struct flow *fw)
+{
+	return fw->block_order;
+}
+
+static inline void inc_total_blocks(struct flow *fw, uint64_t n_blocks)
+{
+	fw->total_blocks = fw_get_total_processed_blocks(fw) + n_blocks;
+}
+
+static inline void fw_set_indent(struct flow *fw, unsigned int indent)
+{
+	fw->indent = indent;
+}
+
+static inline void fw_get_measurements(const struct flow *fw,
+	uint64_t *blocks, uint64_t *time_ns)
+{
+	*blocks = fw_get_total_processed_blocks(fw);
+	*time_ns = fw->measured_time_ns + fw->acc_delay_ns;
+}
+
+uint64_t get_rem_chunk_blocks(const struct flow *fw);
+
+struct fw_measurement {
+	bool		valid;
+	uint64_t	blocks;
+	uint64_t	time_ns;
+};
+
+void start_measurement(struct flow *fw);
+void measure(struct flow *fw, uint64_t processed_blocks,
+	struct fw_measurement *m);
+void clear_progress(struct flow *fw);
+void end_measurement(struct flow *fw);
+
+void print_avg_seq_speed(const struct flow *fw, const char *speed_type,
+	bool use_sectors);
+
+struct dynamic_buffer {
+	char   *buf;
+	size_t len;
+	bool   max_buf;
+	/* Ensure that backup_buf has the same memory alignment as
+	 * it would have, had it been returned by malloc().
+	 */
+	alignas(max_align_t) char backup_buf[2 * MEGABYTE_SIZE];
+};
+
+static inline void dbuf_init(struct dynamic_buffer *dbuf)
+{
+	dbuf->buf = dbuf->backup_buf;
+	dbuf->len = sizeof(dbuf->backup_buf);
+	dbuf->max_buf = false;
+}
+
+void dbuf_free(struct dynamic_buffer *dbuf);
+
+/*
+ * Although the returned buffer may be smaller than
+ * the input value of *psize in bytes, this function never returns NULL.
+ * The input value of *psize is the maximum size of the returned buffer.
+ */
+char *dbuf_get_buf(struct dynamic_buffer *dbuf, unsigned int align_order,
+	size_t *psize);
+
+#endif	/* HEADER_LIBFLOW_H */

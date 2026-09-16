@@ -1,0 +1,116 @@
+Version 10.0 - Apr 29, 2026
+
+    * f3probe: New probing algorithm and --verbose flag
+    * f3brew: Progress report and rate limiting (i.e., --max-write-rate and --max-read-rate)
+    * f3brew: Add --fix-cmd flag
+    * f3write/f3read: Report per-file min/max and average speeds
+    * GitHub Actions: FreeBSD and OpenBSD support
+    * Move codebase from C99 to C17 and refactor project
+
+Version 9.0 - Mar 27, 2025
+
+    * f3read/f3write: Avoid the execution stack to list files
+    * f3read/f3write: Add dynamic buffers
+    * f3read/f3write: chroot(2) to source/target dir if allowed
+    * Portability improvements for Ubuntu, ARM, OpenBSD, and Apple
+    * Automated test of the code with GitHub Actions
+    * Improved documentation
+
+Version 8.0 - Oct 29, 2020
+
+    * f3read: add parameter --max-read-rate
+    * f3read: report speed, percentage, remaining time like f3write
+    * f3write: improve speed measurement (commit 791acdc32627...)
+    * f3probe: handle rare assertion failure (issue #82 ENODATA)
+
+Version 7.2 - Jun 19, 2019
+
+    * f3write: keep up with extremely fast NVM drives (issue #117)
+    * f3write: improve measurement of write speed (issue #102)
+    * f3write: handle rare assertion failure (issue #111)
+    * f3probe: handle rare assertion failure (issue #82)
+
+Version 7.1 - Jul 27, 2018
+
+    * fix compilation issues on non-Linux OSs
+    * f3write: make parameter --max-write-rate work precisely
+    * f3probe: change default reset type to RT_NONE
+
+Version 7.0 - Dec 21, 2017
+
+    * stable version of f3probe, f3fix, and f3brew (Linux only)
+    * f3write: improved write speed and dealing with write failures
+
+Version 6.0 - Dec 24, 2015
+
+    * f3probe: new algorithm.
+    * f3fix: deal with sectors whose sizes are not 512B.
+    * add f3brew (experimental).
+
+Version 5.0 - Dec 24, 2014
+
+    * add f3probe (experimental).
+    * add f3fix   (experimental).
+    * fix building issue on Macs.
+
+Version 4.0 - Sep 9, 2014
+
+    * add support for FreeBSD.
+    * add optional parameter --end-at=NUM to F3.
+    * add scripts f3write.h2w and log-f3wr.
+    * unify Makefile.
+
+Version 3.0 - May 14, 2014
+
+    * fix bug first reported by John Lussmyer.
+    * add support for Windows/Cygwin.
+    * add a change log (this) and a man page.
+    * adopt h2testw's file format.
+
+Version 2.2 - Feb 8, 2013
+
+    * add optional parameter --start-at=NUM to F3.
+    * remove arbitrary limit on filenames.
+    * fix bug first reported by Martin Theiss.
+    * minor code refinements.
+
+Version 2.1 - Mar 7, 2012
+
+    * report version and copyright in help message.
+    * made f3write remove old F3 files in order.
+    * refined flow control algorithm of f3write.
+    * verify that "all" F3 files are present.
+    * added a rough approximation of posix_fadvise for Macs.
+
+Version 2.0 - Dec 20, 2011
+
+    * added a very simple Makefile.
+    * reviewed code.
+    * added support for Macs.
+    * f3write now reports proper progress.
+    * added progress printout in f3read.
+    * improved precision of speed measurements.
+    * formatted code following Linux's coding style.
+
+Version 1.1.3 - Sep 21, 2010
+
+    * fixes some warning issued by GCC when compiling f3read.c on 64bits
+      machines. Nicolai Abruzzese was the first one to report this issue.
+
+Version 1.1.2 - Aug 31, 2010
+
+    * handles an I/O error reported by Misha Aizatulin.
+
+Version 1.1.1 - Aug 16, 2010
+
+    * fixes some warnings issued by gcc when the parameter -Wall is used
+      to compile the source.
+
+Version 1.1 - Aug 10, 2010
+
+    * adds a nice report at the end of the output of f3read.
+    * works fine with large memory cards.
+
+Version 1.0 - Aug 02, 2010
+
+    * Initial release.

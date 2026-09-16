@@ -504,6 +504,13 @@
             </span>
           </label>
           <label class="radio-label">
+            <input type="radio" name="diagnose-mode" value="f3" />
+            <span class="radio-text">
+              <strong data-i18n="diagnose.f3Label">Freien Speicher prüfen (F3)</strong>
+              <small data-i18n="diagnose.f3Description">Schreibt und prüft Testdateien im freien Speicher des gewählten Volumes.</small>
+            </span>
+          </label>
+          <label class="radio-label">
             <input type="radio" name="diagnose-mode" value="full" />
             <span class="radio-text">
               <strong data-i18n="diagnose.fullTest">⚠️ Volltest (Schreiben + Lesen)</strong>
@@ -525,6 +532,14 @@
             <option value="detailed" data-i18n="diagnose.detailedProfile">Ausführlich: 1 / 4 / 16 MiB</option>
           </select>
           <p id="speed-profile-note" class="note" data-i18n="diagnose.quickCaveat">Synchronisieren kann zusätzlich dauern. Kein Dauertest.</p>
+        </div>
+        <div id="f3-options" class="hidden">
+          <label for="f3-volume-select" data-i18n="diagnose.f3SelectVolume">Volume auswählen</label>
+          <div class="disk-row">
+            <select id="f3-volume-select"></select>
+            <button id="refresh-f3-volumes" class="btn secondary icon-btn" data-i18n-title="burn.refresh" title="Aktualisieren">🔄</button>
+          </div>
+          <p class="note" data-i18n="diagnose.f3Caveat"></p>
         </div>
         <div id="diagnose-warning" class="note warning hidden">
           ⚠️ <span data-i18n="diagnose.dataWarning">WARNUNG: Dieser Test löscht alle Daten auf dem USB-Stick!</span>
@@ -552,7 +567,7 @@
         <div class="collapsible-content hidden" id="stats-content">
           <div class="stats-grid">
             <div class="stat-item">
-              <span class="stat-label" data-i18n="diagnose.sectorsChecked">Geprüfte Sektoren:</span>
+              <span id="stat-checked-label" class="stat-label" data-i18n="diagnose.sectorsChecked">Geprüfte Sektoren:</span>
               <span class="stat-value" id="stat-sectors-checked">0</span>
             </div>
             <div class="stat-item">

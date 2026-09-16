@@ -3,6 +3,20 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import { diagnosticSummary, renderDiagnosticDetails, diagnosticProgress } from '../src/diagnostic-report.mjs';
 const t = key => key;
+test('F3 results distinguish file verification from a full sector scan and escape volume names', () => {
+  const result = {success:true, details:{kind:'f3',volume:'<img src=x>',mount_point:'/Volumes/Test',
+    bytes_checked:1048576,good_bytes:1048576,corrupted_sectors:0,changed_sectors:0,overwritten_sectors:0}};
+  assert.equal(diagnosticSummary(result,t),'diagnose.f3Complete');
+  const html = renderDiagnosticDetails(result,t);
+  assert.match(html,/f3Scope/);
+  assert.match(html,/1.0 MiB/);
+  assert.match(html,/&lt;img/);
+  assert.match(html,/f3Cleaned/);
+  assert.doesNotMatch(html,/fullCoverage|<img/);
+  result.success = false;
+  assert.equal(diagnosticSummary(result,t),'diagnose.f3Failed');
+  assert.match(diagnosticProgress({phase:'cleanup',details:{kind:'f3'}},t).status,/f3Cleanup/);
+});
 test('diagnostic results use compact system typography including native table elements', () => {
   const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(css, /#diagnose-details\s*\{[^}]*font-family:\s*inherit;[^}]*font-size:\s*12px;/);

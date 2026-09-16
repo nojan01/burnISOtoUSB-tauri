@@ -11,7 +11,19 @@ pub fn run(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBo
 }
 
 fn run_with_sudo(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBool,
-                 mut event: impl FnMut(&str), sudo: &std::path::Path) -> Result<(), String> {
+                 event: impl FnMut(&str), sudo: &std::path::Path) -> Result<(), String> {
+    let script = format!("{}\n{}", include_str!("worker.py"), include_str!("supervisor.py"));
+    run_script(config, password, cancel, event, sudo, &script)
+}
+
+pub fn run_f3(config: &serde_json::Value, cancel: &AtomicBool,
+              event: impl FnMut(&str)) -> Result<(), String> {
+    run_script(config, None, cancel, event, std::path::Path::new("/usr/bin/sudo"),
+               include_str!("f3_worker.py"))
+}
+
+fn run_script(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBool,
+              mut event: impl FnMut(&str), sudo: &std::path::Path, script: &str) -> Result<(), String> {
     if cancel.load(Ordering::SeqCst) { return Err("Vorgang vor dem Start abgebrochen.".into()); }
     let python = super::get_python3_path().ok_or("Python 3 fehlt (brew install python)")?;
     if let Some(pw) = password {
@@ -43,7 +55,6 @@ fn run_with_sudo(config: &serde_json::Value, password: Option<&str>, cancel: &At
         let mut c = Command::new(sudo);
         c.args(["-n", "--", &python]); c
     } else { Command::new(python) };
-    let script = format!("{}\n{}", include_str!("worker.py"), include_str!("supervisor.py"));
     // Do not inherit a protected Documents cwd or import Python modules from it.
     // All operation paths are absolute; isolated mode also ignores PYTHONPATH.
     let mut child = command.args(["-I", "-u", "-c", &script, &config.to_string()])
@@ -92,7 +103,7 @@ fn run_with_sudo(config: &serde_json::Value, password: Option<&str>, cancel: &At
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = reader.join();
     let error = errors.join().unwrap_or_default();
-    if cancelled { return Err("Vorgang abgebrochen; Schreibprozess beendet.".into()); }
+    if cancelled { return Err(format!("Vorgang abgebrochen; Schreibprozess beendet. {}", error.trim())); }
     if !status.success() || !complete || stream_error.is_some() {
         return Err(format!("Vorgang fehlgeschlagen: {}", if error.trim().is_empty() {
             stream_error.unwrap_or_else(|| status.to_string())

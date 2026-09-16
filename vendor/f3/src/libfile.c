@@ -1,0 +1,221 @@
+#define _GNU_SOURCE
+
+#if __APPLE__ && __MACH__
+
+#define _DARWIN_C_SOURCE
+
+#include <fcntl.h>	/* For fcntl().	*/
+
+#endif	/* Apple Macintosh */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
+#include <assert.h>
+#include <inttypes.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <errno.h>
+#include <err.h>
+#include <unistd.h>
+#include <sys/statvfs.h>
+
+#include "libfile.h"
+#include "libutils.h"
+
+void adjust_dev_path(const char **dev_path)
+{
+	if (chdir(*dev_path)) {
+		err(errno, "Can't change working directory to %s at %s()", *dev_path, __func__);
+	}
+	*dev_path = ".";
+
+	if (!chroot(*dev_path)) {
+		assert(!chdir("/"));
+	} else if (errno != EPERM) {
+		err(errno, "Can't change root directory to %s at %s()", *dev_path, __func__);
+	}
+}
+
+unsigned int get_block_order(const char *path)
+{
+	struct statvfs fs;
+	unsigned int block_size;
+
+	assert(!statvfs(path, &fs));
+	block_size = fs.f_frsize;
+	assert(is_power_of_2(block_size));
+	return ilog2(block_size);
+}
+
+uint64_t get_free_blocks(const char *path)
+{
+	struct statvfs fs;
+	assert(!statvfs(path, &fs));
+	return fs.f_bfree;
+}
+
+int is_my_file(const char *filename)
+{
+	const char *p = filename;
+
+	if (!p || !isdigit(*p))
+		return 0;
+
+	/* Skip digits. */
+	do {
+		p++;
+	} while (isdigit(*p));
+
+	return	(p[0] == '.') && (p[1] == 'h') && (p[2] == '2') &&
+		(p[3] == 'w') && (p[4] == '\0');
+}
+
+char *full_fn_from_number(const char **filename, const char *path, uint64_t num)
+{
+	char *str;
+	assert(asprintf(&str, "%s/%" PRIu64 ".h2w", path, num + 1) > 0);
+	*filename = str + strlen(path) + 1;
+	return str;
+}
+
+static uint64_t number_from_filename(const char *filename)
+{
+	const char *p;
+	uint64_t num;
+
+	assert(is_my_file(filename));
+
+	p = filename;
+	num = 0;
+	do {
+		num = num * 10 + (*p - '0');
+		p++;
+	} while (isdigit(*p));
+
+	return num - 1;
+}
+
+static inline bool include_this_file(const char *filename,
+	uint64_t start_at, uint64_t end_at, uint64_t *number)
+{
+	if (!is_my_file(filename))
+		return false;
+
+	*number = number_from_filename(filename);
+
+	return start_at <= *number && *number <= end_at;
+}
+
+static uint64_t count_files(const char *path,
+	uint64_t start_at, uint64_t end_at)
+{
+	DIR *dir = opendir(path);
+	struct dirent *entry;
+	uint64_t dummy, total = 0;
+
+	if (!dir)
+		err(errno, "Can't open path %s at %s()", path, __func__);
+
+	entry = readdir(dir);
+	while (entry) {
+		if (include_this_file(entry->d_name, start_at, end_at, &dummy))
+			total++;
+		entry = readdir(dir);
+	}
+	closedir(dir);
+
+	return total;
+}
+
+/* Don't call this function directly, use ls_my_files() instead. */
+static uint64_t *__ls_my_files(const char *path,
+	uint64_t start_at, uint64_t end_at, uint64_t *pcount)
+{
+	uint64_t total_files = count_files(path, start_at, end_at);
+	DIR *dir;
+	struct dirent *entry;
+	uint64_t *ret, index;
+
+
+	ret = malloc(sizeof(*ret) * (total_files + 1));
+	assert(ret);
+
+	dir = opendir(path);
+	if (!dir)
+		err(errno, "Can't open path %s at %s()", path, __func__);
+
+	entry = readdir(dir);
+	index = 0;
+	while (entry) {
+		uint64_t number;
+		if (include_this_file(entry->d_name, start_at, end_at,
+				&number)) {
+			if (index >= total_files) {
+				/* The folder @path received more files
+				 * before we finished scanning it.
+				 */
+				closedir(dir);
+				free(ret);
+				return NULL;
+			}
+			ret[index++] = number;
+		}
+
+		entry = readdir(dir);
+	}
+	closedir(dir);
+
+	ret[index] = (uint64_t)-1;
+	*pcount = index;
+	return ret;
+}
+
+/* To be used with qsort(3). */
+static int cmpintp(const void *p1, const void *p2)
+{
+	if (*(const uint64_t *)p1 < *(const uint64_t *)p2)
+		return -1;
+	return *(const uint64_t *)p1 > *(const uint64_t *)p2;
+}
+
+const uint64_t *ls_my_files(const char *path,
+	uint64_t start_at, uint64_t end_at)
+{
+	uint64_t *ret, my_count;
+
+	do {
+		ret = __ls_my_files(path, start_at, end_at, &my_count);
+	} while (!ret);
+
+	qsort(ret, my_count, sizeof(*ret), cmpintp);
+	return ret;
+}
+
+#if __APPLE__ && __MACH__
+
+/* This function is a _rough_ approximation of fdatasync(2). */
+int fdatasync(int fd)
+{
+	return fcntl(fd, F_FULLFSYNC);
+}
+
+#include "libutils.h" /* For UNUSED(). */
+/* This function is a _rough_ approximation of posix_fadvise(2). */
+int posix_fadvise(int fd, off_t offset, off_t len, int advice)
+{
+	UNUSED(offset);
+	UNUSED(len);
+	switch (advice) {
+	case POSIX_FADV_SEQUENTIAL:
+		return fcntl(fd, F_RDAHEAD, 1);
+	case POSIX_FADV_DONTNEED:
+		return fcntl(fd, F_NOCACHE, 1);
+	default:
+		assert(0);
+	}
+}
+
+#endif	/* Apple Macintosh */

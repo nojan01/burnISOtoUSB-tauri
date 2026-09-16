@@ -47,3 +47,7 @@ latest.json
 test-images/
 __pycache__/
 *.pyc
+
+# F3 binaries and corresponding-source archive are rebuilt from vendor/.
+src-tauri/binaries/
+src-tauri/resources/f3-sources.tar.gz

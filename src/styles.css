@@ -20,6 +20,9 @@
 #diagnose-details ul { max-height: 240px; overflow-y: auto; }
 #speed-profile-options { font-family: inherit; font-size: 12px; }
 #speed-profile-options select { font-family: inherit; font-size: inherit; }
+#f3-options { margin-top: 12px; font-family: inherit; font-size: 12px; }
+#f3-options label { display: block; margin-bottom: 6px; }
+#f3-options select { min-width: 0; font-family: inherit; font-size: inherit; }
 
 :root, [data-theme="dark"] {
   --bg-primary: #1e1e1e;
