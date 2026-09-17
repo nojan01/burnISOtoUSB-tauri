@@ -1,0 +1,4 @@
+# Outputs of scripts/build-f3.sh (run from build.rs). Without this, every
+# `tauri dev` build rewrites them, the watcher notices and rebuilds forever.
+binaries/
+resources/f3-sources.tar.gz

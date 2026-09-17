@@ -1,0 +1,9 @@
+<!doctype html><html><meta charset="utf-8"><title>BurnISO UI Smoke Test (no hardware)</title>
+<body style="margin:0"><iframe title="Test-App" style="width:100vw;height:100vh;border:0"></iframe>
+<script type="module">
+const response = await fetch('../src/index.html');
+let html = await response.text();
+html = html.replace('<head>', '<head><base href="/src/">');
+html = html.replace('<script type="module" src="main.js">', '<script type="module" src="/tests/tauri-mock.mjs"></' + 'script><script type="module" src="main.js">');
+document.querySelector('iframe').srcdoc = html;
+</script></body></html>

@@ -1,0 +1,6 @@
+name: meson_build_env
+channels:
+  - conda-forge
+dependencies:
+  - c-compiler
+  - meson

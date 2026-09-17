@@ -42,3 +42,12 @@ secrets.json
 
 # Erzeugtes Updater-Manifest, gehoert ins Release, nicht ins Archiv
 latest.json
+
+# Lokal erzeugte Images fuer manuelle Schreibtests
+test-images/
+__pycache__/
+*.pyc
+
+# F3 binaries and corresponding-source archive are rebuilt from vendor/.
+src-tauri/binaries/
+src-tauri/resources/f3-sources.tar.gz

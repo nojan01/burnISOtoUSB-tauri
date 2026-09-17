@@ -333,19 +333,22 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burniso-usb"
-version = "1.4.13"
+version = "1.4.17"
 dependencies = [
  "chrono",
+ "flate2",
  "libc",
  "regex-lite",
  "serde",
  "serde_json",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
 ]
 

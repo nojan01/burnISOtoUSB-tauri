@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="de"><meta charset="utf-8"><title>Forensik Regressionstest</title>
+<link rel="stylesheet" href="../src/styles.css"><link rel="stylesheet" href="../src/forensic.css">
+<body><main id="test-report"></main>
+<script type="module">
+import { render, fixture } from "./forensic-fixture.mjs";
+document.getElementById("test-report").innerHTML = render(fixture);
+document.querySelectorAll("details").forEach(el => { el.open = true; });
+const sizes = [...new Set([...document.querySelectorAll(".forensic-report *")].filter(el => el.textContent.trim()).map(el => getComputedStyle(el).fontSize))];
+document.title = sizes.length === 1 && sizes[0] === "12px" ? "PASS: überall 12px" : "FAIL: " + sizes.join(", ");
+</script></body></html>

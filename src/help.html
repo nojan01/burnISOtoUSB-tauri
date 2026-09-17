@@ -230,6 +230,22 @@
       <tr><td>Helles Design</td><td><kbd>⌘⇧L</kbd></td></tr>
     </table>
 
+    <h2>🔍 Datenträger prüfen</h2>
+    <div class="section">
+      <h3>Freien Speicher prüfen (F3)</h3>
+      <ol>
+        <li>Unter „USB prüfen“ den externen Datenträger auswählen.</li>
+        <li>„Freien Speicher prüfen (F3)“ und das gewünschte eingehängte, beschreibbare Volume wählen. Verschlüsselte Volumes vorher im Finder entsperren.</li>
+        <li>Den Hinweis bestätigen und den Test starten. F3 schreibt Testdateien und prüft anschließend deren Inhalt; Fortschritt und Durchsatz werden angezeigt.</li>
+      </ol>
+      <p>F3 10.0 ist enthalten. Eine separate F3- oder Homebrew-Installation ist nicht nötig. Die Ablaufsteuerung nutzt wie andere Prüffunktionen Python 3. Für den F3-Test wird kein Administratorpasswort verlangt; dein Benutzer muss auf dem Volume schreiben dürfen.</p>
+      <p><strong>Dateisysteme:</strong> APFS, HFS+, exFAT und FAT32 wurden auf temporären Disk-Images geprüft. NTFS sowie ext2/ext3/ext4 benötigen einen passenden macOS-Schreibtreiber; diese Treiberkombinationen wurden nicht praktisch getestet. F3 verwendet Dateien von höchstens 1 GiB und ist damit auch für FAT32 geeignet.</p>
+      <p><strong>Prüfumfang:</strong> Geprüft werden nur die neu geschriebenen Dateien im freien Speicher. Vorhandene Dateien und Backups werden nicht verifiziert. Dies prüft weder alle logischen Sektoren noch jede physische SSD-Speicherzelle. „Surface Scan“ liest dagegen das gesamte zugängliche Medium; der „Volltest“ überschreibt und prüft es und löscht dabei alle vorhandenen Daten.</p>
+      <div class="warning">F3 belegt den freien Speicher vorübergehend vollständig. APFS-Volumes teilen sich den freien Platz im Container. Während des Tests keine Backups oder andere Schreibvorgänge auf diesem Datenträger starten. Wichtige Daten vorher sichern: Ein defekter oder gefälschter Datenträger kann auch bei einem Dateitest Daten verlieren.</div>
+      <p><strong>Abbruch und Aufräumen:</strong> Die App beendet zuerst F3 und entfernt anschließend ausschließlich ihre eigenen Testdateien im Ordner <code>.burniso-f3-…</code>. Nach einem Verbindungsabbruch oder Absturz können Dateien zurückbleiben. Die Fehlermeldung nennt den Pfad, wenn das Aufräumen fehlschlägt. Nach erneutem Einhängen und ohne laufenden Test kannst du diesen Ordner im Finder löschen (versteckte Dateien mit ⌘⇧. anzeigen).</p>
+      <p>Ein fehlerfreier Durchlauf gilt für die geprüften Testdateien. Er garantiert nicht, dass ein sporadischer USB-Abbruch ausgeschlossen ist. Datenfehler werden als beschädigte, veränderte oder überschriebene 512-Byte-Blöcke angezeigt; dies sind keine lokalisierten defekten Hardwaresektoren.</p>
+    </div>
+
     <h2>🛠️ USB Tools</h2>
     <div class="section">
       <h3>💾 USB formatieren</h3>
@@ -317,7 +333,7 @@
     <div class="section">
       <p>
         <strong>BurnISO to USB</strong> ist freie Open-Source-Software und steht unter der
-        <strong>MIT-Lizenz</strong>.
+        <strong>MIT-Lizenz für den eigenen Anwendungscode</strong>. Für mitgelieferte Komponenten gelten zusätzlich deren eigene Lizenzen.
       </p>
       <p>© 2026 Norbert Jander</p>
       <p>
@@ -337,6 +353,10 @@
         Quellcode und vollständiger Lizenztext:<br>
         <code>https://github.com/nojan01/burnISOtoUSB-tauri</code>
       </p>
+      <p>
+        <strong>Mitgeliefertes F3:</strong> <code>f3write</code> und <code>f3read</code> (F3 10.0, GPLv3) laufen als separate Programme. Darin ist argp-standalone 1.5.0 enthalten (LGPL 2.1 oder später; einzelne Dateien LGPL 2.0 oder später bzw. Public Domain). Die MIT-Lizenz ersetzt diese Bedingungen nicht. Beide Komponenten werden ohne Gewährleistung bereitgestellt.
+      </p>
+      <p>Vollständige Lizenztexte liegen im App-Paket unter <code>Contents/Resources/licenses</code>. Der zugehörige Quellcode einschließlich Bauanleitung und Build-Skripten liegt unter <code>Contents/Resources/f3-sources.tar.gz</code> sowie im Repository unter <code>vendor/</code>. Zugriff im Finder: Rechtsklick auf die App → „Paketinhalt zeigen“. Bei Weitergabe der F3-Programme müssen die jeweiligen Lizenz- und Quellcodepflichten erhalten bleiben.</p>
       <p>
         Diese App verwendet Komponenten Dritter (unter anderem Tauri, Rust-Bibliotheken und
         die macOS-Systemwerkzeuge <code>diskutil</code>, <code>dd</code> und <code>smartctl</code>).
@@ -431,6 +451,22 @@
       <tr><td>Light Mode</td><td><kbd>⌘⇧L</kbd></td></tr>
     </table>
 
+    <h2>🔍 Disk tests</h2>
+    <div class="section">
+      <h3>Test free space (F3)</h3>
+      <ol>
+        <li>Select an external disk in “Check USB”.</li>
+        <li>Select “Test free space (F3)” and a mounted, writable volume. Unlock encrypted volumes in Finder first.</li>
+        <li>Confirm the notice and start. F3 writes test files and then verifies their contents, showing progress and throughput.</li>
+      </ol>
+      <p>F3 10.0 is included; no separate F3 or Homebrew installation is needed. Like other diagnostics, the controller uses Python 3. F3 does not request an administrator password; your user must have write access to the volume.</p>
+      <p><strong>File systems:</strong> APFS, HFS+, exFAT and FAT32 were tested on temporary disk images. NTFS and ext2/ext3/ext4 require a suitable macOS write driver; those driver combinations have not been tested. F3 uses files up to 1 GiB, which also works with FAT32.</p>
+      <p><strong>Scope:</strong> Only new test files in free space are checked. Existing files and backups are not verified. This does not check every logical sector or physical SSD memory cell. “Surface Scan” reads the entire accessible medium; the “Full Test” overwrites and verifies it, deleting all existing data.</p>
+      <div class="warning">F3 temporarily fills the available space. APFS volumes share free container space. Do not run backups or other writes on this disk during testing. Back up important data first: a faulty or counterfeit drive can lose data even during a file test.</div>
+      <p><strong>Cancellation and cleanup:</strong> The app stops F3 first, then removes only its own test files in <code>.burniso-f3-…</code>. A disconnection or crash can leave files behind. If cleanup fails, the error includes the folder path. After reconnecting, with no test running, you can delete that folder in Finder (⌘⇧. shows hidden files).</p>
+      <p>A successful run applies to the tested files and does not rule out intermittent USB failures. Errors are reported as corrupted, changed or overwritten 512-byte blocks, not located faulty hardware sectors.</p>
+    </div>
+
     <h2>🛠️ USB Tools</h2>
     <div class="section">
       <h3>💾 Format USB</h3>
@@ -519,7 +555,7 @@
     <div class="section">
       <p>
         <strong>BurnISO to USB</strong> is free and open source software, licensed under the
-        <strong>MIT License</strong>.
+        <strong>MIT License for its own application code</strong>. Bundled components retain their own licenses.
       </p>
       <p>© 2026 Norbert Jander</p>
       <p>
@@ -539,6 +575,10 @@
         Source code and full license text:<br>
         <code>https://github.com/nojan01/burnISOtoUSB-tauri</code>
       </p>
+      <p>
+        <strong>Bundled F3:</strong> <code>f3write</code> and <code>f3read</code> (F3 10.0, GPLv3) run as separate programs. They include argp-standalone 1.5.0 (LGPL 2.1 or later; individual files under LGPL 2.0 or later or public domain). The MIT license does not replace these terms. Both components are supplied without warranty.
+      </p>
+      <p>Full license texts are included at <code>Contents/Resources/licenses</code> in the app bundle. Corresponding sources, build instructions and scripts are included at <code>Contents/Resources/f3-sources.tar.gz</code> and under <code>vendor/</code> in the repository. In Finder, right-click the app → “Show Package Contents”. Redistribution of the F3 programs must preserve their license and source obligations.</p>
       <p>
         This app uses third-party components (including Tauri, Rust libraries and the macOS
         system tools <code>diskutil</code>, <code>dd</code> and <code>smartctl</code>). Their

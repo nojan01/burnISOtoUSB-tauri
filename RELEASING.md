@@ -16,6 +16,15 @@ Installation erhalten.
 
 ## Release erstellen
 
+Der Build kompiliert `f3write` und `f3read` aus den versionierten Quellen in
+`vendor/` mit Apples Command Line Tools. Tauri bündelt und signiert sie als
+separate Programme. Homebrew ist dafür nicht erforderlich. Vor Veröffentlichung
+prüfen, dass beide Helfer unter `Contents/MacOS` und die zugehörigen Quellen
+unter `Contents/Resources/f3-sources.tar.gz` sowie alle Texte unter
+`Contents/Resources/licenses` im ausgelieferten App-Paket enthalten sind.
+Das Quellarchiv samt Bauanleitung ist Bestandteil der GPL-/LGPL-Auslieferung
+und muss auch im Update-Archiv bleiben. Es enthält keine privaten Signierschlüssel.
+
 Der gesamte unten beschriebene Ablauf steckt in `./release-macos.sh`. Das
 Skript ist der empfohlene Weg; die folgenden Abschnitte erklären, was es tut
 und warum.

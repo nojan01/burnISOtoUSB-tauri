@@ -1,9 +1,9 @@
 # Lizenzhinweise für Komponenten Dritter
 
-**BurnISO to USB** steht unter der MIT-Lizenz (siehe [LICENSE](LICENSE)).
+Der eigene Anwendungscode von **BurnISO to USB** steht unter der MIT-Lizenz (siehe [LICENSE](LICENSE)). Mitgelieferte Fremdkomponenten behalten ihre eigenen Lizenzen.
 
 Die Anwendung verwendet die nachfolgend aufgeführten Komponenten Dritter. Diese
-Datei erfüllt die Namensnennungspflicht der jeweiligen Lizenzen. Sie wurde aus
+Datei dokumentiert die Komponenten und ihre Lizenzbedingungen. Die Paketlisten wurden aus
 den Metadaten von `cargo metadata` und den installierten npm-Paketen erzeugt und
 muss nach einer Aktualisierung von Abhängigkeiten neu erstellt werden.
 
@@ -13,11 +13,38 @@ Stand: siehe Git-Historie dieser Datei.
 
 ## Zusammenfassung
 
-Alle direkten und transitiven Abhängigkeiten stehen unter permissiven Lizenzen.
-**Es sind keine Komponenten unter GPL, AGPL oder LGPL enthalten**, die eine
-Veröffentlichung unter der MIT-Lizenz einschränken würden.
+Die Rust- und JavaScript-Komponenten verwenden überwiegend MIT-/Apache-Lizenzen;
+MPL-Komponenten sind unten gesondert beschrieben. Zusätzlich werden erstmals
+GPL-/LGPL-Komponenten als eigenständige F3-Programme mitgeliefert.
 
-Zwei Punkte verdienen eine ausdrückliche Erwähnung:
+### Mitgelieferte F3-Programme
+
+| Komponente | Version | Lizenz | Einbindung |
+|---|---|---|---|
+| F3 (`f3write`, `f3read`) | 10.0 | GPL-3.0 | Separate ausführbare Programme, keine Verlinkung mit der Rust-App |
+| argp-standalone | 1.5.0 | LGPL-2.1-or-later; einzelne Dateien LGPL-2.0-or-later / Public Domain | Statisch in den F3-Programmen enthalten |
+
+Upstream: <https://github.com/AltraMayor/f3/tree/v10.0> und
+<https://github.com/argp-standalone/argp-standalone/tree/1.5.0>.
+F3: Copyright (C) 2010 Digirati Internet LTDA.; argp: Free Software Foundation,
+Niels Möller und weitere Mitwirkende, siehe die erhaltenen Vermerke in den
+Quelldateien. GPLv3 sowie
+LGPL 2.1 liegen unter `vendor/f3/LICENSE` und
+`vendor/argp-standalone/COPYING.LESSER`. Für LGPL-2.0-or-later-Dateien wird die
+zulässige spätere Version LGPL 2.1 verwendet. Diese Komponenten werden ohne
+Gewährleistung bereitgestellt; die MIT-Lizenz ersetzt ihre Bedingungen nicht.
+
+Jede gebaute App enthält die vollständigen zugehörigen Quellen beider
+Komponenten einschließlich Konfiguration und Build-Skripten in
+`Contents/Resources/f3-sources.tar.gz`. Vollständige Lizenztexte und diese
+Hinweise liegen unter `Contents/Resources/licenses`. Die Quelldateien liegen
+zusätzlich im Repository unter `vendor/`. `scripts/build-f3.sh` baut die separat
+nutzbaren Programme aus diesen Quellen mit Apples Command Line Tools, ohne
+Homebrew oder Netzwerkzugriff. Damit kann auch die statisch eingebundene
+argp-Bibliothek verändert und mit den F3-Quellen neu verlinkt werden.
+Bei Weitergabe sind die GPL-/LGPL-Lizenztexte und der entsprechende Quellcode
+mit Build-Anleitung ebenfalls bereitzustellen; das Quellarchiv darf nicht aus
+veröffentlichten App-Paketen entfernt werden.
 
 ### MPL-2.0 (Mozilla Public License 2.0)
 

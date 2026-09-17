@@ -230,6 +230,7 @@ if [ ! -f "$updater_archive" ]; then
 fi
 npm run --silent make-updater-manifest -- \
   "$version" darwin-aarch64 "$updater_archive" latest.json
+bash scripts/verify-update.sh "$updater_archive" "$version"
 echo
 echo "Fuer das GitHub-Release hochladen:"
 echo "  $dmg"
