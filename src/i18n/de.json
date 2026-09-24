@@ -345,6 +345,8 @@
     "formatCancelled": "Formatierung abgebrochen",
     "formatStarting": "Starte Formatierung als {fs}...",
     "formatFormatting": "Formatiere...",
+    "formatPrepare": "Bereite Datenträger für {fs} vor (temporärer FAT32-Schritt)...",
+    "formatFinal": "Formatiere Datenträger als {fs}...",
     "formatComplete": "✓ Formatierung abgeschlossen!",
     "formatError": "Fehler!",
     "eraseWarning": "UNWIDERRUFLICH!",

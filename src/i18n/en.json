@@ -345,6 +345,8 @@
     "formatCancelled": "Formatting cancelled",
     "formatStarting": "Starting formatting as {fs}...",
     "formatFormatting": "Formatting...",
+    "formatPrepare": "Preparing disk for {fs} (temporary FAT32 step)...",
+    "formatFinal": "Formatting disk as {fs}...",
     "formatComplete": "✓ Formatting complete!",
     "formatError": "Error!",
     "eraseWarning": "IRREVERSIBLE!",

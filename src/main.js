@@ -2725,7 +2725,13 @@ function forensicDeviceName(result, fallback) {
       toolsProgressText.textContent = percent + '%';
       // ETA is included in the status message from backend
       toolsEta.textContent = '';
-      toolsPhase.textContent = status;
+      if (status.startsWith('format:prepare:')) {
+        toolsPhase.textContent = t('tools.formatPrepare').replace('{fs}', status.slice('format:prepare:'.length));
+      } else if (status.startsWith('format:final:')) {
+        toolsPhase.textContent = t('tools.formatFinal').replace('{fs}', status.slice('format:final:'.length));
+      } else {
+        toolsPhase.textContent = status;
+      }
     }
   });
 

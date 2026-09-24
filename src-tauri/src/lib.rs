@@ -2169,7 +2169,12 @@ fn format_disk_blocking(
         .collect();
     let volume_name = if safe_name.is_empty() { "USB_STICK".to_string() } else { safe_name };
 
-    emit_progress(&app, 5, "Formatting USB drive...", "tools");
+    let staged_format = is_ntfs || is_ext;
+    if staged_format {
+        emit_progress(&app, 5, &format!("format:prepare:{filesystem}"), "tools");
+    } else {
+        emit_progress(&app, 5, "Formatting USB drive...", "tools");
+    }
 
     ensure_disk_unmounted(&app, &disk_id)?;
 
@@ -2184,7 +2189,7 @@ fn format_disk_blocking(
         // GPT creates disk#s2 as main partition, MBR creates disk#s1
         let partition_suffix = if scheme_type == "GPT" { "s2" } else { "s1" };
         format!(
-            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && sleep 1 && echo "y" | diskutil eraseVolume UFSD_NTFS "{}" {}{}"#,
+            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && printf 'BURNISO_FORMAT_FINAL_STAGE\n' && sleep 1 && echo "y" | diskutil eraseVolume UFSD_NTFS "{}" {}{}"#,
             volume_name, scheme_type, disk_path, volume_name, disk_path, partition_suffix
         )
     } else if is_ext {
@@ -2200,7 +2205,7 @@ fn format_disk_blocking(
         // UFSD_EXTFS ohne Journal, UFSD_EXTFS3 und UFSD_EXTFS4 mit Journal.
         let partition_suffix = if scheme_type == "GPT" { "s2" } else { "s1" };
         format!(
-            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && sleep 1 && echo "y" | diskutil eraseVolume {} "{}" {}{}"#,
+            r#"diskutil eraseDisk "MS-DOS FAT32" "{}" {} {} && printf 'BURNISO_FORMAT_FINAL_STAGE\n' && sleep 1 && echo "y" | diskutil eraseVolume {} "{}" {}{}"#,
             volume_name, scheme_type, disk_path, fs_type, volume_name, disk_path, partition_suffix
         )
     } else if is_encrypted {
@@ -2224,7 +2229,15 @@ fn format_disk_blocking(
 
     let cfg = serde_json::json!({"mode":"command","script":script});
     process_runner::run(&cfg, Some(&password), &CANCEL_TOOLS, |line| {
-        emit_progress(&app, 50, line, "tools");
+        if staged_format {
+            // diskutil reports the temporary FAT32 partition as if it were the
+            // final result. Show the selected filesystem and the actual stage.
+            if line == "BURNISO_FORMAT_FINAL_STAGE" {
+                emit_progress(&app, 70, &format!("format:final:{filesystem}"), "tools");
+            }
+        } else {
+            emit_progress(&app, 50, line, "tools");
+        }
     })?;
     emit_progress(&app, 95, "Mounting volume...", "tools");
     let _ = Command::new("diskutil").args(["mountDisk", &disk_path]).output();
