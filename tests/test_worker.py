@@ -64,6 +64,19 @@ class WorkerTests(unittest.TestCase):
             opened.assert_called_once()
         self.assertEqual(Path(path).read_bytes(), bytes(128))
 
+    def test_raw_worker_uses_inherited_descriptor(self):
+        path = self.file('device-fixture', b'confirmed medium')
+        fd = os.open(path, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        device = '/dev/rdisk99'
+        original_dup = os.dup
+        with patch.dict(os.environ, {'BURNISO_RAW_DEVICE': device}), \
+             patch.object(os, 'dup', side_effect=lambda _: original_dup(fd)) as duplicate, \
+             patch.object(os, 'open', side_effect=AssertionError('reopened device')):
+            with os.fdopen(w.open_device(device, os.O_RDONLY), 'rb') as source:
+                self.assertEqual(source.read(), b'confirmed medium')
+            duplicate.assert_called_once_with(3)
+
     def test_full_backup_preserves_tail_and_publishes_atomically(self):
         data = bytes(range(251))
         cfg = dict(device=self.file('source', data), destination=str(self.root / 'full.img'), size=len(data))

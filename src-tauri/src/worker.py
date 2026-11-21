@@ -39,7 +39,7 @@ def publish(partial, destination):
         os.unlink(partial)
 
 def open_device(path, flags):
-    fd = os.open(path, flags)
+    fd = os.dup(3) if os.environ.get('BURNISO_RAW_DEVICE') == path else os.open(path, flags)
     if sys.platform == 'darwin':
         try: fcntl.fcntl(fd, 48, 1)  # F_NOCACHE: verification must read the device.
         except OSError:
@@ -146,7 +146,7 @@ def backup(cfg):
     # Exclusive creation protects existing backups and symlink destinations.
     if os.path.lexists(destination): raise FileExistsError(destination)
     # Root is needed only to acquire the raw reader, not to create a backup.
-    with open(cfg['device'], 'rb', buffering=0) as source:
+    with os.fdopen(open_device(cfg['device'], os.O_RDONLY), 'rb', buffering=0) as source:
         if 'uid' in cfg and os.geteuid() == 0:
             os.setgroups([])
             os.setgid(cfg['gid'])

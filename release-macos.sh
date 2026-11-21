@@ -49,7 +49,12 @@ TAURI_SIGNING_PRIVATE_KEY="$SIGNING_KEY" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
   npm run tauri -- build --bundles app
 
+echo "==> Integriere die Python-Laufzeit"
+bash scripts/bundle-python-macos.sh "$APP_PATH" "$IDENTITY"
+
 echo "==> Signiere die App"
+codesign --force --options runtime --timestamp --identifier com.burniso.usb.raw-helper \
+  --sign "$IDENTITY" "$APP_PATH/Contents/MacOS/raw-helper"
 for HELPER in f3write f3read; do
   codesign --force --options runtime --timestamp \
     --sign "$IDENTITY" "$APP_PATH/Contents/MacOS/$HELPER"

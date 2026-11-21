@@ -21,7 +21,7 @@ use tauri::menu::{Menu, MenuItem, Submenu, PredefinedMenuItem, AboutMetadata};
 /// nicht stillschweigend zu Datenverlust auf einer noch gemounteten
 /// Partition führt (siehe Code-Review K5).
 fn verify_disk_unmounted(disk_id: &str) -> Result<(), String> {
-    let python = get_python3_path().ok_or("Python 3 fehlt zur Mountprüfung")?;
+    let python = unprivileged_python_path().ok_or("Python 3 fehlt zur Mountprüfung")?;
     let out = Command::new(python).args(["-I", "-S", "-c", include_str!("check_mounts.py"), disk_id])
         .output().map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -57,6 +57,12 @@ fn get_python3_path() -> Option<String> {
     let python = "/usr/bin/python3";
     Command::new(python).arg("--version").output().ok()
         .filter(|out| out.status.success()).map(|_| python.to_owned())
+}
+
+fn unprivileged_python_path() -> Option<PathBuf> {
+    let bundled = std::env::current_exe().ok()
+        .and_then(|exe| exe.parent()?.parent().map(|contents| contents.join("Resources/python/bin/python3")));
+    bundled.filter(|path| path.is_file()).or_else(|| get_python3_path().map(PathBuf::from))
 }
 
 fn get_xz_path() -> Option<String> {
@@ -1690,7 +1696,8 @@ fn encrypt_apfs_volume(volume: &str, passphrase: &str) -> Result<(), String> {
 
 fn media_identity(disk: &str) -> Result<String, String> {
     if !is_valid_disk_id(disk) { return Err("Ungültiger Datenträger".into()); }
-    let out = Command::new("/usr/bin/python3").args(["-I", "-S", "-c",
+    let python = unprivileged_python_path().ok_or("Python 3 fehlt zur Geräteprüfung")?;
+    let out = Command::new(python).args(["-I", "-S", "-c",
         concat!(include_str!("media_identity.py"), "\nimport sys; print(media_identity(sys.argv[1]))"), disk])
         .output().map_err(|e| e.to_string())?;
     if !out.status.success() { return Err("Geräteidentität nicht verfügbar".into()); }

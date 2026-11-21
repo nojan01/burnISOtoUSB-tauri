@@ -11,6 +11,9 @@ esac
 BUILD="$ROOT/src-tauri/target/f3-$TARGET"
 OUT="$ROOT/src-tauri/binaries"
 mkdir -p "$BUILD" "$OUT" "$ROOT/src-tauri/resources"
+xcrun clang -arch "$ARCH" -mmacosx-version-min="$MIN" -O2 -Wall -Wextra -Werror \
+  "$ROOT/src-tauri/src/raw_helper.c" -framework DiskArbitration -framework IOKit -framework CoreFoundation \
+  -o "$OUT/raw-helper-$TARGET"
 cp "$ROOT/scripts/f3-argp-config.h" "$BUILD/config.h"
 ARGP="$ROOT/vendor/argp-standalone"
 F3="$ROOT/vendor/f3/src"

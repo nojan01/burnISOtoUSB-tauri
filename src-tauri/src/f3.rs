@@ -19,7 +19,7 @@ fn binary(name: &str) -> Result<PathBuf, String> {
 pub async fn list_f3_volumes(disk_id: String) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         ensure_writable_target(&disk_id)?;
-        let python = get_python3_path().ok_or("Python 3 fehlt zur Volume-Prüfung")?;
+        let python = unprivileged_python_path().ok_or("Python 3 fehlt zur Volume-Prüfung")?;
         let cfg = serde_json::json!({"action":"list", "disk_id":disk_id});
         let out = Command::new(python).args(["-I", "-S", "-c", include_str!("f3_worker.py"), &cfg.to_string()])
             .current_dir("/").output().map_err(|e| e.to_string())?;

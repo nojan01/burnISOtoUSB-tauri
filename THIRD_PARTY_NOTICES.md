@@ -686,3 +686,10 @@ Insgesamt 532 direkte und transitive Abhängigkeiten.
 ```sh
 cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --all-features
 ```
+
+## CPython
+
+The Apple Silicon release bundles the CPython 3.11.18 runtime from
+[Python Build Standalone](https://github.com/astral-sh/python-build-standalone/releases/tag/20261110).
+The distribution's license texts are retained in the bundled Python tree,
+including `Contents/Resources/python/lib/python3.11/LICENSE.txt`.

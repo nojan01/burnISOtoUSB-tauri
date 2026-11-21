@@ -25,7 +25,12 @@ pub fn run_f3(config: &serde_json::Value, cancel: &AtomicBool,
 fn run_script(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBool,
               mut event: impl FnMut(&str), sudo: &std::path::Path, script: &str) -> Result<(), String> {
     if cancel.load(Ordering::SeqCst) { return Err("Vorgang vor dem Start abgebrochen.".into()); }
-    let python = super::get_python3_path().ok_or("Python 3 fehlt (xcode-select --install)")?;
+    let raw_disk = config["device"].as_str().and_then(|path| path.strip_prefix("/dev/r"));
+    let python = if password.is_some() && raw_disk.is_none() {
+        super::get_python3_path().map(std::path::PathBuf::from)
+    } else {
+        super::unprivileged_python_path()
+    }.ok_or("Python 3 fehlt (xcode-select --install)")?;
     if let Some(pw) = password {
         // -k MUST be a separate call. Combined with -v it validates the password
         // but deliberately does not update the ticket needed by the -n launch.
@@ -53,7 +58,24 @@ fn run_script(config: &serde_json::Value, password: Option<&str>, cancel: &Atomi
     }
     let mut command = if password.is_some() {
         let mut c = Command::new(sudo);
-        c.args(["-n", "--", &python]); c
+        c.args(["-n", "--"]);
+        if let Some(disk) = raw_disk {
+            let mode = match config["mode"].as_str() {
+                Some("burn" | "erase" | "full" | "speed") => "write",
+                Some("surface" | "sample" | "backup") => "read",
+                _ => return Err("Unbekannter Raw-Vorgang".into()),
+            };
+            let identity = match config["identity"].as_str() {
+                Some(value) => value.to_owned(),
+                None if mode == "read" => super::media_identity(disk)?,
+                None => return Err("Geräteidentität fehlt".into()),
+            };
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let helper = exe.with_file_name("raw-helper");
+            c.args(["/bin/sh", "-c", include_str!("launch_raw_helper.sh"), "raw-helper"])
+                .arg(helper).args([disk, &identity, mode]);
+        }
+        c.arg(&python); c
     } else { Command::new(python) };
     // Do not inherit a protected Documents cwd or import Python modules from it.
     // All operation paths are absolute; isolated mode also ignores PYTHONPATH.

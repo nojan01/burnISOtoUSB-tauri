@@ -81,7 +81,7 @@
 ### Voraussetzungen
 - macOS 10.15 (Catalina) oder neuer
 - Administrator-Rechte (für USB-Zugriff)
-- Python 3 zum Brennen und sicheren Löschen (aus den Apple Command Line Tools: `xcode-select --install`)
+- Der Apple-Silicon-Release enthält Python für Brennen, sicheres Löschen, Raw-Backups und Datenträgertests. Für Formatierung, Reparatur und bestimmte Forensik- und ISO-Funktionen wird weiterhin Apples Python aus den Command Line Tools benötigt (`xcode-select --install`).
 - Für XZ-komprimierte Images: `xz` (bei Bedarf: `brew install xz`)
 
 ### Download

@@ -1,7 +1,7 @@
 fn main() {
     let target = std::env::var("TARGET").unwrap();
     if target.ends_with("apple-darwin") {
-        for path in ["../vendor", "../scripts/build-f3.sh", "../scripts/f3-argp-config.h"] {
+        for path in ["src/raw_helper.c", "../vendor", "../scripts/build-f3.sh", "../scripts/f3-argp-config.h"] {
             println!("cargo:rerun-if-changed={path}");
         }
         assert!(std::process::Command::new("bash")

@@ -25,6 +25,19 @@ unter `Contents/Resources/f3-sources.tar.gz` sowie alle Texte unter
 Das Quellarchiv samt Bauanleitung ist Bestandteil der GPL-/LGPL-Auslieferung
 und muss auch im Update-Archiv bleiben. Es enthält keine privaten Signierschlüssel.
 
+Der Apple-Silicon-Release enthält CPython 3.11.18 aus Python Build Standalone.
+Das Release-Skript prüft den fest hinterlegten SHA-256-Wert, signiert die
+Mach-O-Dateien der Laufzeit und startet einen Importtest vor der Notarisierung.
+`BURNISO_PYTHON_ARCHIVE` kann auf eine lokale Kopie desselben Archivs zeigen.
+Die mitgelieferte Laufzeit wird für F3 und Prüfungen mit Benutzerrechten
+verwendet. Für Raw-Vorgänge öffnet der native Helper das gewählte Medium,
+gibt die Administratorrechte ab und startet den Worker mit dem offenen
+Deskriptor. Der Release signiert den Helper mit der Kennung
+`com.burniso.usb.raw-helper`. Vor dem privilegierten Start wird eine Kopie
+in einem nur für root zugänglichen Verzeichnis auf Developer ID, Team und
+Kennung geprüft. Formatierung, Reparatur sowie Teile der Forensik und
+ISO-Extraktion verwenden weiterhin Apples System-Python.
+
 Der gesamte unten beschriebene Ablauf steckt in `./release-macos.sh`. Das
 Skript ist der empfohlene Weg; die folgenden Abschnitte erklären, was es tut
 und warum.
