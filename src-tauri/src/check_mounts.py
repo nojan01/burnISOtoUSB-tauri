@@ -2,10 +2,17 @@
 import plistlib
 import subprocess
 import sys
+import time
 
 def plist(*args):
     result = subprocess.run(['/usr/sbin/diskutil', *args], capture_output=True,
-                            check=True, timeout=30)
+                            timeout=30)
+    if result.returncode:
+        try:
+            detail = plistlib.loads(result.stdout).get("ErrorMessage")
+        except (ValueError, plistlib.InvalidFileException):
+            detail = None
+        raise RuntimeError(detail or result.stderr.decode(errors="replace").strip() or f"diskutil {args[0]}: Status {result.returncode}")
     return plistlib.loads(result.stdout)
 
 def related_volumes(disk, listing, apfs):
@@ -24,7 +31,14 @@ def related_volumes(disk, listing, apfs):
     return sorted(result)
 
 def check(disk):
-    targets = related_volumes(disk, plist('list', '-plist', disk), plist('apfs', 'list', '-plist'))
+    for attempt in range(3):
+        listing = plist('list', '-plist')
+        if disk in listing.get('AllDisks', []):
+            break
+        if attempt == 2:
+            raise ValueError(f'{disk} ist nach dem Aushängen nicht mehr in der macOS-Geräteliste. Bitte Verbindung prüfen und das Medium erneut auswählen.')
+        time.sleep(0.25)
+    targets = related_volumes(disk, listing, plist('apfs', 'list', '-plist'))
     for target in targets:
         info = plist('info', '-plist', target)
         if info.get('DeviceIdentifier') != target: raise ValueError('Gerätekennung hat sich geändert')

@@ -23,6 +23,13 @@ class MountTests(unittest.TestCase):
         values = [{'AllDisks':['disk4','disk4s1']}, {'Containers':[]}, {'DeviceIdentifier':'disk4'}, {'DeviceIdentifier':'disk4s1','MountPoint':'/Volumes/Test'}]
         with patch.object(m, 'plist', side_effect=values), self.assertRaises(ValueError): m.check('disk4')
 
+    def test_missing_target_never_switches_to_another_external_disk(self):
+        with patch.object(m, 'plist', return_value={'AllDisks':['disk6']}) as query, patch.object(m.time, 'sleep'):
+            with self.assertRaisesRegex(ValueError, 'disk16.*erneut auswählen'):
+                m.check('disk16')
+            self.assertEqual(query.call_count, 3)
+            query.assert_called_with('list', '-plist')
+
     def test_command_failure_refuses_raw_access(self):
         with patch.object(m, 'plist', side_effect=subprocess.CalledProcessError(1,'diskutil')), self.assertRaises(subprocess.CalledProcessError): m.check('disk4')
 
