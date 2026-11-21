@@ -30,3 +30,14 @@ class UsbPathTests(unittest.TestCase):
         result = identify(device, 'disk1')['flash_components']
         self.assertEqual(result['controller']['manufacturer'], 'Reported maker')
         self.assertEqual(result['nand'], {'raw_id': 'ff 01'})
+
+    def test_reader_vid_identifies_reader_only(self):
+        reader = {'IOObjectClass': 'IOUSBHostDevice', 'idVendor': 0x05e3, 'idProduct': 0x0749,
+                  'IORegistryEntryChildren': [{'BSD Name': 'disk1', 'Whole': True}]}
+        result = identify(reader, 'disk1')
+        self.assertEqual(result['usb_info']['manufacturer'], 'Genesys Logic, Inc.')
+        self.assertEqual(result['flash_components'], {'controller': None, 'nand': None})
+        self.assertEqual(result['sd_card_info'], {})
+        reader['IORegistryEntryChildren'][0]['CID'] = bytes.fromhex('035344534c303847801234567801abff')
+        card = identify(reader, 'disk1')['sd_card_info']
+        self.assertEqual(card['manufacturer_id'], '0x03')

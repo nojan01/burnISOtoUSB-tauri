@@ -69,3 +69,12 @@ test('scan categories and access hint are available in both languages', () => {
     }
   }
 });
+
+test('USB reader vendor and missing SD card CID are displayed separately', () => {
+  const result = {usb_info: {manufacturer: 'Genesys Logic, Inc.', hardware_type: 'USB Card Reader'}, sd_card_info: {}};
+  const html = render(result);
+  assert.match(html, /tools.readerManufacturer:<\/span>.*?Genesys Logic, Inc\./);
+  assert.match(html, /tools.sdCardManufacturer:<\/span>.*?tools.noCardCid/);
+  result.sd_card_info = {manufacturer_id: '0x03', manufacturer: 'SanDisk'};
+  assert.match(render(result), /tools.sdCardManufacturer:<\/span>.*?SanDisk/);
+});

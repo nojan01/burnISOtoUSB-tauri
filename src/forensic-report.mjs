@@ -95,7 +95,7 @@ export function createForensicRenderer(context) {
   html += '<div class="forensic-grid">';
   
   // Check if this is an SD Card (has SD Card info from card reader)
-  const isSDCard = result.usb_info && result.usb_info.hardware_type === 'SD Card';
+  const isSDCard = Boolean(result.sd_card_info || result.usb_info?.hardware_type === 'SD Card');
   
   const diskLabels = {
     media_name: t('tools.forensicMediaName'), device_id: 'Identifier', device_node: t('tools.forensicDevicePath'),
@@ -189,14 +189,16 @@ export function createForensicRenderer(context) {
   }
   
   // USB Info Section - properly format USB device objects
-  if (result.usb_info && Object.keys(result.usb_info).length > 0) {
+  for (const [info, card] of [[result.usb_info, result.usb_info?.hardware_type === 'SD Card'], [result.sd_card_info, true]]) {
+    if (!info) continue;
+    const reader = !card && (info.hardware_type === 'USB Card Reader' || Boolean(result.sd_card_info));
     html += '<div class="forensic-section">';
-    html += '<h5>🔌 ' + t('tools.forensicUsbInfo') + '</h5>';
+    html += '<h5>🔌 ' + t(card ? 'tools.sdCard' : reader ? 'tools.usbCardReader' : 'tools.forensicUsbInfo') + '</h5>';
     html += '<div class="forensic-grid">';
     
     // Check if usb_info contains a devices array
-    if (result.usb_info.devices && Array.isArray(result.usb_info.devices)) {
-      result.usb_info.devices.forEach((device, idx) => {
+    if (info.devices && Array.isArray(info.devices)) {
+      info.devices.forEach((device, idx) => {
         html += '<div class="forensic-usb-device" style="border: 1px solid #444; padding: 10px; margin: 5px 0; border-radius: 6px; background: rgba(0,0,0,0.2);">';
         html += '<strong style="color: #4fc3f7;">📱 ' + t('tools.device') + ' ' + (idx + 1) + ': ' + eh(device.product_name || t('tools.unknown')) + '</strong><br>';
         if (device.manufacturer) html += '<span class="forensic-label">' + t('tools.manufacturer') + ':</span> <span class="forensic-value">' + eh(device.manufacturer) + '</span><br>';
@@ -214,7 +216,8 @@ export function createForensicRenderer(context) {
       const usbLabels = {
         product_name: t('tools.productName'),
         card_model: t('tools.cardModel'),
-        manufacturer: t('tools.manufacturer'),
+        manufacturer: t(card ? 'tools.sdCardManufacturer' : reader ? 'tools.readerManufacturer' : 'tools.manufacturer'),
+        cid: 'CID',
         manufacturer_id: t('tools.manufacturerId'),
         vendor_id: 'Vendor ID',
         product_id: 'Product ID',
@@ -231,10 +234,14 @@ export function createForensicRenderer(context) {
         smart_status: 'SMART Status',
         reader_vendor_id: t('tools.readerVendor')
       };
-      for (let key in result.usb_info) {
-        if (result.usb_info[key] && typeof result.usb_info[key] !== 'object') {
+      if (card && !info.manufacturer) {
+        const unknown = info.manufacturer_id || info.cid ? t('tools.unknown') : t('tools.noCardCid');
+        html += '<div class="forensic-item"><span class="forensic-label">' + eh(usbLabels.manufacturer) + ':</span> <span class="forensic-value">' + eh(unknown) + '</span></div>';
+      }
+      for (let key in info) {
+        if (info[key] && typeof info[key] !== 'object') {
           const label = usbLabels[key] || key;
-          html += '<div class="forensic-item"><span class="forensic-label">' + eh(label) + ':</span> <span class="forensic-value">' + eh(result.usb_info[key]) + '</span></div>';
+          html += '<div class="forensic-item"><span class="forensic-label">' + eh(label) + ':</span> <span class="forensic-value">' + eh(info[key]) + '</span></div>';
         }
       }
     }

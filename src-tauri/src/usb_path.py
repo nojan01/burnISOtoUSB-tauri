@@ -5,6 +5,9 @@ import subprocess
 import sys
 
 
+# USB ID Repository: https://usb-ids.gowdy.us/read/UD/05e3
+USB_VENDORS = {0x05e3: "Genesys Logic, Inc."}
+
 # Manufacturer byte of a raw NAND READ ID response (address 00h).
 NAND_MAKERS = {0x2c: 'Micron', 0xec: 'Samsung', 0xad: 'SK hynix',
                0x98: 'Toshiba / Kioxia', 0x45: 'SanDisk', 0xc2: 'Macronix'}
@@ -48,6 +51,20 @@ def identify(nodes, disk):
                 for key, field in [('idVendor', 'vendor_id'), ('idProduct', 'product_id'), ('locationID', 'location_id')]:
                     if isinstance(device.get(key), int):
                         info[field] = format(device[key], '#06x')
+                vendor = USB_VENDORS.get(device.get('idVendor'))
+                if vendor and not info.get('manufacturer', '').strip():
+                    info['manufacturer'] = vendor
+                reader = ((device.get('idVendor'), device.get('idProduct')) == (0x05e3, 0x0749)
+                          or 'card reader' in info.get('product_name', '').lower())
+                if reader:
+                    info['hardware_type'] = 'USB Card Reader'
+                    card = {}
+                    for entry in reversed(path):
+                        cid = entry.get('CID')
+                        if isinstance(cid, bytes) and len(cid) == 16 and cid[0] not in (0, 255):
+                            card = {'cid': cid.hex(), 'manufacturer_id': f'0x{cid[0]:02x}'}
+                            break
+                    result['sd_card_info'] = card
                 result['usb_info'] = info
                 if controller:
                     result['controller_info'] = {'host_controller': controller}

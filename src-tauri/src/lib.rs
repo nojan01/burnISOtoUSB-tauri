@@ -2803,7 +2803,7 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
 
                     result["smart_info"] = serde_json::json!(smart_info);
                 }
-                result["usb_info"] = sd_info;
+                result["sd_card_info"] = sd_info;
 
                 // Remove misleading smart_status from disk_info for SD cards
                 // (diskutil says "Not Supported" but Card Reader has its own health check)
@@ -2823,10 +2823,21 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
             if out.status.success() {
                 if let Ok(fields) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&out.stdout) {
                     for (field, value) in fields {
-                        if field == "flash_components" || !found_device_info { result[field] = value; }
+                        if field == "sd_card_info" && found_device_info {
+                            if let Some(cid) = value.get("cid") { result["sd_card_info"]["cid"] = cid.clone(); }
+                            if result["sd_card_info"].get("manufacturer_id").is_none() {
+                                if let Some(mid) = value.get("manufacturer_id") { result["sd_card_info"]["manufacturer_id"] = mid.clone(); }
+                            }
+                        } else { result[field] = value; }
                     }
                 }
             }
+        }
+    }
+
+    if let Some(mid) = result["sd_card_info"]["manufacturer_id"].as_str() {
+        if let Some(name) = sd_manufacturer_lookup(&mid.trim().to_ascii_lowercase()) {
+            result["sd_card_info"]["manufacturer"] = serde_json::json!(name);
         }
     }
 
@@ -3236,7 +3247,8 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
     }
 
     let mut sources = vec!["diskutil".to_string(), "raw disk header".to_string()];
-    if result.get("usb_info").is_some() { sources.push(if found_device_info { "system_profiler" } else { "IORegistry" }.to_string()); }
+    if found_device_info { sources.push("system_profiler".to_string()); }
+    if result.get("usb_info").is_some() { sources.push("IORegistry".to_string()); }
     if result.get("smart_info").is_some() { sources.push("SMART / smartctl".to_string()); }
     if result.get("filesystem_details").is_some() { sources.push("mounted filesystem metadata".to_string()); }
     if result.get("linux_filesystem_details").is_some() { sources.push("Linux filesystem superblock (read-only)".to_string()); }
@@ -3306,7 +3318,7 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
                             let bsd_name = card.get("bsd_name").and_then(|b| b.as_str()).unwrap_or("");
 
                             // Match by disk ID
-                            if bsd_name == disk_id || disk_id.starts_with(bsd_name) || bsd_name.starts_with(&disk_id.replace("s1", "").replace("s2", "")) {
+                            if whole_disk_of(bsd_name) == disk_id {
                                 let mut info = serde_json::Map::new();
 
                                 // Card type and name

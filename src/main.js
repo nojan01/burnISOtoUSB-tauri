@@ -1,3 +1,4 @@
+import { createToolOperation } from './tool-operation.mjs';
 import { diagnosticSummary, renderDiagnosticDetails, diagnosticProgress } from './diagnostic-report.mjs';
 import { burnCompletion } from './burn-result.mjs';
 import { createForensicRenderer, standaloneReport, buildForensicJsonExport } from './forensic-report.mjs';
@@ -751,7 +752,15 @@ function forensicDeviceName(result, fallback) {
   
   // Tools tab state
   let selectedToolsDisk = null;
-  let isToolsRunning = false;
+  const toolOperation = createToolOperation(updateToolControls);
+
+  function updateToolControls() {
+    toolsDiskSelect.disabled = toolOperation.busy;
+    refreshToolsDisks.disabled = toolOperation.busy;
+    for (const button of [formatBtn, repairBtn, secureEraseBtn, bootcheckBtn]) {
+      button.disabled = toolOperation.busy || !selectedToolsDisk;
+    }
+  }
   let toolsStartTime = null;
 
   // Collapsible section toggle
@@ -1014,7 +1023,12 @@ function forensicDeviceName(result, fallback) {
   }
 
   // Load disks (with logging)
-  async function loadDisks(selectElement, infoElement, logFn) {
+  async function loadDisks(selectElement, infoElement, logFn, afterToolCompletion = false) {
+    if (selectElement === toolsDiskSelect) {
+      if (toolOperation.busy && !afterToolCompletion) return;
+      selectedToolsDisk = null;
+      updateToolControls();
+    }
     if (selectElement === diagnoseDiskSelect) {
       if (isDiagnosing) return;
       selectedDiagnoseDisk = null;
@@ -1049,6 +1063,11 @@ function forensicDeviceName(result, fallback) {
 
   // Load disks silently (no logging)
   async function loadDisksSilent(selectElement, infoElement) {
+    if (selectElement === toolsDiskSelect) {
+      if (toolOperation.busy) return;
+      selectedToolsDisk = null;
+      updateToolControls();
+    }
     if (selectElement === diagnoseDiskSelect) {
       if (isDiagnosing) return;
       selectedDiagnoseDisk = null;
@@ -2212,27 +2231,24 @@ function forensicDeviceName(result, fallback) {
   });
 
   toolsDiskSelect.addEventListener('change', async function() {
+    if (toolOperation.busy) return;
     if (toolsDiskSelect.value) {
       selectedToolsDisk = JSON.parse(toolsDiskSelect.value);
-      await showDiskInfo(selectedToolsDisk.id, toolsDiskInfo, logTools);
+      const disk = selectedToolsDisk;
+      updateToolControls();
+      await showDiskInfo(disk.id, toolsDiskInfo, logTools);
+      if (disk !== selectedToolsDisk) return;
       logTools(t('logs.usbSelected') + selectedToolsDisk.name + ' (' + selectedToolsDisk.size + ')', 'info');
-      formatBtn.disabled = false;
-      repairBtn.disabled = false;
-      secureEraseBtn.disabled = false;
-      bootcheckBtn.disabled = false;
       updateEraseTimeEstimates(selectedToolsDisk.size);
     } else {
       selectedToolsDisk = null;
+      updateToolControls();
       toolsDiskInfo.classList.remove('visible');
-      formatBtn.disabled = true;
-      repairBtn.disabled = true;
-      secureEraseBtn.disabled = true;
-      bootcheckBtn.disabled = true;
       updateEraseTimeEstimates(null);
     }
   });
 
-  formatBtn.addEventListener('click', async function() {
+  formatBtn.addEventListener('click', () => toolOperation.run(async function() {
     const confirmedDisk = selectedToolsDisk;
     if (!confirmedDisk) return;
     
@@ -2270,12 +2286,7 @@ function forensicDeviceName(result, fallback) {
       return;
     }
     
-    isToolsRunning = true;
     toolsStartTime = Date.now();
-    formatBtn.disabled = true;
-    repairBtn.disabled = true;
-    secureEraseBtn.disabled = true;
-    bootcheckBtn.disabled = true;
     
     // Reset progress display
     toolsProgressFill.style.width = '0%';
@@ -2307,22 +2318,17 @@ function forensicDeviceName(result, fallback) {
       formatEncryptionPassword.value = '';
       
       sendNotification(t('notifications.formatComplete'), t('notifications.formatSuccess'));
-      loadDisks(toolsDiskSelect, toolsDiskInfo, logTools);
+      await loadDisks(toolsDiskSelect, toolsDiskInfo, logTools, true);
     } catch (err) {
       logTools(t('messages.error') + ': ' + err, 'error');
       toolsPhase.textContent = t('tools.formatError');
       toolsPhase.className = 'phase-text error';
     }
     
-    isToolsRunning = false;
-    formatBtn.disabled = !selectedToolsDisk;
-    repairBtn.disabled = !selectedToolsDisk;
-    secureEraseBtn.disabled = !selectedToolsDisk;
-    bootcheckBtn.disabled = !selectedToolsDisk;
-  });
+  }));
 
   // Repair disk button
-  repairBtn.addEventListener('click', async function() {
+  repairBtn.addEventListener('click', () => toolOperation.run(async function() {
     const confirmedDisk = selectedToolsDisk;
     if (!confirmedDisk) return;
     
@@ -2339,11 +2345,6 @@ function forensicDeviceName(result, fallback) {
       return;
     }
     
-    isToolsRunning = true;
-    formatBtn.disabled = true;
-    repairBtn.disabled = true;
-    secureEraseBtn.disabled = true;
-    bootcheckBtn.disabled = true;
     
     logTools(t('tools.repairStarting'), 'info');
     toolsPhase.textContent = t('tools.repairRepairing');
@@ -2367,21 +2368,16 @@ function forensicDeviceName(result, fallback) {
       }
       toolsPhase.className = 'phase-text success';
       
-      loadDisks(toolsDiskSelect, toolsDiskInfo, logTools);
+      await loadDisks(toolsDiskSelect, toolsDiskInfo, logTools, true);
     } catch (err) {
       logTools(t('tools.repairError') + ': ' + err, 'error');
       toolsPhase.textContent = t('tools.repairError');
       toolsPhase.className = 'phase-text error';
     }
     
-    isToolsRunning = false;
-    formatBtn.disabled = !selectedToolsDisk;
-    repairBtn.disabled = !selectedToolsDisk;
-    secureEraseBtn.disabled = !selectedToolsDisk;
-    bootcheckBtn.disabled = !selectedToolsDisk;
-  });
+  }));
 
-  secureEraseBtn.addEventListener('click', async function() {
+  secureEraseBtn.addEventListener('click', () => toolOperation.run(async function() {
     const confirmedDisk = selectedToolsDisk;
     if (!confirmedDisk) return;
     
@@ -2414,12 +2410,7 @@ function forensicDeviceName(result, fallback) {
       return;
     }
     
-    isToolsRunning = true;
     toolsStartTime = Date.now();
-    formatBtn.disabled = true;
-    repairBtn.disabled = true;
-    secureEraseBtn.disabled = true;
-    bootcheckBtn.disabled = true;
     cancelEraseBtn.classList.remove('hidden');
     cancelEraseBtn.disabled = false;
     
@@ -2447,7 +2438,7 @@ function forensicDeviceName(result, fallback) {
       toolsPhase.className = 'phase-text success';
       
       sendNotification(t('notifications.eraseComplete'), t('notifications.eraseSuccess'));
-      loadDisks(toolsDiskSelect, toolsDiskInfo, logTools);
+      await loadDisks(toolsDiskSelect, toolsDiskInfo, logTools, true);
     } catch (err) {
       const errMsg = String(err);
       if (errMsg.includes('abgebrochen') || errMsg.includes('cancelled')) {
@@ -2463,14 +2454,9 @@ function forensicDeviceName(result, fallback) {
       }
     }
     
-    isToolsRunning = false;
-    formatBtn.disabled = !selectedToolsDisk;
-    repairBtn.disabled = !selectedToolsDisk;
-    secureEraseBtn.disabled = !selectedToolsDisk;
-    bootcheckBtn.disabled = !selectedToolsDisk;
     cancelEraseBtn.classList.add('hidden');
     cancelEraseBtn.disabled = true;
-  });
+  }));
 
   cancelEraseBtn.addEventListener('click', async function() {
     logTools(t('messages.cancelled') + '...', 'warning');
@@ -2482,7 +2468,7 @@ function forensicDeviceName(result, fallback) {
     }
   });
 
-  bootcheckBtn.addEventListener('click', async function() {
+  bootcheckBtn.addEventListener('click', () => toolOperation.run(async function() {
     console.log('Bootcheck clicked, selectedToolsDisk:', selectedToolsDisk);
     if (!selectedToolsDisk) {
       console.log('No disk selected, returning');
@@ -2531,7 +2517,7 @@ function forensicDeviceName(result, fallback) {
       bootcheckResult.innerHTML = '<div class="bootcheck-error">' + escapeHtml(t('messages.error') + ': ' + err) + '</div>';
       bootcheckResult.classList.remove('hidden');
     }
-  });
+  }));
 
   const renderForensicReport = createForensicRenderer({
     t, escapeHtml, forensicValue, forensicItem, formatBytes, formatBytesExact,
@@ -2692,7 +2678,7 @@ function forensicDeviceName(result, fallback) {
       logBackup(message, 'info');
     } else if (isDiagnosing) {
       logDiagnose(message, 'info');
-    } else if (isToolsRunning) {
+    } else if (toolOperation.busy) {
       logTools(message, 'info');
     }
   });
