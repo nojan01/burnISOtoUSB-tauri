@@ -18,9 +18,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1] / 'src-tauri/src'
 sys.path.insert(0, str(ROOT))
 import check_mounts
+from media_identity import media_identity
 
 def run_worker(config):
-    script = (ROOT / 'worker.py').read_text() + '\n' + (ROOT / 'supervisor.py').read_text()
+    script = '\n'.join((ROOT / name).read_text() for name in ('media_identity.py', 'worker.py', 'supervisor.py'))
     child = subprocess.Popen([sys.executable, '-u', '-c', script, json.dumps(config)], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     # Keep stdin open. EOF is deliberately treated as parent failure/cancel.
@@ -61,6 +62,7 @@ def main():
             disk, capacity, name = target.split(':', 2)
             capacity = int(capacity)
             if not disk.startswith('disk') or not disk[4:].isdigit(): raise ValueError('Invalid disk identifier')
+            identity = media_identity(disk)
             validate(disk, capacity, name)
             print(f'TEST {disk}: {name}, {capacity} bytes (destructive prefix test)', flush=True)
             subprocess.run(['/usr/sbin/diskutil','unmountDisk',disk], check=True, stdout=subprocess.DEVNULL)
@@ -71,13 +73,13 @@ def main():
                 validate(disk, capacity, name)
                 check_mounts.check(disk)
                 start = time.monotonic()
-                run_worker(dict(mode='burn', source=str(image), device=device, size=size, xz=decoder, verify=True))
+                run_worker(dict(mode='burn', identity=identity, source=str(image), device=device, size=size, xz=decoder, verify=True))
                 print(f'PASS {disk}: {image.name}, write+verify {time.monotonic()-start:.2f}s', flush=True)
             backup = root / (disk + '.img')
             run_worker(dict(mode='backup', device=device, size=size, destination=str(backup)))
             assert hashlib.sha256(backup.read_bytes()).digest() == expected
             print(f'PASS {disk}: exact {size}-byte backup', flush=True)
-            run_worker(dict(mode='full', device=device, size=size))
+            run_worker(dict(mode='full', identity=identity, device=device, size=size))
             run_worker(dict(mode='surface', device=device, size=size))
             print(f'PASS {disk}: 00/FF full-byte verification + surface read including tail', flush=True)
             print(f'NOTICE {disk}: first {size} bytes overwritten; partition map destroyed.', flush=True)

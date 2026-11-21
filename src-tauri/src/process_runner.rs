@@ -12,20 +12,20 @@ pub fn run(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBo
 
 fn run_with_sudo(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBool,
                  event: impl FnMut(&str), sudo: &std::path::Path) -> Result<(), String> {
-    let script = format!("{}\n{}", include_str!("worker.py"), include_str!("supervisor.py"));
+    let script = format!("{}\n{}\n{}", include_str!("media_identity.py"), include_str!("worker.py"), include_str!("supervisor.py"));
     run_script(config, password, cancel, event, sudo, &script)
 }
 
 pub fn run_f3(config: &serde_json::Value, cancel: &AtomicBool,
               event: impl FnMut(&str)) -> Result<(), String> {
     run_script(config, None, cancel, event, std::path::Path::new("/usr/bin/sudo"),
-               include_str!("f3_worker.py"))
+               concat!(include_str!("media_identity.py"), "\n", include_str!("f3_worker.py")))
 }
 
 fn run_script(config: &serde_json::Value, password: Option<&str>, cancel: &AtomicBool,
               mut event: impl FnMut(&str), sudo: &std::path::Path, script: &str) -> Result<(), String> {
     if cancel.load(Ordering::SeqCst) { return Err("Vorgang vor dem Start abgebrochen.".into()); }
-    let python = super::get_python3_path().ok_or("Python 3 fehlt (brew install python)")?;
+    let python = super::get_python3_path().ok_or("Python 3 fehlt (xcode-select --install)")?;
     if let Some(pw) = password {
         // -k MUST be a separate call. Combined with -v it validates the password
         // but deliberately does not update the ticket needed by the -n launch.
@@ -57,7 +57,7 @@ fn run_script(config: &serde_json::Value, password: Option<&str>, cancel: &Atomi
     } else { Command::new(python) };
     // Do not inherit a protected Documents cwd or import Python modules from it.
     // All operation paths are absolute; isolated mode also ignores PYTHONPATH.
-    let mut child = command.args(["-I", "-u", "-c", &script, &config.to_string()])
+    let mut child = command.args(["-I", "-S", "-u", "-c", &script, &config.to_string()])
         .current_dir("/")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("Prozessstart: {e}"))?;

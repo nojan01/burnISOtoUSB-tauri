@@ -48,6 +48,22 @@ class WorkerTests(unittest.TestCase):
         with patch.object(w.os, 'write', short_write): w.write_all(0, b'abcdefg')
         self.assertEqual(received, b'abcdefg')
 
+    def test_changed_attachment_closes_descriptor_before_write(self):
+        with patch.object(w, 'open_device', return_value=42), \
+             patch.object(w, 'verify_media', create=True, side_effect=ValueError('changed')), \
+             patch.object(w.os, 'close') as close, patch.object(w, 'write_all') as write:
+            with self.assertRaises(ValueError):
+                w.erase(dict(device='/dev/rdisk7', identity='previous', size=512))
+            close.assert_called_once_with(42)
+            write.assert_not_called()
+
+    def test_multiple_passes_share_one_descriptor(self):
+        path = self.file('target', bytes(128))
+        with patch.object(w, 'open_device', wraps=w.open_device) as opened:
+            w.erase(dict(device=path, size=128, passes=[True, False]))
+            opened.assert_called_once()
+        self.assertEqual(Path(path).read_bytes(), bytes(128))
+
     def test_full_backup_preserves_tail_and_publishes_atomically(self):
         data = bytes(range(251))
         cfg = dict(device=self.file('source', data), destination=str(self.root / 'full.img'), size=len(data))
@@ -105,13 +121,25 @@ class WorkerTests(unittest.TestCase):
         with patch.object(w.os, 'fsync', corrupt), self.assertRaisesRegex(OSError, 'Verifizierung'):
             w.burn(cfg)
 
+    def test_burn_releases_privileges_before_opening_source(self):
+        cfg = dict(device=self.file('target', bytes(64)), source=self.file('source', bytes(64)),
+                   size=64, uid=501, gid=20)
+        order = []
+        with patch.object(w.os, 'geteuid', return_value=0), \
+             patch.object(w.os, 'setgroups', side_effect=lambda groups: order.append(('groups', groups))), \
+             patch.object(w.os, 'setgid', side_effect=lambda gid: order.append(('gid', gid))), \
+             patch.object(w.os, 'setuid', side_effect=lambda uid: order.append(('uid', uid))), \
+             patch.object(w, 'open', create=True, side_effect=lambda *args: (order.append('open'), open(*args))[1]):
+            w.burn(cfg)
+        self.assertEqual(order, [('groups', []), ('gid', 20), ('uid', 501), 'open'])
+
     def test_xz_decompresses_only_once(self):
         xz = shutil.which('xz')
         if not xz: self.skipTest('xz missing')
         cfg = dict(device=self.file('disk', bytes(251)), source=self.file('image.xz', lzma.compress(bytes(range(251)))), size=251, verify=True, xz=xz)
         with patch.object(w.subprocess, 'Popen', wraps=subprocess.Popen) as popen:
             w.burn(cfg)
-            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(popen.call_count, 0 if os.geteuid() == 0 else 1)
         self.assertEqual(Path(cfg['device']).read_bytes(), bytes(range(251)))
 
     def test_speed_never_exceeds_small_device(self):

@@ -49,7 +49,7 @@
 - **NTFS** - Erfordert [Paragon NTFS](https://www.paragon-software.com/de/home/ntfs-mac/)
 - **ext2/3/4** - Erfordert [Paragon extFS](https://www.paragon-software.com/de/home/extfs-mac/)
 - **First Aid** - Repariert Dateisystem-Fehler auf USB-Sticks
-- **Sicher Löschen** - 4 Sicherheitsstufen (Schnell bis Gutmann 35×)
+- **Sicher Löschen** - 4 Sicherheitsstufen (Schnell bis 35 Durchgänge)
 - **Boot-Analyse** - Prüft Bootfähigkeit (MBR, GPT, EFI, El Torito)
 
 ### 🔍 Forensik-Analyse (NEU in 1.3.0)
@@ -81,7 +81,7 @@
 ### Voraussetzungen
 - macOS 10.15 (Catalina) oder neuer
 - Administrator-Rechte (für USB-Zugriff)
-- Python 3 zum Brennen und sicheren Löschen (bei Bedarf: `brew install python`)
+- Python 3 zum Brennen und sicheren Löschen (aus den Apple Command Line Tools: `xcode-select --install`)
 - Für XZ-komprimierte Images: `xz` (bei Bedarf: `brew install xz`)
 
 ### Download

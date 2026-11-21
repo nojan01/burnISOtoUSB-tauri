@@ -38,6 +38,12 @@ trap cleanup EXIT
 
 cd "$PROJECT_DIR"
 
+# Remove the legacy password ACL on migration to the notarytool profile.
+legacy_service="BurnISOtoUSB Notarisierung"
+if /usr/bin/security find-generic-password -s "$legacy_service" >/dev/null 2>&1; then
+  /usr/bin/security delete-generic-password -s "$legacy_service"
+fi
+
 echo "==> Baue ${APP_NAME} ${VERSION}"
 TAURI_SIGNING_PRIVATE_KEY="$SIGNING_KEY" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
@@ -71,6 +77,8 @@ COPYFILE_DISABLE=1 tar --no-xattrs -C "$MACOS_DIR" \
 TAURI_SIGNING_PRIVATE_KEY_PATH="$SIGNING_KEY" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
   npm run tauri -- signer sign "$UPDATER_TGZ"
+
+bash scripts/verify-update.sh "$UPDATER_TGZ" "$VERSION"
 
 echo "==> Erstelle das DMG aus der gestapelten App"
 mkdir -p "$DMG_DIR"

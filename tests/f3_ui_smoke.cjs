@@ -45,7 +45,7 @@ const root = path.resolve(__dirname, '..');
         assert(!(await app.locator('#f3-volume-select').isDisabled()));
         const calls = await page.frames()[1].evaluate(() => window.__mockCalls);
         const invocation = calls.find(c => c.command === 'diagnose_f3');
-        assert.deepEqual(invocation.args,{diskId:'disk99',volumeId:'disk100s1',volumeUuid:'fixture-uuid'});
+        assert.deepEqual(invocation.args,{diskId:'disk99',identity:'fixture-attachment',volumeId:'disk100s1',volumeUuid:'fixture-uuid'});
         assert(!calls.some(c => c.command === 'diagnose_full_test'));
         assert(!(await app.locator('#password-modal').isVisible()));
         if (scenario === 'success') await page.screenshot({path:'/private/tmp/burniso-f3-ui.png',fullPage:true});

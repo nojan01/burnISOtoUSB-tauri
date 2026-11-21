@@ -49,7 +49,7 @@ window.__TAURI__ = {
     if (['diagnose_speed_test','diagnose_surface_scan','diagnose_f3'].includes(command)) return diagnose(command,args);
     if (command === 'list_f3_volumes') return new URL(window.parent.location.href).searchParams.get('f3') === 'none' ? [] :
       [{id:'disk100s1',uuid:'fixture-uuid',name:'F3 Test Volume',mount_point:'/Volumes/F3 Test',free_bytes:1073741824}];
-    if (command === 'list_disks') return [{id:'disk99',name:'Disposable Test Fixture',size:'4 GB',bytes:4000000000}];
+    if (command === 'list_disks') return [{id:'disk99',identity:'fixture-attachment',name:'Disposable Test Fixture',size:'4 GB',bytes:4000000000}];
     if (command === 'get_disk_info') return 'Test fixture (no device access)';
     if (command === 'forensic_analysis') return structuredClone(fixture);
     if (command === 'check_dependencies') return {python3:true,xz:true,smartctl:true,all_installed:true};

@@ -28,7 +28,7 @@ fn result_from(details: serde_json::Value, size: u64) -> Result<DiagnoseResult, 
     })
 }
 
-pub async fn run(app: AppHandle, disk_id: String, password: String, mode: &str, profile: &str) -> Result<DiagnoseResult, String> {
+pub async fn run(app: AppHandle, disk_id: String, identity: Option<String>, password: String, mode: &str, profile: &str) -> Result<DiagnoseResult, String> {
     if !matches!(mode, "surface" | "sample" | "speed") || !matches!(profile, "quick" | "detailed") {
         return Err("Ungültiger Diagnosemodus".into());
     }
@@ -40,10 +40,10 @@ pub async fn run(app: AppHandle, disk_id: String, password: String, mode: &str, 
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         if !is_valid_disk_id(&disk_id) { return Err("Invalid disk identifier".into()); }
-        if mode == "speed" { ensure_writable_target(&disk_id)?; }
+        if mode == "speed" { verify_media(&disk_id, identity.as_deref().unwrap_or(""))?; ensure_writable_target(&disk_id)?; }
         let size = get_disk_size(&disk_id)?;
         ensure_disk_unmounted(&app, &disk_id)?;
-        let cfg = serde_json::json!({"mode":mode,"speed_profile":profile,"seconds":30,
+        let cfg = serde_json::json!({"identity":identity,"mode":mode,"speed_profile":profile,"seconds":30,
             "device":format!("/dev/r{disk_id}"),"size":size});
         let mut result = None;
         let mut protocol_error = None;

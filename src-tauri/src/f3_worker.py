@@ -72,6 +72,7 @@ def volumes(disk):
 def selected_volume(cfg):
     for volume in volumes(cfg['disk_id']):
         if volume['id'] == cfg['volume_id'] and volume['uuid'] == cfg['volume_uuid']:
+            verify_media(cfg['disk_id'], cfg['identity'])
             return volume
     raise ValueError('Das gewählte Volume ist nicht mehr verfügbar. Bitte neu auswählen.')
 

@@ -12,11 +12,11 @@ import sys
 import threading
 import time
 
-from hardware_smoke import ROOT, validate, check_mounts
+from hardware_smoke import ROOT, validate, check_mounts, media_identity
 
 
 def measure(config):
-    script = (ROOT / 'worker.py').read_text() + '\n' + (ROOT / 'supervisor.py').read_text()
+    script = '\n'.join((ROOT / name).read_text() for name in ('media_identity.py', 'worker.py', 'supervisor.py'))
     child = subprocess.Popen([sys.executable, '-I', '-u', '-c', script, json.dumps(config)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, cwd=ROOT)
@@ -72,9 +72,10 @@ def main():
         if not disk.startswith('disk') or not disk[4:].isdigit():
             raise ValueError('Invalid disk identifier')
         capacity = int(capacity)
+        identity = media_identity(disk)
         validate(disk, capacity, name)
-        targets.append((disk, capacity, name))
-    for disk, capacity, name in targets:
+        targets.append((disk, capacity, name, identity))
+    for disk, capacity, name, identity in targets:
         print(f'TEST {disk}: {name}, {capacity} bytes; PARTITION MAP WILL BE DESTROYED', flush=True)
         validate(disk, capacity, name)
         subprocess.run(['/usr/sbin/diskutil', 'unmountDisk', disk], check=True)
@@ -86,7 +87,7 @@ def main():
                 validate(disk, capacity, name)
                 check_mounts.check(disk)
                 print(f'START {disk}: {mode}/{profile}', flush=True)
-                measure(dict(mode=mode, speed_profile=profile, seconds=30,
+                measure(dict(mode=mode, identity=identity, speed_profile=profile, seconds=30,
                              device='/dev/r' + disk, size=capacity))
         finally:
             subprocess.run(['/usr/sbin/diskutil', 'mountDisk', disk], check=False)

@@ -47,6 +47,17 @@ def open_device(path, flags):
             raise
     return fd
 
+def open_target(cfg, flags):
+    fd = open_device(cfg['device'], flags)
+    try:
+        if cfg['device'].startswith('/dev/rdisk'):
+            verify_media(os.path.basename(cfg['device'])[1:], cfg['identity'])
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def read_exact(reader, size):
     chunks = []
     remaining = size
@@ -76,9 +87,17 @@ def burn(cfg):
     if total <= 0: raise ValueError('Leeres Image')
     decoder = None
     errors_file = None
-    fd = open_device(cfg['device'], os.O_RDWR)
+    fd = open_target(cfg, os.O_RDWR)
     try:
-        if cfg.get('xz'):
+        if os.geteuid() == 0 and 'uid' in cfg:
+            os.setgroups([])
+            os.setgid(cfg['gid'])
+            os.setuid(cfg['uid'])
+        if cfg.get('xz') and os.geteuid() == 0:
+            # A caller running as root has no lower-privileged decoder account.
+            import lzma
+            source = lzma.open(cfg['source'], 'rb')
+        elif cfg.get('xz'):
             errors_file = tempfile.TemporaryFile()
             decoder = subprocess.Popen([cfg['xz'], '--threads=2', '-dc', '--', cfg['source']],
                                        stdout=subprocess.PIPE, stderr=errors_file)
@@ -147,7 +166,7 @@ def diagnostic(cfg):
     total = cfg['size']
     if total <= 0: raise ValueError('Ungültige Datenträgergröße')
     full = cfg['mode'] == 'full'
-    fd = open_device(cfg['device'], os.O_RDWR if full else os.O_RDONLY)
+    fd = open_target(cfg, os.O_RDWR) if full else open_device(cfg['device'], os.O_RDONLY)
     try:
         for pattern in ([0, 255] if full else [None]):
             pattern_data = bytes([pattern]) * BLOCK if full else None
@@ -177,18 +196,19 @@ def diagnostic(cfg):
     finally: os.close(fd)
 
 def erase(cfg):
-    fd = open_device(cfg['device'], os.O_WRONLY)
+    fd = open_target(cfg, os.O_WRONLY)
     total = cfg['size']
-    done = 0
     zeros = bytes(BLOCK)
     try:
-        while done < total:
-            size = min(BLOCK, total - done)
-            data = os.urandom(size) if cfg.get('random') else zeros[:size]
-            write_all(fd, data)
-            done += size
-            progress('BYTES', done, total)
-        os.fsync(fd)
+        for index, random in enumerate(cfg.get('passes', [cfg.get('random', False)]), 1):
+            os.lseek(fd, 0, os.SEEK_SET)
+            done = 0
+            while done < total:
+                size = min(BLOCK, total - done)
+                write_all(fd, os.urandom(size) if random else zeros[:size])
+                done += size
+                progress('BYTES', done, total, str(index))
+            os.fsync(fd)
     finally: os.close(fd)
 
 def filesystem_backup(cfg):
@@ -208,7 +228,10 @@ def worker(cfg):
     elif mode == 'erase': erase(cfg)
     elif mode == 'filesystem_backup': filesystem_backup(cfg)
     elif mode == 'speed': speed(cfg)
-    elif mode == 'command': subprocess.run(['/bin/sh', '-c', cfg['script']], stdin=subprocess.DEVNULL, check=True)
+    elif mode == 'command':
+        if 'disk' in cfg:
+            verify_media(cfg['disk'], cfg['identity'])
+        subprocess.run(['/bin/sh', '-c', cfg['script']], stdin=subprocess.DEVNULL, check=True, env={**os.environ, 'PATH':'/usr/bin:/bin:/usr/sbin:/sbin'})
     else: raise ValueError('Unbekannter Vorgang: ' + mode)
 
 def diagnostic_event(event_name, **values):
@@ -305,7 +328,7 @@ def speed(cfg):
     blocks = (8 * 1024**2,) if profile == 'quick' else (1024**2, 4 * 1024**2, 16 * 1024**2)
     amount = min(total, max(100 * 1024**2, min(total // 30, 50 * 1024**3)))
     rows = []
-    fd = open_device(cfg['device'], os.O_RDWR)
+    fd = open_target(cfg, os.O_RDWR)
     try:
         for index, block in enumerate(blocks):
             data = bytes(block)

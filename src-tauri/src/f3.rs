@@ -21,7 +21,7 @@ pub async fn list_f3_volumes(disk_id: String) -> Result<serde_json::Value, Strin
         ensure_writable_target(&disk_id)?;
         let python = get_python3_path().ok_or("Python 3 fehlt zur Volume-Prüfung")?;
         let cfg = serde_json::json!({"action":"list", "disk_id":disk_id});
-        let out = Command::new(python).args(["-I", "-c", include_str!("f3_worker.py"), &cfg.to_string()])
+        let out = Command::new(python).args(["-I", "-S", "-c", include_str!("f3_worker.py"), &cfg.to_string()])
             .current_dir("/").output().map_err(|e| e.to_string())?;
         if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).trim().into()); }
         serde_json::from_slice(&out.stdout).map_err(|e| format!("Ungültige Volume-Liste: {e}"))
@@ -29,14 +29,14 @@ pub async fn list_f3_volumes(disk_id: String) -> Result<serde_json::Value, Strin
 }
 
 #[tauri::command]
-pub async fn diagnose_f3(app: AppHandle, disk_id: String, volume_id: String, volume_uuid: String) -> Result<DiagnoseResult, String> {
+pub async fn diagnose_f3(app: AppHandle, disk_id: String, identity: String, volume_id: String, volume_uuid: String) -> Result<DiagnoseResult, String> {
     let guard = start_operation(&disk_id)?;
     CANCEL_DIAGNOSE.store(false, Ordering::SeqCst);
     app.emit("operation_start", guard.id).ok();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         ensure_writable_target(&disk_id)?;
-        let cfg = serde_json::json!({"disk_id":disk_id,"volume_id":volume_id,"volume_uuid":volume_uuid,
+        let cfg = serde_json::json!({"disk_id":disk_id,"identity":identity,"volume_id":volume_id,"volume_uuid":volume_uuid,
                                     "f3write":binary("f3write")?,"f3read":binary("f3read")?});
         let mut result = None;
         let mut protocol_error = None;

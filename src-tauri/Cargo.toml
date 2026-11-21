@@ -1,6 +1,6 @@
 [package]
 name = "burniso-usb"
-version = "1.4.18"
+version = "1.4.19"
 description = "Burn ISO to USB und USB Backup Tool für macOS"
 authors = ["Norbert Jander"]
 edition = "2021"
@@ -17,6 +17,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+plist = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "=2.7.3"

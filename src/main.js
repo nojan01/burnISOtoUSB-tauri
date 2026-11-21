@@ -286,7 +286,9 @@ function forensicDeviceName(result, fallback) {
         
         // Update message with missing packages
         const missing = deps.missing_brew_packages || [];
-        if (missing.length > 0) {
+        if (!deps.python3) {
+          message.textContent = "Apple Command Line Tools (Python 3)";
+        } else if (missing.length > 0) {
           const packageNames = missing.join(', ');
           const lang = window.i18n.currentLang;
           message.textContent = lang === 'de' 
@@ -700,7 +702,7 @@ function forensicDeviceName(result, fallback) {
     eraseLevelInputs.forEach(input => {
       const small = input.parentElement.querySelector('small');
       if (!small) return;
-      // Don't overwrite the Gutmann warning text
+      // Don't overwrite the flash warning text
       if (input.value === '3') return;
       const range = rangeFor(map[input.value]);
       if (range) {
@@ -1230,7 +1232,8 @@ function forensicDeviceName(result, fallback) {
   });
 
   burnBtn.addEventListener('click', async function() {
-    if (!selectedIsoPath || !selectedBurnDisk) return;
+    const confirmedDisk = selectedBurnDisk;
+    if (!selectedIsoPath || !confirmedDisk) return;
     
     // W3: Frontend-Validierung des ISO-Pfads
     const isoLower = String(selectedIsoPath).toLowerCase();
@@ -1246,7 +1249,7 @@ function forensicDeviceName(result, fallback) {
     // Confirmation dialog
     const confirmed = await requestConfirm(
       '⚠️ WARNING!',
-      'All data on "' + selectedBurnDisk.name + '" (' + selectedBurnDisk.id + ') will be PERMANENTLY deleted!\n\nContinue?',
+      'All data on "' + confirmedDisk.name + '" (' + confirmedDisk.id + ') will be PERMANENTLY deleted!\n\nContinue?',
       'Yes, delete',
       'Cancel'
     );
@@ -1290,7 +1293,8 @@ function forensicDeviceName(result, fallback) {
     try {
       const result = await invoke('burn_iso', {
         isoPath: selectedIsoPath,
-        diskId: selectedBurnDisk.id,
+        diskId: confirmedDisk.id,
+        identity: confirmedDisk.identity,
         password: password,
         verify: doVerify,
         eject: doEject
@@ -2001,10 +2005,11 @@ function forensicDeviceName(result, fallback) {
       logDiagnose(t('diagnose.callingTest').replace('{mode}', mode), 'info');
       
       if (mode === 'f3') {
-        result = await invoke('diagnose_f3', {diskId: disk.id, volumeId: f3Volume.id, volumeUuid: f3Volume.uuid});
+        result = await invoke('diagnose_f3', {diskId: disk.id, identity: disk.identity, volumeId: f3Volume.id, volumeUuid: f3Volume.uuid});
       } else if (mode === 'surface' || mode === 'sample') {
         result = await invoke('diagnose_surface_scan', {
           diskId: disk.id,
+          identity: disk.identity,
           sampled: mode === 'sample',
           password: password
         });
@@ -2012,12 +2017,14 @@ function forensicDeviceName(result, fallback) {
         logDiagnose(t('diagnose.invokingFullTest'), 'info');
         result = await invoke('diagnose_full_test', {
           diskId: disk.id,
+          identity: disk.identity,
           password: password
         });
         logDiagnose(t('diagnose.fullTestReturned'), 'info');
       } else if (mode === 'speed') {
         result = await invoke('diagnose_speed_test', {
           diskId: disk.id,
+          identity: disk.identity,
           profile: speedProfile.value,
           password: password
         });
@@ -2226,7 +2233,8 @@ function forensicDeviceName(result, fallback) {
   });
 
   formatBtn.addEventListener('click', async function() {
-    if (!selectedToolsDisk) return;
+    const confirmedDisk = selectedToolsDisk;
+    if (!confirmedDisk) return;
     
     const filesystem = formatFilesystem.value;
     const name = formatName.value || 'USB_STICK';
@@ -2244,7 +2252,7 @@ function forensicDeviceName(result, fallback) {
     const fsLabel = encrypted ? filesystem + ' (verschlüsselt)' : filesystem;
     const confirmed = await requestConfirm(
       '⚠️ ' + t('tools.formatWarning'),
-      t('tools.formatConfirmMsg').replace('{name}', selectedToolsDisk.name).replace('{fs}', fsLabel),
+      t('tools.formatConfirmMsg').replace('{name}', confirmedDisk.name).replace('{fs}', fsLabel),
       t('tools.formatConfirmYes'),
       t('dialogs.cancel')
     );
@@ -2280,7 +2288,8 @@ function forensicDeviceName(result, fallback) {
     
     try {
       const result = await invoke('format_disk', {
-        diskId: selectedToolsDisk.id,
+        diskId: confirmedDisk.id,
+        identity: confirmedDisk.identity,
         filesystem: filesystem,
         name: name,
         scheme: scheme,
@@ -2314,7 +2323,8 @@ function forensicDeviceName(result, fallback) {
 
   // Repair disk button
   repairBtn.addEventListener('click', async function() {
-    if (!selectedToolsDisk) return;
+    const confirmedDisk = selectedToolsDisk;
+    if (!confirmedDisk) return;
     
     let password;
     try {
@@ -2341,7 +2351,8 @@ function forensicDeviceName(result, fallback) {
     
     try {
       const result = await invoke('repair_disk', { 
-        diskId: selectedToolsDisk.id,
+        diskId: confirmedDisk.id,
+        identity: confirmedDisk.identity,
         password: password
       });
       logTools(result, 'success');
@@ -2371,20 +2382,21 @@ function forensicDeviceName(result, fallback) {
   });
 
   secureEraseBtn.addEventListener('click', async function() {
-    if (!selectedToolsDisk) return;
+    const confirmedDisk = selectedToolsDisk;
+    if (!confirmedDisk) return;
     
     const eraseLevel = document.querySelector('input[name="erase-level"]:checked').value;
     const levelNames = {
       '0': t('tools.eraseQuick'),
       '1': t('tools.eraseRandom'),
-      '3': t('tools.eraseGutmann'),
-      '4': t('tools.eraseDoe')
+      '3': t('tools.erase35Pass'),
+      '4': t('tools.eraseThreePass')
     };
     
     // Confirmation dialog
     const confirmed = await requestConfirm(
       '⚠️ ' + t('tools.eraseWarning'),
-      t('tools.eraseConfirmMsg').replace('{name}', selectedToolsDisk.name).replace('{method}', levelNames[eraseLevel]),
+      t('tools.eraseConfirmMsg').replace('{name}', confirmedDisk.name).replace('{method}', levelNames[eraseLevel]),
       t('tools.eraseConfirmYes'),
       t('dialogs.cancel')
     );
@@ -2423,7 +2435,8 @@ function forensicDeviceName(result, fallback) {
     
     try {
       const result = await invoke('secure_erase', {
-        diskId: selectedToolsDisk.id,
+        diskId: confirmedDisk.id,
+        identity: confirmedDisk.identity,
         level: parseInt(eraseLevel),
         password: password
       });
