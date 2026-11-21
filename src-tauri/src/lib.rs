@@ -2755,12 +2755,6 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
 
     // 3. Get device info - check SD Card Reader FIRST (more specific match by bsd_name)
     // then fall back to USB device tree
-    let media_name = result.get("disk_info")
-        .and_then(|d| d.get("media_name"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
-
     let mut found_device_info = false;
 
     // 3a. Check for SD Card Reader first (built-in card readers have exact bsd_name match)
@@ -2822,14 +2816,15 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
         }
     }
 
-    // 3b. If not an SD card, check USB device tree
-    if !found_device_info {
-        let usb_cmd = "system_profiler SPUSBHostDataType -json 2>/dev/null";
-        if let Ok(output) = Command::new("sh").args(["-c", usb_cmd]).output() {
-            if let Ok(json_data) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                // Parse USB device tree to find our specific device by name
-                if let Some(usb_info) = find_usb_device_info(&json_data, &disk_id, &media_name) {
-                    result["usb_info"] = usb_info;
+    result["flash_components"] = serde_json::json!({"controller":null,"nand":null});
+    if let Some(python) = unprivileged_python_path() {
+        let output = Command::new(python).args(["-I", "-S", "-c", include_str!("usb_path.py"), &disk_id]).output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(fields) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&out.stdout) {
+                    for (field, value) in fields {
+                        if field == "flash_components" || !found_device_info { result[field] = value; }
+                    }
                 }
             }
         }
@@ -2923,43 +2918,6 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
 
         if !hw_info.is_empty() {
             result["hardware_info"] = serde_json::json!(hw_info);
-        }
-    }
-
-    // 9. Get USB controller path info
-    let usb_path_cmd = format!(
-        "system_profiler SPUSBDataType 2>/dev/null | grep -B30 {} | head -35",
-        shell_quote(&disk_id)
-    );
-    if let Ok(output) = Command::new("sh").args(["-c", &usb_path_cmd]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut controller_info = serde_json::Map::new();
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.starts_with("USB") && line.contains("Bus") {
-                controller_info.insert("usb_bus".to_string(), serde_json::json!(line));
-            } else if line.contains("Host Controller") {
-                if let Some((_, val)) = line.split_once(':') {
-                    controller_info.insert("host_controller".to_string(), serde_json::json!(val.trim()));
-                }
-            } else if line.contains("PCI Device ID") {
-                if let Some((_, val)) = line.split_once(':') {
-                    controller_info.insert("pci_device_id".to_string(), serde_json::json!(val.trim()));
-                }
-            } else if line.contains("PCI Vendor ID") {
-                if let Some((_, val)) = line.split_once(':') {
-                    controller_info.insert("pci_vendor_id".to_string(), serde_json::json!(val.trim()));
-                }
-            } else if line.contains("PCI Revision ID") {
-                if let Some((_, val)) = line.split_once(':') {
-                    controller_info.insert("pci_revision_id".to_string(), serde_json::json!(val.trim()));
-                }
-            }
-        }
-
-        if !controller_info.is_empty() {
-            result["controller_info"] = serde_json::json!(controller_info);
         }
     }
 
@@ -3278,7 +3236,7 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
     }
 
     let mut sources = vec!["diskutil".to_string(), "raw disk header".to_string()];
-    if result.get("usb_info").is_some() { sources.push("system_profiler".to_string()); }
+    if result.get("usb_info").is_some() { sources.push(if found_device_info { "system_profiler" } else { "IORegistry" }.to_string()); }
     if result.get("smart_info").is_some() { sources.push("SMART / smartctl".to_string()); }
     if result.get("filesystem_details").is_some() { sources.push("mounted filesystem metadata".to_string()); }
     if result.get("linux_filesystem_details").is_some() { sources.push("Linux filesystem superblock (read-only)".to_string()); }
@@ -3303,66 +3261,6 @@ fn collect_forensic(disk_id: String, password: String) -> Result<serde_json::Val
     });
 
     Ok(result)
-}
-
-/// Find USB device info from system_profiler JSON
-/// USB Vendor ID to Manufacturer name lookup (USB-IF official registry)
-fn usb_vendor_lookup(vendor_id: &str) -> Option<&'static str> {
-    // Common USB flash drive and storage device vendors
-    // Full list: https://usb-ids.gowdy.us/
-    match vendor_id.to_lowercase().as_str() {
-        "0x0781" => Some("SanDisk Corporation"),
-        "0x0951" => Some("Kingston Technology"),
-        "0x8564" => Some("Transcend Information"),
-        "0x058f" => Some("Alcor Micro Corp."),
-        "0x090c" => Some("Silicon Motion"),
-        "0x13fe" => Some("Phison Electronics"),
-        "0x1f75" => Some("Innostor Technology"),
-        "0x0bda" => Some("Realtek Semiconductor"),
-        "0x1908" => Some("GEMBIRD"),
-        "0x0930" => Some("Toshiba Corporation"),
-        "0x1b1c" => Some("Corsair"),
-        "0x154b" => Some("PNY Technologies"),
-        "0x18a5" => Some("Verbatim"),
-        "0x0dd8" => Some("Netac Technology"),
-        "0x1005" => Some("Apacer Technology"),
-        "0x04e8" => Some("Samsung Electronics"),
-        "0x0ea0" => Some("Ours Technology"),
-        "0x048d" => Some("Integrated Technology Express"),
-        "0x1307" => Some("USBest Technology"),
-        "0x05dc" => Some("Lexar Media"),
-        "0x3538" => Some("Power Quotient International"),
-        "0x0cf2" => Some("ENE Technology"),
-        "0x1e3d" => Some("Chipsbrand Technologies"),
-        // SATA-to-USB Bridge controllers
-        "0x174c" => Some("ASMedia Technology Inc."),
-        "0x152d" => Some("JMicron Technology Corp."),
-        "0x1058" => Some("Western Digital Technologies"),
-        "0x0bc2" => Some("Seagate Technology"),
-        "0x04fc" => Some("Sunplus Technology"),
-        "0x2109" => Some("VIA Labs Inc."),
-        "0x14cd" => Some("Super Top"),
-        "0x1bcf" => Some("Sunplus Innovation"),
-        "0x0080" => Some("Assmann Electronic"),
-        // External HDD/SSD vendors
-        "0x0480" => Some("Toshiba America Inc."),
-        "0x07ab" => Some("Freecom Technologies"),
-        "0x059b" => Some("Iomega Corporation"),
-        "0x4971" => Some("SimpleTech"),
-        "0x067b" => Some("Prolific Technology"),
-        // Apple
-        "0x05ac" => Some("Apple Inc."),
-        // Common peripheral vendors
-        "0x046d" => Some("Logitech Inc."),
-        "0x045e" => Some("Microsoft Corporation"),
-        "0x1d5c" => Some("Fresco Logic"),
-        "0x1a40" => Some("Terminus Technology Inc."),
-        "0x8087" => Some("Intel Corporation"),
-        "0x0b95" => Some("ASIX Electronics"),
-        "0x2357" => Some("TP-Link Technologies"),
-        "0x0fe6" => Some("ICS Advent"),
-        _ => None
-    }
 }
 
 /// SD Card Manufacturer ID lookup (SD Association standard)
@@ -3478,149 +3376,6 @@ fn find_sd_card_info(json_data: &serde_json::Value, disk_id: &str) -> Option<ser
         }
     }
     None
-}
-
-fn find_usb_device_info(json_data: &serde_json::Value, _disk_id: &str, media_name: &str) -> Option<serde_json::Value> {
-    // SPUSBHostDataType uses different field names than SPUSBDataType
-    // We search recursively and match by media_name (e.g., "SanDisk 3.2Gen1")
-
-    // Helper function to extract USB device info from an item
-    fn extract_device_info(item: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        let mut info = serde_json::Map::new();
-
-        let device_name = item.get("_name").and_then(|n| n.as_str()).unwrap_or("").trim();
-
-        // Product name
-        info.insert("product_name".to_string(), serde_json::json!(device_name));
-
-        // Vendor ID and real manufacturer name from lookup
-        let vendor_id = item.get("USBDeviceKeyVendorID").and_then(|v| v.as_str()).unwrap_or("");
-        if !vendor_id.is_empty() {
-            info.insert("vendor_id".to_string(), serde_json::json!(vendor_id));
-
-            // Look up the real manufacturer name from USB-IF registry
-            if let Some(real_manufacturer) = usb_vendor_lookup(vendor_id) {
-                info.insert("manufacturer".to_string(), serde_json::json!(real_manufacturer));
-            } else if let Some(vendor) = item.get("USBDeviceKeyVendorName").and_then(|v| v.as_str()) {
-                info.insert("manufacturer".to_string(), serde_json::json!(vendor.trim()));
-            }
-        } else if let Some(vendor) = item.get("USBDeviceKeyVendorName").and_then(|v| v.as_str()) {
-            info.insert("manufacturer".to_string(), serde_json::json!(vendor.trim()));
-        }
-
-        // Product ID
-        if let Some(product_id) = item.get("USBDeviceKeyProductID").and_then(|p| p.as_str()) {
-            info.insert("product_id".to_string(), serde_json::json!(product_id));
-        }
-
-        // Serial number
-        if let Some(serial) = item.get("USBDeviceKeySerialNumber").and_then(|s| s.as_str()) {
-            let serial_val = if serial == "Not Provided" { "" } else { serial };
-            if !serial_val.is_empty() {
-                info.insert("serial_number".to_string(), serde_json::json!(serial_val));
-            }
-        }
-
-        // Link speed (e.g., "5 Gb/s", "480 Mb/s")
-        if let Some(speed) = item.get("USBDeviceKeyLinkSpeed").and_then(|s| s.as_str()) {
-            info.insert("usb_speed".to_string(), serde_json::json!(speed));
-        }
-
-        // Product version
-        if let Some(version) = item.get("USBDeviceKeyProductVersion").and_then(|v| v.as_str()) {
-            info.insert("device_version".to_string(), serde_json::json!(version));
-        }
-
-        // Power allocation (e.g., "4.48 W (896 mA)")
-        if let Some(power) = item.get("USBDeviceKeyPowerAllocation").and_then(|p| p.as_str()) {
-            info.insert("power_allocation".to_string(), serde_json::json!(power));
-        }
-
-        // Location ID
-        if let Some(location) = item.get("USBKeyLocationID").and_then(|l| l.as_str()) {
-            info.insert("location_id".to_string(), serde_json::json!(location));
-        }
-
-        // Hardware type
-        info.insert("hardware_type".to_string(), serde_json::json!("USB Storage Device"));
-
-        info
-    }
-
-    // Known USB-SATA bridge controller names
-    fn is_usb_sata_bridge(name: &str) -> bool {
-        let bridge_patterns = [
-            "ASM105", "ASM115", "ASM235", "ASM1351", "ASM1352", "ASM1153", // ASMedia
-            "JMS", "JMicron", // JMicron
-            "VL71", "VL716", // VIA Labs
-            "GL33", "GL35", // Genesys Logic
-            "RTL9210", // Realtek
-            "USB3.0", "USB 3.0", "SATA", // Generic patterns
-        ];
-        let name_upper = name.to_uppercase();
-        bridge_patterns.iter().any(|p| name_upper.contains(&p.to_uppercase()))
-    }
-
-    fn search_devices(items: &serde_json::Value, media_name: &str, matched_device: &mut Option<serde_json::Value>, all_bridges: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
-        if let Some(array) = items.as_array() {
-            for item in array {
-                // Check if this is a removable USB device
-                let is_removable = item.get("USBKeyHardwareType")
-                    .and_then(|h| h.as_str())
-                    .map(|s| s == "Removable")
-                    .unwrap_or(false);
-
-                if is_removable {
-                    let device_name = item.get("_name").and_then(|n| n.as_str()).unwrap_or("").trim();
-
-                    // Check if this device matches our media_name
-                    let name_matches = !media_name.is_empty() && (
-                        device_name.contains(media_name) ||
-                        media_name.contains(device_name) ||
-                        device_name.trim().eq_ignore_ascii_case(media_name.trim()) ||
-                        (media_name.len() > 3 && device_name.to_lowercase().contains(&media_name[..media_name.len().min(8)].to_lowercase()))
-                    );
-
-                    if name_matches && matched_device.is_none() {
-                        let info = extract_device_info(item);
-                        *matched_device = Some(serde_json::json!(info));
-                        return;
-                    }
-
-                    // Collect USB-SATA bridges as potential candidates
-                    if is_usb_sata_bridge(device_name) {
-                        all_bridges.push(extract_device_info(item));
-                    }
-                }
-
-                // Recursively search in _items
-                if let Some(sub_items) = item.get("_items") {
-                    search_devices(sub_items, media_name, matched_device, all_bridges);
-                    if matched_device.is_some() {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut matched_device: Option<serde_json::Value> = None;
-    let mut all_bridges: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-
-    if let Some(usb_data) = json_data.get("SPUSBHostDataType") {
-        search_devices(usb_data, media_name, &mut matched_device, &mut all_bridges);
-    }
-
-    // If no exact match found but we have USB-SATA bridges, return the first one
-    // This handles cases like Samsung SSD 870 EVO connected via ASM105X bridge
-    if matched_device.is_none() && !all_bridges.is_empty() {
-        // Use the first bridge, add a note that this is the USB controller
-        let mut bridge_info = all_bridges.remove(0);
-        bridge_info.insert("note".to_string(), serde_json::json!("USB-SATA Bridge Controller"));
-        return Some(serde_json::json!(bridge_info));
-    }
-
-    matched_device
 }
 
 /// Analyze boot structure of the disk

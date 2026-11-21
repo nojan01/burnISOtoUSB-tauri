@@ -467,6 +467,18 @@ export function createForensicRenderer(context) {
     html += '</div></details>';
   }
   
+  if (result.flash_components) {
+    html += '<div class="forensic-section"><h5>' + eh(t('tools.flashComponents')) + '</h5><div class="forensic-grid">';
+    for (const [key, label] of [['controller', 'flashController'], ['nand', 'nandMemory']]) {
+      const component = result.flash_components[key];
+      const values = [component?.manufacturer || t('tools.unknown'), component?.model,
+        component?.raw_id && 'ID ' + component.raw_id].filter(Boolean);
+      html += '<div class="forensic-item"><span class="forensic-label">' + eh(t('tools.' + label)) +
+        '</span><span class="forensic-value">' + values.map(eh).join(' · ') + '</span></div>';
+    }
+    html += '</div></div>';
+  }
+
   // Controller Info Section
   if (result.controller_info) {
     html += '<details class="forensic-section forensic-disclosure">';
